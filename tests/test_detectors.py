@@ -58,6 +58,11 @@ class DetectorTest(unittest.TestCase):
   with self.connect() as db:
    self.assertIsNotNone(db.execute('SELECT verified_at FROM detection_sources WHERE id=?',(source['id'],)).fetchone()[0])
    self.assertEqual(db.execute('SELECT COUNT(*) FROM detection_runs').fetchone()[0],0)
+ def test_boce_error_shows_safe_upstream_reason(self):
+  with patch('detectors.request_json',return_value={'error_code':401,'error':'invalid API key: testsecret'}):
+   with self.assertRaises(IntegrationError) as raised:detectors.boce('testsecret','node/list')
+  self.assertIn('401',str(raised.exception));self.assertIn('invalid API key',str(raised.exception))
+  self.assertNotIn('testsecret',str(raised.exception))
  def test_self_probe_test_uses_authenticated_heartbeat(self):
   source=self.source('self')
   r=self.post('/sources/'+str(source['id'])+'/test')
