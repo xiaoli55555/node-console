@@ -23,4 +23,4 @@ if __name__=='__main__':
         except Exception:print('DNS worker: cycle failed',flush=True)
         try:detection_tick(server.connect,server.CIPHER)
         except Exception:print("Detection worker: cycle failed",flush=True)
-        time.sleep(10)
+        time.sleep(5)

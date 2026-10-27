@@ -161,6 +161,8 @@ def finish(db,run,status,rows):
             else:
                 streak=0
                 db.execute('UPDATE detection_plans SET failure_streak=0,failure_ip=NULL,failure_port=NULL WHERE server_id=?',(run['server_id'],))
+                if recovering and plan['automatic'] and rows and all(r.get('state')=='reachable' for r in rows) and boce_dns_gate(db,run['server_id'],run['ip']):
+                    db.execute('UPDATE detection_plans SET next_at=? WHERE server_id=?',(now+10,run['server_id']))
         plan_status=status
         if action_result:plan_status+='；'+action_result
         db.execute('UPDATE detection_plans SET status=?,checked=? WHERE server_id=?',(plan_status,now,run['server_id']))
@@ -233,7 +235,7 @@ def tick(connect,cipher):
     execute_change_ip_actions(connect,cipher)
 
 # A successful/uncertain request needs an observation window, not an action cooldown.
-CHANGE_IP_OBSERVE_SECONDS=180
+CHANGE_IP_OBSERVE_SECONDS=60
 
 def execute_change_ip_actions(connect,cipher):
     """Advance persistent recovery jobs once per worker cycle; never spin or overlap."""
