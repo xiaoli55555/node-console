@@ -63,6 +63,11 @@ class DetectorTest(unittest.TestCase):
    with self.assertRaises(IntegrationError) as raised:detectors.boce('testsecret','node/list')
   self.assertIn('401',str(raised.exception));self.assertIn('invalid API key',str(raised.exception))
   self.assertNotIn('testsecret',str(raised.exception))
+ def test_boce_sends_key_and_parameters_as_documented_query(self):
+  with patch('detectors.request_json',return_value={'error_code':0}) as call:
+   detectors.boce('testsecret','task/create/tcping',{'node_ids':'1,2','host':'8.8.8.8:443'})
+  self.assertEqual(call.call_args.args[0],'https://api.boce.com/v3/task/create/tcping?key=testsecret&node_ids=1%2C2&host=8.8.8.8%3A443')
+  self.assertEqual(len(call.call_args.args),1)
  def test_self_probe_test_uses_authenticated_heartbeat(self):
   source=self.source('self')
   r=self.post('/sources/'+str(source['id'])+'/test')
