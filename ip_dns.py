@@ -263,7 +263,9 @@ def run_binding(connect,cipher,bid,apply=False):
                         db.execute('UPDATE dns_bindings SET candidate=?,candidate_since=? WHERE id=?',(new_ip,now,bid))
                         b['candidate_since']=now
                     probe_reason=boce_dns_gate(db,b['server_id'],new_ip,b['port']) if apply else None
-                    if apply and not probe_reason and now-(b['candidate_since'] or now)>=60:
+                    has_plan=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='detection_plans'").fetchone() and db.execute('SELECT 1 FROM detection_plans WHERE server_id=?',(b['server_id'],)).fetchone()
+                    stable_seconds=10 if has_plan and not probe_reason else 60
+                    if apply and not probe_reason and now-(b['candidate_since'] or now)>=stable_seconds:
                         try:
                             with socket.create_connection((new_ip,b['port']),timeout=4):pass
                         except OSError:raise IntegrationError('新 IP 业务 TCP 端口不可达，暂停同步')
@@ -275,7 +277,7 @@ def run_binding(connect,cipher,bid,apply=False):
                         check=dict(b,expected_ip=new_ip);validate_record(verify,check)
                         db.execute('UPDATE dns_bindings SET expected_ip=?,candidate=NULL,candidate_since=NULL WHERE id=?',(new_ip,bid))
                         status=b['expected_ip']+' → '+new_ip+'；解析已更新并回读验证（客户端缓存仍需等待 TTL）'
-                    else:status=probe_reason or (b['expected_ip']+' → '+new_ip+'；旧解析核对通过，需新 IP 稳定至少 60 秒再同步')
+                    else:status=probe_reason or (b['expected_ip']+' → '+new_ip+'；旧解析核对通过，需新 IP 稳定至少 '+str(stable_seconds)+' 秒再同步')
                 if not changed:db.execute('UPDATE dns_bindings SET candidate=NULL,candidate_since=NULL WHERE id=?',(bid,))
                 db.execute('UPDATE dns_bindings SET status=?,updated=? WHERE id=?',(status,now,bid))
                 db.execute('INSERT INTO dns_events(binding_id,message,created) VALUES(?,?,?)',(bid,status,now))

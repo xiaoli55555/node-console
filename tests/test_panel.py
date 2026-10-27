@@ -93,10 +93,11 @@ class PanelTest(unittest.TestCase):
             detectors.execute_change_ip_actions(server.connect,server.CIPHER)
             self.assertIn('BOCE',ip_dns.run_binding(server.connect,server.CIPHER,binding['id'],apply=True)['status'])
             for n in range(2):
-                if n:clock[0]+=110
+                if n:clock[0]+=10
                 report(new_ip);detectors.tick(server.connect,server.CIPHER)
                 clock[0]+=10;detectors.tick(server.connect,server.CIPHER)
                 if n==0:
+                    with server.connect() as db:self.assertEqual(db.execute("SELECT next_at FROM detection_plans WHERE server_id=?",(sid,)).fetchone()[0],clock[0]+10)
                     self.assertEqual(dns_writes,[])
                     self.assertIn('BOCE',ip_dns.run_binding(server.connect,server.CIPHER,binding['id'],apply=True)['status'])
             self.assertEqual(len(created),8)
@@ -106,7 +107,7 @@ class PanelTest(unittest.TestCase):
             self.assertEqual(moonvm.call_count,3)
             clock[0]+=1;report(new_ip)
             ip_dns.run_binding(server.connect,server.CIPHER,binding['id'],apply=True)
-            clock[0]+=61;report(new_ip)
+            clock[0]+=11;report(new_ip)
             final=ip_dns.run_binding(server.connect,server.CIPHER,binding['id'],apply=True)
             self.assertIn('回读验证',final['status']);self.assertEqual(len(dns_writes),1)
             detectors.execute_change_ip_actions(server.connect,server.CIPHER)

@@ -320,7 +320,7 @@ class DetectorTest(unittest.TestCase):
    detectors.execute_change_ip_actions(self.connect,self.cipher)
    detectors.execute_change_ip_actions(self.connect,self.cipher)
    self.assertEqual(api.call_count,1)
-  with self.connect() as db:db.execute("UPDATE detection_runs SET action_status='issued',action_attempted=? WHERE id=?",(int(time.time())-181,rid))
+  with self.connect() as db:db.execute("UPDATE detection_runs SET action_status='issued',action_attempted=? WHERE id=?",(int(time.time())-61,rid))
   with patch('detectors.invoke_change_ip_api',return_value='accepted') as api:
    detectors.execute_change_ip_actions(self.connect,self.cipher)
    self.assertEqual(api.call_count,1)
