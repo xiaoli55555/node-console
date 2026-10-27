@@ -58,6 +58,22 @@ class DetectorTest(unittest.TestCase):
   with self.connect() as db:
    self.assertIsNotNone(db.execute('SELECT verified_at FROM detection_sources WHERE id=?',(source['id'],)).fetchone()[0])
    self.assertEqual(db.execute('SELECT COUNT(*) FROM detection_runs').fetchone()[0],0)
+ def test_monitor_status_returns_latest_per_plan_without_creating_tasks(self):
+  source=self.source()['id'];self.plan(source)
+  other=self.source()['id']
+  with self.connect() as db:
+   db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details) VALUES(1,?,'8.8.8.8',443,'[]','TCP 可达',1,2,?)",(source,json.dumps([{'node_id':'1','name':'广州','state':'reachable','latency_ms':12}])))
+   # More recent runs for another source must not replace the configured source result.
+   for i in range(55):db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated) VALUES(1,?,'1.1.1.1',443,'[]','其他来源',3,4)",(other,))
+  with patch('detectors.boce') as upstream:
+   response=self.client.get('/api/detection/monitor-status',headers=self.headers)
+   upstream.assert_not_called()
+  self.assertEqual(response.status_code,200)
+  item=response.json['monitors'][0]
+  self.assertEqual(item['run']['status'],'TCP 可达');self.assertEqual(item['run']['details'][0]['latency_ms'],12)
+  self.assertNotIn('testsecret',response.text)
+  self.assertEqual(self.client.get('/api/detection/monitor-status').status_code,403)
+
  def test_boce_error_shows_safe_upstream_reason(self):
   with patch('detectors.request_json',return_value={'error_code':401,'error':'invalid API key: testsecret'}):
    with self.assertRaises(IntegrationError) as raised:detectors.boce('testsecret','node/list')

@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS detection_sources(id INTEGER PRIMARY KEY,name TEXT NO
 CREATE TABLE IF NOT EXISTS detection_plans(server_id INTEGER PRIMARY KEY REFERENCES servers(id) ON DELETE CASCADE,source_id INTEGER NOT NULL REFERENCES detection_sources(id),nodes TEXT NOT NULL DEFAULT '[]',interval_s INTEGER NOT NULL DEFAULT 600,automatic INTEGER NOT NULL DEFAULT 0,daily_limit INTEGER NOT NULL DEFAULT 1000,next_at INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT '等待检测',checked INTEGER,response_mode TEXT NOT NULL DEFAULT 'none',action_connection_id INTEGER REFERENCES ip_connections(id),failure_threshold INTEGER NOT NULL DEFAULT 3,failure_streak INTEGER NOT NULL DEFAULT 0,failure_ip TEXT,failure_port INTEGER,last_action INTEGER);
 CREATE TABLE IF NOT EXISTS detection_runs(id INTEGER PRIMARY KEY,server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,source_id INTEGER NOT NULL REFERENCES detection_sources(id),ip TEXT NOT NULL,port INTEGER NOT NULL,nodes TEXT NOT NULL,status TEXT NOT NULL,remote_id TEXT,created INTEGER NOT NULL,updated INTEGER NOT NULL,details TEXT NOT NULL DEFAULT '[]',poll_at INTEGER NOT NULL DEFAULT 0,cost INTEGER NOT NULL DEFAULT 0,scheduled INTEGER NOT NULL DEFAULT 0,action_result TEXT,action_status TEXT);
 CREATE INDEX IF NOT EXISTS detection_pending ON detection_runs(status,poll_at);
+CREATE INDEX IF NOT EXISTS detection_server_latest ON detection_runs(server_id,source_id,id);
 '''
 
 def initialize(connect):
@@ -236,6 +237,20 @@ def register(app,connect,cipher,auth,body,error,audit):
         for p in plans:p['nodes']=json.loads(p['nodes'])
         for r in runs:r['details']=json.loads(r['details'])
         return jsonify(sources=sources,plans=plans,runs=runs)
+
+    @app.get('/api/detection/monitor-status')
+    @auth(admin=True)
+    def detection_monitor_status():
+        # Read existing runs only: refreshing this view never creates paid tasks.
+        with connect() as db:
+            plans=db.execute('SELECT p.*,s.name AS source_name,s.kind AS source_kind,s.enabled AS source_enabled,m.current_ip,m.enabled AS monitor_enabled FROM detection_plans p JOIN detection_sources s ON s.id=p.source_id JOIN ip_monitors m ON m.server_id=p.server_id').fetchall()
+            result=[]
+            for p in plans:
+                run=db.execute('SELECT id,ip,port,status,created,updated,details,action_result FROM detection_runs WHERE server_id=? AND source_id=? ORDER BY id DESC LIMIT 1',(p['server_id'],p['source_id'])).fetchone()
+                latest=dict(run) if run else None
+                if latest:latest['details']=json.loads(latest['details'])
+                result.append({'server_id':p['server_id'],'source_kind':p['source_kind'],'current_ip':p['current_ip'],'monitor_enabled':bool(p['monitor_enabled']),'source_name':p['source_name'],'source_enabled':bool(p['source_enabled']),'automatic':bool(p['automatic']),'status':p['status'],'checked':p['checked'],'next_at':p['next_at'],'failure_streak':p['failure_streak'],'failure_threshold':p['failure_threshold'],'run':latest})
+        return jsonify(monitors=result,now=int(time.time()))
 
     @app.post('/api/detection/sources')
     @auth(admin=True)
