@@ -123,6 +123,19 @@ class DetectorTest(unittest.TestCase):
   with patch('detectors.boce') as call:
    with self.assertRaises(IntegrationError):detectors.start_run(self.connect,self.cipher,1)
    call.assert_not_called()
+ def test_submission_failure_reason_is_persisted_visible_and_masks_key(self):
+  self.plan(self.source()['id'])
+  with patch('detectors.boce',side_effect=IntegrationError('BOCE 返回错误码 5：quota testsecret')):
+   detectors.start_run(self.connect,self.cipher,1)
+  result=self.client.get('/api/detection/monitor-status',headers=self.headers)
+  self.assertIn('quota',result.json['monitors'][0]['run']['status'])
+  self.assertNotIn('testsecret',result.text)
+  with self.connect() as db:self.assertIn('quota',db.execute('SELECT status FROM detection_plans').fetchone()[0])
+ def test_malformed_task_response_is_recorded_without_crashing(self):
+  self.plan(self.source()['id'])
+  with patch('detectors.boce',return_value={'data':None}):detectors.start_run(self.connect,self.cipher,1)
+  with self.connect() as db:self.assertIn('BOCE 未返回有效任务 ID',db.execute('SELECT status FROM detection_runs').fetchone()[0])
+
  def test_ambiguous_submission_persists_cost_no_retry(self):
   self.plan(self.source()['id'])
   with patch('detectors.boce',side_effect=IntegrationError('timeout')):detectors.start_run(self.connect,self.cipher,1)
