@@ -132,6 +132,32 @@ class IPDNSTest(unittest.TestCase):
         self.assertIn('已接受',result)
         self.assertEqual(request.call_args.args[1]['X-Token'],'Token abc')
         self.assertEqual(json.loads(request.call_args.args[2]),{'instance':'edge-7','ip':'8.8.8.8','id':'7'})
+    def test_moonvm_url_is_parsed_encrypted_and_never_called_when_saved(self):
+        token='test-moonvm-token-1234567890'
+        url='https://store.moonvm.com/ddns.php?product=13688&flag=changeip&iptoken='+token
+        with patch('ip_dns.request_moonvm') as request:
+            saved=self.post('/connections',{'kind':'change_ip','name':'MoonVM','config':{'provider':'moonvm','url':url},'secret':''})
+            self.assertEqual(saved.status_code,200,saved.json)
+            tested=self.post('/connections/'+str(saved.json['id'])+'/test',{})
+            self.assertEqual(tested.status_code,200,tested.json);self.assertFalse(tested.json['test_supported'])
+            request.assert_not_called()
+        with self.connect() as db:
+            row=db.execute('SELECT * FROM ip_connections WHERE id=?',(saved.json['id'],)).fetchone()
+            self.assertEqual(json.loads(row['config']),{'provider':'moonvm','product':'13688'})
+            self.assertNotIn(token,row['config']);self.assertNotEqual(token,row['secret'])
+        self.assertNotIn(token,self.client.get('/api/ip-dns',headers=self.headers).text)
+    def test_moonvm_change_action_uses_generated_get_url(self):
+        token='test-moonvm-token-1234567890'
+        connection={'config':{'provider':'moonvm','product':'13688'},'secret':token}
+        with patch('ip_dns.request_moonvm',return_value='accepted') as request:
+            result=ip_dns.invoke_change_ip_api(connection,7,'edge','8.8.8.8')
+        self.assertIn('等待新 IP 上报',result)
+        self.assertEqual(request.call_args.args[0],'https://store.moonvm.com/ddns.php?product=13688&flag=changeip&iptoken='+token)
+        request.assert_called_once()
+    def test_moonvm_parser_rejects_wrong_host_and_wrong_action(self):
+        for url in ['https://evil.example/ddns.php?product=1&flag=changeip&iptoken=12345678',
+                    'https://store.moonvm.com/ddns.php?product=1&flag=delete&iptoken=12345678']:
+            with self.assertRaises(ip_dns.IntegrationError):ip_dns.parse_moonvm_url(url)
     def test_ssrf_dns_rebinding_guard_and_url_validation(self):
         for url in ['http://example.com','https://user:pass@example.com','https://example.com:8080']:
             with self.assertRaises(ip_dns.IntegrationError):ip_dns.endpoint(url)
