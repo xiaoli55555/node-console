@@ -263,6 +263,22 @@ class PanelTest(unittest.TestCase):
         self.admin.patch(f'/api/servers/{sid}',json={'owner_id':None},headers={'X-CSRF-Token':self.tokens['admin']})
         self.assertEqual(self.admin.post('/api/agent/commands/'+str(job['id'])+'/ack',json={},headers=h).status_code,403)
 
+    def test_egress_ip_changes_are_recorded_without_interface_public_ip(self):
+        r=self.post('/api/servers',{'name':'nat-node'}).json;sid=r['id'];h={'Authorization':'Bearer '+r['token']}
+        now=int(time.time())
+        for address in ['8.8.8.8','1.1.1.1','1.1.1.1']:
+            response=self.admin.post('/api/agent/report',json={'public_ips':[],'egress_ips':[address],'egress_checked':now},headers=h)
+            self.assertEqual(response.status_code,200)
+        history=self.admin.get(f'/api/servers/{sid}/ip-history').json
+        self.assertEqual(history['total'],2)
+        self.assertTrue(history['available'])
+        self.assertEqual(history['events'][0]['addresses'],['1.1.1.1'])
+        self.assertEqual(history['events'][0]['previous_addresses'],['8.8.8.8'])
+        # Failed or stale external observations must not create empty/false events.
+        for sample in [{'public_ips':[],'egress_ips':None}, {'public_ips':[],'egress_ips':['9.9.9.9'],'egress_checked':now-100}]:
+            self.assertEqual(self.admin.post('/api/agent/report',json=sample,headers=h).status_code,200)
+        self.assertEqual(self.admin.get(f'/api/servers/{sid}/ip-history').json['total'],2)
+
     def test_complete_ip_history_pagination_and_ownership(self):
         r=self.post('/api/servers',{'name':'cmhk-node'}).json;sid=r['id'];h={'Authorization':'Bearer '+r['token']}
         uid=self.alice.get('/api/me').json['id']
