@@ -42,11 +42,36 @@ class DetectorTest(unittest.TestCase):
  def source(self,kind='boce'):
   r=self.post('/sources',{'kind':kind,'name':'test','secret':'testsecret' if kind=='boce' else ''});self.assertEqual(r.status_code,200);return r.json
  def plan(self,source,**kwargs):
+  if kwargs.get('response_mode','none')!='none':
+   with self.connect() as db:db.execute('UPDATE detection_sources SET verified_at=? WHERE id=?',(int(time.time()),source))
   r=self.post('/plans/1',{'source_id':source,'nodes':['1','2'],'interval_s':600,'daily_limit':1000,**kwargs});self.assertEqual(r.status_code,200,r.json)
  def test_secret_encryption_and_admin_only(self):
   self.source();self.assertEqual(self.client.get('/api/detection').status_code,403)
   data=self.client.get('/api/detection',headers=self.headers).text;self.assertNotIn('testsecret',data)
   with self.connect() as db:self.assertNotIn('testsecret',db.execute('SELECT secret FROM detection_sources').fetchone()[0])
+ def test_boce_source_test_verifies_credentials_without_creating_a_run(self):
+  source=self.source()
+  with patch('detectors.boce',return_value={'data':{'list':[{'id':1},{'id':2}]}}) as boce:
+   r=self.post('/sources/'+str(source['id'])+'/test')
+  self.assertEqual(r.status_code,200,r.json);self.assertTrue(r.json['usable']);self.assertIn('2 个检测节点',r.json['message'])
+  self.assertEqual(boce.call_args.args[1],'node/list')
+  with self.connect() as db:
+   self.assertIsNotNone(db.execute('SELECT verified_at FROM detection_sources WHERE id=?',(source['id'],)).fetchone()[0])
+   self.assertEqual(db.execute('SELECT COUNT(*) FROM detection_runs').fetchone()[0],0)
+ def test_self_probe_test_uses_authenticated_heartbeat(self):
+  source=self.source('self')
+  r=self.post('/sources/'+str(source['id'])+'/test')
+  self.assertEqual(r.status_code,400);self.assertIn('未在线',r.json['error'])
+  heartbeat=self.client.post('/api/probe/jobs',json={},headers={'Authorization':'Bearer '+source['probe_token']})
+  self.assertEqual(heartbeat.status_code,200)
+  r=self.post('/sources/'+str(source['id'])+'/test')
+  self.assertEqual(r.status_code,200,r.json);self.assertTrue(r.json['usable']);self.assertIn('在线',r.json['message'])
+ def test_automatic_response_requires_recent_source_test(self):
+  source=self.source()
+  payload={'source_id':source['id'],'nodes':['1'],'automatic':True,'response_mode':'reboot'}
+  self.assertEqual(self.post('/plans/1',payload).status_code,400)
+  with patch('detectors.boce',return_value={'data':{'list':[{'id':1}]}}):self.assertEqual(self.post('/sources/'+str(source['id'])+'/test').status_code,200)
+  self.assertEqual(self.post('/plans/1',payload).status_code,200)
  def test_boce_create_and_pending_not_a_failure(self):
   self.plan(self.source()['id'])
   with patch('detectors.boce',return_value={'data':{'id':'task123'}}) as call:
