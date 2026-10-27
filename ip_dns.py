@@ -40,6 +40,10 @@ CREATE TABLE IF NOT EXISTS dns_events(
 class IntegrationError(ValueError):
     pass
 
+class ChangeIPUncertain(IntegrationError):
+    """Provider may have accepted a request whose response was lost."""
+    pass
+
 def public_v4(value):
     try:
         ip=ipaddress.ip_address(value)
@@ -113,9 +117,10 @@ def invoke_change_ip_api(connection,server_id,server_name,current_ip):
         return value
     headers={'Accept':'application/json','Content-Type':'application/json'}
     if connection['secret']:headers[config['header']]=config['prefix']+connection['secret']
-    response=request_json(config['url'],headers,json.dumps(expand(template),ensure_ascii=False,separators=(',',':')))
+    try:response=request_json(config['url'],headers,json.dumps(expand(template),ensure_ascii=False,separators=(',',':')))
+    except IntegrationError as e:raise ChangeIPUncertain(str(e)) from None
     if isinstance(response,dict) and response.get('success') is False:raise IntegrationError('换 IP API 返回失败；请核对供应商 API 参数')
-    return '换 IP API 已接受请求；等待服务器上报新 IP（请求异常不会自动重试）'
+    return '换 IP API 已接受请求；等待服务器上报新 IP 后进行国内复检'
 
 def parse_moonvm_url(url):
     """Accept only MoonVM's generated change-IP link; never request it while saving."""
@@ -158,7 +163,7 @@ def request_moonvm(url,token):
             return result[:300]
         finally:conn.close()
     except IntegrationError:raise
-    except Exception:raise IntegrationError('连接 MoonVM API 失败；请检查服务器网络、DNS 和 TLS') from None
+    except Exception:raise ChangeIPUncertain('MoonVM 请求结果不确定，先核对新 IP，避免重复请求') from None
 
 def alidns(connection,action,**kwargs):
     params={'AccessKeyId':connection['config']['access_key_id'],'Action':action,'Format':'JSON',
@@ -218,6 +223,25 @@ def candidate_ip(db,binding,cipher):
     if len(egress)>1:raise IntegrationError('出口 IP 检测到多个公网 IPv4，无法确定目标地址')
     raise IntegrationError('未取得网卡公网 IPv4，也没有新鲜且唯一的出口公网 IPv4')
 
+def boce_dns_gate(db,sid,address,port=None):
+    """Return a blocking reason, or None. No BOCE requests are made here."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='detection_plans'").fetchone():return None
+    plan=db.execute('SELECT p.*,s.kind,s.enabled AS source_enabled,m.port AS monitor_port FROM detection_plans p JOIN detection_sources s ON s.id=p.source_id JOIN ip_monitors m ON m.server_id=p.server_id WHERE p.server_id=?',(sid,)).fetchone()
+    if not plan:return None
+    if not plan['source_enabled']:return '等待新 IP 的 BOCE 国内复检：探测来源已暂停'
+    target_port=plan['monitor_port']
+    rows=db.execute("SELECT * FROM detection_runs WHERE server_id=? AND status NOT IN ('creating','pending','queued','issued') ORDER BY id DESC LIMIT 2",(sid,)).fetchall()
+    if len(rows)<2:return '等待新 IP 的 BOCE 国内复检连续两轮通过'
+    now=int(time.time())
+    recovery=db.execute("SELECT id,action_attempted FROM detection_runs WHERE server_id=? AND ip!=? AND action_attempts>0 AND action_status IN ('queued','issued','submitted','uncertain','verifying') ORDER BY id DESC LIMIT 1",(sid,address)).fetchone()
+    for run in rows:
+        if recovery and (run['id']<=recovery['id'] or run['created']<(recovery['action_attempted'] or 0)):return '等待本次换 IP 后重新进行两轮 BOCE 国内复检，旧结果不可复用'
+        if run['source_id']!=plan['source_id'] or run['nodes']!=plan['nodes'] or run['ip']!=address or run['port']!=target_port or now-run['updated']>max(300,plan['interval_s']*3):return '等待新 IP 和当前端口的 BOCE 国内复检连续两轮通过'
+        try:details=json.loads(run['details']);nodes=json.loads(plan['nodes'])
+        except (ValueError,TypeError):return '等待有效的 BOCE 国内复检结果'
+        if not isinstance(details,list) or not isinstance(nodes,list) or not details or any(not isinstance(x,dict) for x in details) or len(details)!=len(nodes) or set(str(x.get('node_id')) for x in details)!=set(map(str,nodes)) or any(x.get('state')!='reachable' for x in details):return '新 IP 尚未通过全部所选 BOCE 国内节点，暂不更新 DNS'
+    return None
+
 def run_binding(connect,cipher,bid,apply=False):
     # The process lock serializes workers AND admin-triggered updates across gunicorn processes.
     import fcntl
@@ -238,7 +262,8 @@ def run_binding(connect,cipher,bid,apply=False):
                     if b['candidate']!=new_ip:
                         db.execute('UPDATE dns_bindings SET candidate=?,candidate_since=? WHERE id=?',(new_ip,now,bid))
                         b['candidate_since']=now
-                    if apply and now-(b['candidate_since'] or now)>=60:
+                    probe_reason=boce_dns_gate(db,b['server_id'],new_ip,b['port']) if apply else None
+                    if apply and not probe_reason and now-(b['candidate_since'] or now)>=60:
                         try:
                             with socket.create_connection((new_ip,b['port']),timeout=4):pass
                         except OSError:raise IntegrationError('新 IP 业务 TCP 端口不可达，暂停同步')
@@ -250,7 +275,7 @@ def run_binding(connect,cipher,bid,apply=False):
                         check=dict(b,expected_ip=new_ip);validate_record(verify,check)
                         db.execute('UPDATE dns_bindings SET expected_ip=?,candidate=NULL,candidate_since=NULL WHERE id=?',(new_ip,bid))
                         status=b['expected_ip']+' → '+new_ip+'；解析已更新并回读验证（客户端缓存仍需等待 TTL）'
-                    else:status=b['expected_ip']+' → '+new_ip+'；旧解析核对通过，需新 IP 稳定至少 60 秒再同步'
+                    else:status=probe_reason or (b['expected_ip']+' → '+new_ip+'；旧解析核对通过，需新 IP 稳定至少 60 秒再同步')
                 if not changed:db.execute('UPDATE dns_bindings SET candidate=NULL,candidate_since=NULL WHERE id=?',(bid,))
                 db.execute('UPDATE dns_bindings SET status=?,updated=? WHERE id=?',(status,now,bid))
                 db.execute('INSERT INTO dns_events(binding_id,message,created) VALUES(?,?,?)',(bid,status,now))

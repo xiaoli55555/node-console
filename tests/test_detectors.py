@@ -49,6 +49,16 @@ class DetectorTest(unittest.TestCase):
   self.source();self.assertEqual(self.client.get('/api/detection').status_code,403)
   data=self.client.get('/api/detection',headers=self.headers).text;self.assertNotIn('testsecret',data)
   with self.connect() as db:self.assertNotIn('testsecret',db.execute('SELECT secret FROM detection_sources').fetchone()[0])
+ def test_failed_scheduled_probe_rechecks_after_ten_seconds(self):
+  source=self.source()['id'];self.plan(source,automatic=True,failure_threshold=3)
+  with self.connect() as db:
+   db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,scheduled,created,updated) VALUES(1,?,'8.8.8.8',443,?,'pending',1,100,100)",(source,json.dumps(['1','2'])))
+   run=db.execute('SELECT * FROM detection_runs').fetchone()
+   with patch('detectors.time.time',return_value=1000):
+    detectors.finish(db,run,'不通',[{'node_id':'1','state':'unreachable'},{'node_id':'2','state':'unreachable'}])
+   plan=db.execute('SELECT * FROM detection_plans').fetchone()
+   self.assertEqual(plan['next_at'],1010);self.assertEqual(plan['failure_streak'],1)
+   self.assertIsNone(db.execute('SELECT action_status FROM detection_runs').fetchone()[0])
  def test_boce_source_test_verifies_credentials_without_creating_a_run(self):
   source=self.source()
   with patch('detectors.boce',return_value={'data':{'list':[{'id':1},{'id':2}]}}) as boce:
@@ -284,8 +294,72 @@ class DetectorTest(unittest.TestCase):
    detectors.execute_change_ip_actions(self.connect,self.cipher);api.assert_not_called()
   with self.connect() as db:self.assertEqual(db.execute('SELECT action_status FROM detection_runs').fetchone()[0],'cancelled')
 
- def test_resaving_plan_preserves_cooldown_for_both_automatic_actions(self):
-  for mode in ['reboot','change_api']:
+ def recovery_job(self):
+  source=self.source('self')['id']
+  with self.connect() as db:action=db.execute('INSERT INTO ip_connections(name,kind,config,secret) VALUES(?,?,?,?)',('dry-run','change_ip','{}',self.cipher.encrypt(b'dummy').decode())).lastrowid
+  self.plan(source,automatic=True,response_mode='change_api',action_connection_id=action)
+  with self.connect() as db:
+   db.execute('UPDATE detection_plans SET last_action=?',(int(time.time()),))
+   return db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,scheduled,action_status) VALUES(1,?,'8.8.8.8',443,'[\"self\"]','failed',?,?,1,'queued')",(source,int(time.time()),int(time.time()))).lastrowid
+
+ def test_explicit_change_failures_retry_without_cooldown_or_attempt_limit(self):
+  rid=self.recovery_job()
+  with patch('detectors.invoke_change_ip_api',side_effect=IntegrationError('explicit rejection')) as api:
+   for _ in range(6):detectors.execute_change_ip_actions(self.connect,self.cipher)
+   self.assertEqual(api.call_count,6)
+   with self.connect() as db:
+    r=db.execute('SELECT * FROM detection_runs WHERE id=?',(rid,)).fetchone()
+    self.assertEqual(r['action_status'],'queued');self.assertEqual(r['action_attempts'],6)
+   self.client.patch('/api/detection/plans/1/actions',json={'enabled':False},headers=self.headers)
+   detectors.execute_change_ip_actions(self.connect,self.cipher)
+   self.assertEqual(api.call_count,6)
+
+ def test_uncertain_request_observes_ip_before_retrying_and_survives_restart(self):
+  rid=self.recovery_job()
+  with patch('detectors.invoke_change_ip_api',side_effect=detectors.ChangeIPUncertain('timeout')) as api:
+   detectors.execute_change_ip_actions(self.connect,self.cipher)
+   detectors.execute_change_ip_actions(self.connect,self.cipher)
+   self.assertEqual(api.call_count,1)
+  with self.connect() as db:db.execute("UPDATE detection_runs SET action_status='issued',action_attempted=? WHERE id=?",(int(time.time())-181,rid))
+  with patch('detectors.invoke_change_ip_api',return_value='accepted') as api:
+   detectors.execute_change_ip_actions(self.connect,self.cipher)
+   self.assertEqual(api.call_count,1)
+   with self.connect() as db:db.execute('UPDATE servers SET metrics=?,seen=? WHERE id=1',(json.dumps({'public_ips':['1.1.1.1']}),int(time.time())))
+   detectors.execute_change_ip_actions(self.connect,self.cipher)
+   self.assertEqual(api.call_count,1)
+  with self.connect() as db:self.assertEqual(db.execute('SELECT action_status FROM detection_runs WHERE id=?',(rid,)).fetchone()[0],'verifying')
+
+ def test_dns_requires_two_fresh_complete_boce_results_for_new_ip(self):
+  source=self.source()['id'];self.plan(source)
+  from ip_dns import boce_dns_gate
+  rows=[{'node_id':str(i),'state':'reachable'} for i in [1,2]]
+  def insert(details,ip='1.1.1.1',port=443,stamp=None):
+   with self.connect() as db:db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details) VALUES(1,?,?,?,?,'complete',?,?,?)",(source,ip,port,json.dumps(['1','2']),int(time.time()),stamp or int(time.time()),json.dumps(details)))
+  with self.connect() as db:self.assertIsNotNone(boce_dns_gate(db,1,'1.1.1.1'))
+  insert(rows)
+  with self.connect() as db:self.assertIsNotNone(boce_dns_gate(db,1,'1.1.1.1'))
+  insert(rows)
+  with self.connect() as db:self.assertIsNone(boce_dns_gate(db,1,'1.1.1.1'))
+  insert([{'node_id':'1','state':'reachable'},{'node_id':'2','state':'unreachable'}])
+  with self.connect() as db:self.assertIsNotNone(boce_dns_gate(db,1,'1.1.1.1'))
+  insert(rows,port=23456)
+  with self.connect() as db:self.assertIsNotNone(boce_dns_gate(db,1,'1.1.1.1'))
+  insert(rows,stamp=int(time.time())-4000);insert(rows,stamp=int(time.time())-4000)
+  with self.connect() as db:self.assertIsNotNone(boce_dns_gate(db,1,'1.1.1.1'))
+
+ def test_results_from_before_latest_change_attempt_cannot_release_dns(self):
+  source=self.source()['id'];self.plan(source)
+  from ip_dns import boce_dns_gate
+  now=int(time.time());nodes=json.dumps(['1','2']);good=json.dumps([{'node_id':str(i),'state':'reachable'} for i in [1,2]])
+  with self.connect() as db:
+   db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,action_status,action_attempts,action_attempted) VALUES(1,?,'8.8.8.8',443,?,'failed',?,?,'verifying',2,?)",(source,nodes,now-30,now,now-5))
+   for _ in range(2):db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details) VALUES(1,?,'1.1.1.1',443,?,'passed',?,?,?)",(source,nodes,now-10,now,good))
+   self.assertIsNotNone(boce_dns_gate(db,1,'1.1.1.1'))
+   for _ in range(2):db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details) VALUES(1,?,'1.1.1.1',443,?,'passed',?,?,?)",(source,nodes,now,now,good))
+   self.assertIsNone(boce_dns_gate(db,1,'1.1.1.1'))
+
+ def test_resaving_plan_preserves_reboot_cooldown(self):
+  for mode in ['reboot']:
    with self.subTest(mode=mode):
     source=self.source('self')['id'];options={'automatic':True,'response_mode':mode,'failure_threshold':2}
     if mode=='change_api':
