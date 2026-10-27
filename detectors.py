@@ -52,6 +52,10 @@ def boce(secret,path,params=None):
     query=urllib.parse.urlencode({'key':secret,**(params or {})})
     data=request_json('https://api.boce.com/v3/'+path+'?'+query)
     if not isinstance(data,dict):raise IntegrationError('BOCE API 返回格式错误（不是 JSON 对象）')
+    # Some BOCE deployments wrap the documented payload in {code:200,data:{...}}.
+    inner=data.get('data')
+    if data.get('code') in (200,'200') and isinstance(inner,dict) and ('error_code' in inner or 'done' in inner):
+        data=inner
     code=data.get('error_code',0)
     if code not in (0,'0'):
         detail=str(data.get('error') or '').strip().replace(secret,'[已隐藏]')[:240]

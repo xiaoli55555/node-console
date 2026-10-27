@@ -131,6 +131,17 @@ class DetectorTest(unittest.TestCase):
   self.assertIn('quota',result.json['monitors'][0]['run']['status'])
   self.assertNotIn('testsecret',result.text)
   with self.connect() as db:self.assertIn('quota',db.execute('SELECT status FROM detection_plans').fetchone()[0])
+ def test_boce_wrapped_create_poll_and_error_responses(self):
+  response={'code':200,'data':{'error_code':0,'error':'','data':{'id':'20261028_task_123'}}}
+  with patch('detectors.request_json',return_value=response):
+   data=detectors.boce('testsecret','task/create/tcping')
+  self.assertEqual(data['data']['id'],'20261028_task_123')
+  with patch('detectors.request_json',return_value={'code':200,'data':{'done':False,'id':'20261028_task_123','list':[]}}):
+   self.assertIs(detectors.boce('testsecret','task/tcping/20261028_task_123')['done'],False)
+  with patch('detectors.request_json',return_value={'code':200,'data':{'error_code':1,'error':'invalid testsecret'}}):
+   with self.assertRaises(IntegrationError) as caught:detectors.boce('testsecret','task/create/tcping')
+  self.assertNotIn('testsecret',str(caught.exception));self.assertIn('1',str(caught.exception))
+
  def test_task_ids_are_opaque_strings_and_encoded_when_polled(self):
   self.plan(self.source()['id'])
   with patch('detectors.boce',return_value={'data':{'id':'task-123_abc/part?x=1'}}):detectors.start_run(self.connect,self.cipher,1)
