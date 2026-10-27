@@ -10,7 +10,7 @@ from flask import jsonify,request
 from ip_dns import IntegrationError, request_json, candidate_ip, load_connection, invoke_change_ip_api
 
 SCHEMA='''
-CREATE TABLE IF NOT EXISTS detection_sources(id INTEGER PRIMARY KEY,name TEXT NOT NULL,kind TEXT NOT NULL,secret TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1);
+CREATE TABLE IF NOT EXISTS detection_sources(id INTEGER PRIMARY KEY,name TEXT NOT NULL,kind TEXT NOT NULL,secret TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,last_seen INTEGER,verified_at INTEGER);
 CREATE TABLE IF NOT EXISTS detection_plans(server_id INTEGER PRIMARY KEY REFERENCES servers(id) ON DELETE CASCADE,source_id INTEGER NOT NULL REFERENCES detection_sources(id),nodes TEXT NOT NULL DEFAULT '[]',interval_s INTEGER NOT NULL DEFAULT 600,automatic INTEGER NOT NULL DEFAULT 0,daily_limit INTEGER NOT NULL DEFAULT 1000,next_at INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT '等待检测',checked INTEGER,response_mode TEXT NOT NULL DEFAULT 'none',action_connection_id INTEGER REFERENCES ip_connections(id),failure_threshold INTEGER NOT NULL DEFAULT 3,failure_streak INTEGER NOT NULL DEFAULT 0,failure_ip TEXT,failure_port INTEGER,last_action INTEGER);
 CREATE TABLE IF NOT EXISTS detection_runs(id INTEGER PRIMARY KEY,server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,source_id INTEGER NOT NULL REFERENCES detection_sources(id),ip TEXT NOT NULL,port INTEGER NOT NULL,nodes TEXT NOT NULL,status TEXT NOT NULL,remote_id TEXT,created INTEGER NOT NULL,updated INTEGER NOT NULL,details TEXT NOT NULL DEFAULT '[]',poll_at INTEGER NOT NULL DEFAULT 0,cost INTEGER NOT NULL DEFAULT 0,scheduled INTEGER NOT NULL DEFAULT 0,action_result TEXT,action_status TEXT);
 CREATE INDEX IF NOT EXISTS detection_pending ON detection_runs(status,poll_at);
@@ -21,6 +21,10 @@ def initialize(connect):
         db.executescript(SCHEMA)
         # Additive migrations preserve existing monitoring plans and run history.
         migrations={
+            'detection_sources':{
+                'last_seen':'INTEGER',
+                'verified_at':'INTEGER',
+            },
             'detection_plans':{
                 'response_mode':"TEXT NOT NULL DEFAULT 'none'",
                 'action_connection_id':'INTEGER REFERENCES ip_connections(id)',
@@ -219,7 +223,7 @@ def register(app,connect,cipher,auth,body,error,audit):
     @auth(admin=True)
     def detection_overview():
         with connect() as db:
-            sources=[{k:r[k] for k in ('id','name','kind','enabled')} for r in db.execute('SELECT * FROM detection_sources')]
+            sources=[{k:r[k] for k in ('id','name','kind','enabled','last_seen','verified_at')} for r in db.execute('SELECT * FROM detection_sources')]
             plans=[dict(r) for r in db.execute('SELECT * FROM detection_plans')]
             runs=[dict(r) for r in db.execute('SELECT id,server_id,source_id,ip,port,status,created,updated,details,action_result,action_status FROM detection_runs ORDER BY id DESC LIMIT 50')]
         for p in plans:p['nodes']=json.loads(p['nodes'])
@@ -238,13 +242,40 @@ def register(app,connect,cipher,auth,body,error,audit):
                 if not old or old['kind']!=kind:return error('检测来源不存在或类型不可更改')
                 if kind=='self' and secret:return error('自建探针密钥只能由系统生成')
                 encrypted=cipher.encrypt(secret.encode()).decode() if secret else old['secret']
-                db.execute('UPDATE detection_sources SET name=?,secret=?,enabled=? WHERE id=?',(name.strip(),encrypted,int(enabled),old['id']));sid=old['id']
+                db.execute('UPDATE detection_sources SET name=?,secret=?,enabled=?,verified_at=CASE WHEN ? THEN NULL ELSE verified_at END WHERE id=?',(name.strip(),encrypted,int(enabled),int(bool(secret)),old['id']));sid=old['id']
             else:
                 if kind=='self':secret=token=secrets.token_urlsafe(36)
                 if not secret:return error('请填写 BOCE API Key')
                 sid=db.execute('INSERT INTO detection_sources(name,kind,secret,enabled) VALUES(?,?,?,?)',(name.strip(),kind,cipher.encrypt(secret.encode()).decode(),int(enabled))).lastrowid
             audit(db,'保存检测来源 #'+str(sid))
         return jsonify(ok=True,id=sid,probe_token=token)
+
+    @app.post('/api/detection/sources/<int:sid>/test')
+    @auth(admin=True)
+    def detection_test_source(sid):
+        """Test the source control channel without probing a VPS or triggering actions."""
+        try:
+            with connect() as db:s=db.execute('SELECT * FROM detection_sources WHERE id=?',(sid,)).fetchone()
+            if not s:raise IntegrationError('检测来源不存在')
+            if not s['enabled']:raise IntegrationError('检测来源已暂停，请先启用')
+            now=int(time.time())
+            if s['kind']=='boce':
+                result=boce(source_secret(s,cipher),'node/list')
+                rows=result.get('data',{}).get('list')
+                if not isinstance(rows,list):raise IntegrationError('BOCE 节点列表格式异常')
+                valid=sum(1 for r in rows if isinstance(r,dict) and str(r.get('id','')).isdigit())
+                if not valid:raise IntegrationError('BOCE API 可连接，但没有返回可用检测节点')
+                message=f'BOCE API 可用，读取到 {valid} 个检测节点；这只是连通性测试，不会提交收费拨测任务'
+            elif s['kind']=='self':
+                seen=s['last_seen']
+                if not seen or now-int(seen)>35:raise IntegrationError('自建探针未在线：检查探针服务、面板 HTTPS 地址及密钥；在线后等待 10–35 秒再测试')
+                message='自建探针在线，最近心跳 '+str(max(0,now-int(seen)))+' 秒前；实际 VPS 端口可达性需另行发起手动检测'
+            else:raise IntegrationError('未知检测来源类型')
+            with connect() as db:db.execute('UPDATE detection_sources SET verified_at=? WHERE id=?',(now,sid))
+            return jsonify(ok=True,usable=True,kind=s['kind'],verified_at=now,message=message)
+        except IntegrationError as e:
+            with connect() as db:db.execute('UPDATE detection_sources SET verified_at=NULL WHERE id=?',(sid,))
+            return error(str(e))
 
     @app.post('/api/detection/sources/<int:sid>/nodes')
     @auth(admin=True)
@@ -278,6 +309,7 @@ def register(app,connect,cipher,auth,body,error,audit):
             if not db.execute('SELECT 1 FROM ip_monitors WHERE server_id=?',(sid,)).fetchone():return error('请先选择被监控的 VPS')
             s=db.execute('SELECT * FROM detection_sources WHERE id=?',(d.get('source_id'),)).fetchone()
             if not s:return error('请选择检测来源')
+            if response_mode!='none' and (not s['verified_at'] or time.time()-s['verified_at']>900):return error('启用自动重启或换 IP 前，请先测试探测来源；测试结果 15 分钟内有效')
             if action_connection_id:
                 action=db.execute('SELECT kind FROM ip_connections WHERE id=?',(action_connection_id,)).fetchone()
                 if not action or action['kind']!='change_ip':return error('请选择有效的换 IP API 连接')
@@ -320,6 +352,7 @@ def register(app,connect,cipher,auth,body,error,audit):
         now=int(time.time())
         with connect() as db:
             db.execute('BEGIN IMMEDIATE')
+            db.execute('UPDATE detection_sources SET last_seen=? WHERE id=?',(now,s['id']))
             r=db.execute("SELECT r.* FROM detection_runs r JOIN detection_plans p ON p.server_id=r.server_id JOIN ip_monitors m ON m.server_id=r.server_id WHERE r.source_id=? AND p.source_id=r.source_id AND m.enabled=1 AND r.status='queued' AND r.created>? ORDER BY r.id LIMIT 1",(s['id'],now-120)).fetchone()
             if not r:return jsonify(job=None)
             db.execute("UPDATE detection_runs SET status='issued',updated=? WHERE id=?",(now,r['id']))
