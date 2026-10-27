@@ -52,6 +52,10 @@ def boce(secret,path,params=None):
     query=urllib.parse.urlencode({'key':secret,**(params or {})})
     data=request_json('https://api.boce.com/v3/'+path+'?'+query)
     if not isinstance(data,dict):raise IntegrationError('BOCE API 返回格式错误（不是 JSON 对象）')
+    # Some BOCE deployments wrap the documented payload in {code:200,data:{...}}.
+    inner=data.get('data')
+    if data.get('code') in (200,'200') and isinstance(inner,dict) and ('error_code' in inner or 'done' in inner):
+        data=inner
     code=data.get('error_code',0)
     if code not in (0,'0'):
         detail=str(data.get('error') or '').strip().replace(secret,'[已隐藏]')[:240]
@@ -170,7 +174,10 @@ def start_run(connect,cipher,sid,scheduled=False):
                 data=boce(source_secret(p,cipher),'task/create/tcping',{'node_ids':','.join(map(str,nodes)),'host':ip+':'+str(m['port'])})
                 payload=data.get('data')
                 remote=payload.get('id') if isinstance(payload,dict) else None
-                if not isinstance(remote,str) or not remote or len(remote)>200 or not remote.isalnum():raise IntegrationError('BOCE 未返回有效任务 ID')
+                if not isinstance(remote,str) or not remote or len(remote)>200 or any(c.isspace() or ord(c)<32 for c in remote):
+                    detail=str(data.get('error') or data.get('message') or '')[:120]
+                    shape='data 类型='+type(payload).__name__+'，id 类型='+type(remote).__name__
+                    raise IntegrationError('BOCE 未返回有效任务 ID（'+shape+'）'+('：'+detail if detail else ''))
                 db.execute("UPDATE detection_runs SET remote_id=?,status='pending' WHERE id=?",(remote,rid))
             else:db.execute("UPDATE detection_runs SET status='queued' WHERE id=?",(rid,))
         except IntegrationError as e:
@@ -192,7 +199,7 @@ def tick(connect,cipher):
     for r in pending:
         with connect() as db:db.execute('UPDATE detection_runs SET poll_at=? WHERE id=?',(now+10,r['id']))
         try:
-            data=boce(source_secret(r,cipher),'task/tcping/'+r['remote_id'])
+            data=boce(source_secret(r,cipher),'task/tcping/'+urllib.parse.quote(r['remote_id'],safe=''))
             if type(data.get('done'))is not bool:raise IntegrationError('BOCE 结果格式无效')
             if not data['done']:continue
             status,rows=summarize(data.get('list'),json.loads(r['nodes']))
