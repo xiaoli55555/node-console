@@ -46,8 +46,10 @@ def initialize(connect):
                 if name not in existing:db.execute(f'ALTER TABLE {table} ADD COLUMN {name} {definition}')
 
 def boce(secret,path,params=None):
-    # Fixed upstream host; credential is sent in POST body, never logged or returned.
-    data=request_json('https://api.boce.com/v3/'+path,{'Content-Type':'application/x-www-form-urlencoded'},urllib.parse.urlencode({'key':secret,**(params or {})}))
+    # BOCE documents key and task parameters as query parameters; do not send form body
+    # because its API may reject that as "auth fail key nil".
+    query=urllib.parse.urlencode({'key':secret,**(params or {})})
+    data=request_json('https://api.boce.com/v3/'+path+'?'+query)
     if not isinstance(data,dict):raise IntegrationError('BOCE API 返回格式错误（不是 JSON 对象）')
     code=data.get('error_code',0)
     if code not in (0,'0'):
