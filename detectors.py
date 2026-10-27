@@ -218,10 +218,11 @@ def execute_change_ip_actions(connect,cipher):
     """Claim each queued provider API action once; ambiguous failures are never retried."""
     now=int(time.time())
     with connect() as db:
-        queued=[dict(r) for r in db.execute("SELECT r.id,r.server_id,r.ip,p.action_connection_id,s.name FROM detection_runs r JOIN detection_plans p ON p.server_id=r.server_id AND p.source_id=r.source_id JOIN detection_sources ds ON ds.id=p.source_id JOIN ip_monitors m ON m.server_id=r.server_id JOIN servers s ON s.id=r.server_id WHERE r.action_status='queued' AND r.scheduled=1 AND p.automatic=1 AND p.response_mode='change_api' AND p.action_connection_id IS NOT NULL AND ds.enabled=1 AND m.enabled=1 AND (m.current_ip IS NULL OR m.current_ip=r.ip) ORDER BY r.id LIMIT 20")]
+        db.execute("UPDATE detection_runs SET action_status='cancelled',action_result='检测端口已更改，取消旧目标的换 IP 请求' WHERE action_status='queued' AND EXISTS (SELECT 1 FROM detection_plans p WHERE p.server_id=detection_runs.server_id AND p.response_mode='change_api') AND EXISTS (SELECT 1 FROM ip_monitors m WHERE m.server_id=detection_runs.server_id AND m.port!=detection_runs.port)")
+        queued=[dict(r) for r in db.execute("SELECT r.id,r.server_id,r.ip,p.action_connection_id,s.name FROM detection_runs r JOIN detection_plans p ON p.server_id=r.server_id AND p.source_id=r.source_id JOIN detection_sources ds ON ds.id=p.source_id JOIN ip_monitors m ON m.server_id=r.server_id JOIN servers s ON s.id=r.server_id WHERE r.action_status='queued' AND r.scheduled=1 AND p.automatic=1 AND p.response_mode='change_api' AND p.action_connection_id IS NOT NULL AND ds.enabled=1 AND m.enabled=1 AND m.port=r.port AND (m.current_ip IS NULL OR m.current_ip=r.ip) ORDER BY r.id LIMIT 20")]
     for item in queued:
         with connect() as db:
-            if not db.execute("UPDATE detection_runs SET action_status='issued' WHERE id=? AND action_status='queued'",(item['id'],)).rowcount:continue
+            if not db.execute("UPDATE detection_runs SET action_status='issued' WHERE id=? AND action_status='queued' AND EXISTS (SELECT 1 FROM ip_monitors m WHERE m.server_id=detection_runs.server_id AND m.port=detection_runs.port AND m.enabled=1)",(item['id'],)).rowcount:continue
             try:connection=load_connection(db,cipher,item['action_connection_id'])
             except IntegrationError as e:
                 db.execute("UPDATE detection_runs SET action_status='failed',action_result=? WHERE id=?",('换 IP API 配置失效：'+str(e),item['id']))

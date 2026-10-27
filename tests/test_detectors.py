@@ -234,6 +234,19 @@ class DetectorTest(unittest.TestCase):
   r=self.post('/plans/1',{'source_id':source,'nodes':['self'],'interval_s':600,'daily_limit':1000,'automatic':True,'response_mode':'reboot','failure_threshold':1})
   self.assertEqual(r.status_code,400)
 
+ def test_queued_change_ip_is_cancelled_after_monitor_port_changes(self):
+  source=self.source()['id']
+  with self.connect() as db:
+   action=db.execute('INSERT INTO ip_connections(name,kind,config,secret) VALUES(?,?,?,?)',('dry-run','change_ip','{}',self.cipher.encrypt(b'dummy').decode())).lastrowid
+  self.plan(source,automatic=True,response_mode='change_api',action_connection_id=action)
+  with self.connect() as db:
+   db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,scheduled,action_status) VALUES(1,?,'8.8.8.8',443,'[]','failed',?,?,1,'queued')",(source,int(time.time()),int(time.time())))
+   db.execute('UPDATE ip_monitors SET port=23456 WHERE server_id=1')
+  with patch('detectors.invoke_change_ip_api') as api:
+   detectors.execute_change_ip_actions(self.connect,self.cipher)
+   api.assert_not_called()
+  with self.connect() as db:self.assertEqual(db.execute('SELECT action_status FROM detection_runs').fetchone()[0],'cancelled')
+
  def test_change_ip_api_runs_once_after_confirmed_scheduled_failures(self):
   source=self.source('self')['id']
   with self.connect() as db:
