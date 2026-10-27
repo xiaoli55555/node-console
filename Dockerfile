@@ -3,7 +3,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 DATA_DIR=/data COOKIE_SECURE=1
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt && useradd --uid 10001 --create-home panel && mkdir /data && chown panel:panel /data
-COPY server.py network.py credential_store.py ip_dns.py dns_worker.py ./
+COPY server.py network.py credential_store.py ip_dns.py dns_worker.py detectors.py ./
 COPY web ./web
 COPY agent ./agent
 USER panel

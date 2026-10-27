@@ -1,6 +1,7 @@
 """Run one dedicated worker: python dns_worker.py (Compose starts it automatically)."""
 import time
 import server
+from detectors import tick as detection_tick
 from ip_dns import run_binding, check_monitor, IntegrationError
 
 def tick():
@@ -20,4 +21,6 @@ if __name__=='__main__':
     while True:
         try:tick()
         except Exception:print('DNS worker: cycle failed',flush=True)
-        time.sleep(30)
+        try:detection_tick(server.connect,server.CIPHER)
+        except Exception:print("Detection worker: cycle failed",flush=True)
+        time.sleep(10)
