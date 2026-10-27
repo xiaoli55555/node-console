@@ -606,9 +606,14 @@ def report():
         if clean.get('uptime') is not None and previous.get('uptime') is not None and clean['uptime']<previous['uptime']:
             db.execute("UPDATE commands SET status='completed',updated=? WHERE server_id=? AND status='accepted' AND created>=?",(int(time.time()),row['id'],int(time.time())-600))
         db.execute("UPDATE commands SET status='unconfirmed',updated=? WHERE server_id=? AND status='accepted' AND created<?",(int(time.time()),row['id'],int(time.time())-600))
-        if 'public_ips' in clean:
+        # Match the public-IP display: fresh external observations first, then
+        # interface addresses. Missing/failed samples never erase IP history.
+        history_ips=clean.get('public_ips') or None
+        if clean.get('egress_ips') and 0<=int(time.time())-clean.get('egress_checked',0)<=90:
+            history_ips=clean['egress_ips']
+        if history_ips:
             last=db.execute('SELECT addresses FROM ip_events WHERE server_id=? ORDER BY id DESC LIMIT 1',(row['id'],)).fetchone()
-            addresses=json.dumps(clean['public_ips'])
+            addresses=json.dumps(history_ips)
             if not last or last['addresses']!=addresses:
                 db.execute('INSERT INTO ip_events(server_id,addresses,observed) VALUES(?,?,?)',(row['id'],addresses,int(time.time())))
         db.execute('UPDATE servers SET metrics=?,seen=? WHERE id=?',(json.dumps(clean),int(time.time()),row['id']))
@@ -715,7 +720,7 @@ def ip_history(sid):
         count=db.execute('SELECT COUNT(*) FROM ip_events WHERE server_id=?',(sid,)).fetchone()[0]
         return jsonify(events=[{'id':e['id'],'addresses':json.loads(e['addresses']),'observed':e['observed'],
                                 'previous_addresses':json.loads(e['previous_addresses']) if e['previous_addresses'] is not None else None} for e in events],
-                       available='public_ips' in metrics,error=metrics.get('ip_error',''),seen=row['seen'],
+                       available=bool(metrics.get('public_ips') or metrics.get('egress_ips')),error=metrics.get('egress_error','') if metrics.get('egress_ips') else metrics.get('ip_error',''),seen=row['seen'],
                        current_addresses=json.loads(latest['addresses']) if latest else None,
                        latest_observed=latest['observed'] if latest else None,total=count,has_more=more,
                        next_cursor=events[-1]['id'] if more else None)
