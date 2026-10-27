@@ -8,6 +8,7 @@ import hmac
 import http.client
 import ipaddress
 import json
+import re
 import secrets
 import socket
 import ssl
@@ -94,6 +95,12 @@ def provider_ip(connection):
 def invoke_change_ip_api(connection,server_id,server_name,current_ip):
     """Call an explicitly configured HTTPS JSON action API; never execute shell commands."""
     config=connection['config']
+    if config.get('provider')=='moonvm':
+        product=str(config.get('product',''));token=connection.get('secret','')
+        if not product.isdigit() or not token:raise IntegrationError('MoonVM API 配置无效，请重新保存完整 API 链接')
+        url='https://store.moonvm.com/ddns.php?'+urllib.parse.urlencode({'product':product,'flag':'changeip','iptoken':token})
+        response=request_moonvm(url,token)
+        return 'MoonVM 已接受换 IP 请求；请等待新 IP 上报。'+(('上游响应：'+response) if response else '')
     try:template=json.loads(config['body_json'])
     except (KeyError,TypeError,ValueError):raise IntegrationError('换 IP API 请求 JSON 无效') from None
     values={'server_id':str(server_id),'server_name':str(server_name),'current_ip':str(current_ip)}
@@ -109,6 +116,49 @@ def invoke_change_ip_api(connection,server_id,server_name,current_ip):
     response=request_json(config['url'],headers,json.dumps(expand(template),ensure_ascii=False,separators=(',',':')))
     if isinstance(response,dict) and response.get('success') is False:raise IntegrationError('换 IP API 返回失败；请核对供应商 API 参数')
     return '换 IP API 已接受请求；等待服务器上报新 IP（请求异常不会自动重试）'
+
+def parse_moonvm_url(url):
+    """Accept only MoonVM's generated change-IP link; never request it while saving."""
+    try:p=urllib.parse.urlsplit(url)
+    except (TypeError,ValueError):raise IntegrationError('请粘贴完整的 MoonVM API 链接') from None
+    try:port=p.port
+    except ValueError:raise IntegrationError('MoonVM API 端口格式错误') from None
+    if p.scheme!='https' or p.hostname!='store.moonvm.com' or port not in (None,443) or p.path!='/ddns.php' or p.username or p.password or p.fragment:
+        raise IntegrationError('链接格式不正确：请粘贴 store.moonvm.com/ddns.php 生成的完整链接')
+    try:q=urllib.parse.parse_qs(p.query,keep_blank_values=True,strict_parsing=True)
+    except ValueError:raise IntegrationError('MoonVM API 链接参数格式错误') from None
+    product=q.get('product',[]);flag=q.get('flag',[]);token=q.get('iptoken',[])
+    if len(product)!=1 or not product[0].isdigit() or len(flag)!=1 or flag[0]!='changeip' or len(token)!=1 or not re.fullmatch(r'[A-Za-z0-9_-]{8,512}',token[0]):
+        raise IntegrationError('链接缺少有效的产品编号、changeip 标记或 iptoken')
+    return product[0],token[0]
+
+def request_moonvm(url,token):
+    """Perform the fixed MoonVM HTTPS GET only when an automatic action is issued."""
+    p=endpoint(url)
+    if p.hostname!='store.moonvm.com' or p.path!='/ddns.php':raise IntegrationError('MoonVM API 地址无效')
+    try:
+        addresses=socket.getaddrinfo(p.hostname,443,type=socket.SOCK_STREAM)
+        if not addresses or any(not ipaddress.ip_address(x[4][0]).is_global for x in addresses):raise IntegrationError('MoonVM API 地址解析异常')
+        conn=http.client.HTTPSConnection(p.hostname,timeout=10)
+        raw=socket.create_connection((addresses[0][4][0],443),timeout=10)
+        try:conn.sock=ssl.create_default_context().wrap_socket(raw,server_hostname=p.hostname)
+        except Exception:raw.close();raise
+        try:
+            conn.request('GET',p.path+'?'+p.query,headers={'Accept':'text/plain, application/json'})
+            response=conn.getresponse()
+            if not 200<=response.status<300:raise IntegrationError('MoonVM API 返回 HTTP '+str(response.status))
+            body=response.read(4097)
+            if len(body)>4096:raise IntegrationError('MoonVM API 响应过大')
+            result=body.decode('utf-8','replace').strip().replace(token,'[已隐藏]')
+            if result[:1]=='{':
+                try:data=json.loads(result)
+                except ValueError:raise IntegrationError('MoonVM API 返回内容无法解析') from None
+                if isinstance(data,dict) and (data.get('success') is False or data.get('status') in ('error','failed','fail')):raise IntegrationError('MoonVM API 返回失败：'+str(data.get('message') or data.get('error') or '请检查 MoonVM 控制台'))
+            if any(word in result.lower() for word in ('invalid token','invalid iptoken','unauthorized','not found')):raise IntegrationError('MoonVM API 拒绝请求，请检查链接是否仍有效')
+            return result[:300]
+        finally:conn.close()
+    except IntegrationError:raise
+    except Exception:raise IntegrationError('连接 MoonVM API 失败；请检查服务器网络、DNS 和 TLS') from None
 
 def alidns(connection,action,**kwargs):
     params={'AccessKeyId':connection['config']['access_key_id'],'Action':action,'Format':'JSON',
@@ -302,6 +352,17 @@ def register(app,connect,cipher,auth,body,error,audit):
                 if not re.fullmatch(r'[A-Za-z0-9-]{1,64}',header) or header.lower() in ('host','content-length','connection','transfer-encoding') or any(x in prefix+secret for x in '\r\n') or len(prefix)>64 or not re.fullmatch(r'[A-Za-z0-9_.-]{1,160}',path):raise IntegrationError('认证头或字段路径格式无效')
                 if len(url)>2048:raise IntegrationError('API 地址过长')
                 config={'url':url,'header':header,'prefix':prefix,'ip_path':path}
+            elif config.get('provider')=='moonvm':
+                url=config.get('url','').strip()
+                if url:
+                    product,secret=parse_moonvm_url(url)
+                    config={'provider':'moonvm','product':product}
+                    name='MoonVM 产品 '+product
+                elif d.get('id'):
+                    with connect() as db:old=load_connection(db,cipher,d['id'])
+                    if old['kind']!='change_ip' or old['config'].get('provider')!='moonvm':raise IntegrationError('请粘贴完整的 MoonVM API 链接')
+                    config=old['config'];secret=secret or old['secret']
+                else:raise IntegrationError('请粘贴完整的 MoonVM API 链接')
             else:
                 url=config.get('url','');endpoint(url)
                 header=config.get('header','Authorization');prefix=config.get('prefix','Bearer ');body_json=config.get('body_json','{}')
@@ -341,6 +402,7 @@ def register(app,connect,cipher,auth,body,error,audit):
                 # Return enough identity information for explicit bindings; never return credentials.
                 return jsonify(ok=True,records=[{k:r.get(k) for k in ('RecordId','RR','Type','Line','Value','TTL','Status')} for r in records],total=data.get('TotalCount'),page_size=100)
             if c['kind']=='provider':return jsonify(ok=True,ip=provider_ip(c))
+            if c['config'].get('provider')=='moonvm':return jsonify(ok=True,test_supported=False,message='MoonVM API 已保存；为避免真的更换 IP，面板不会发送测试请求。')
             return jsonify(ok=True,test_supported=False,message='为避免误触发换 IP，不会发送测试请求；已验证 HTTPS 地址和请求 JSON 格式。')
         except IntegrationError as e:return error(str(e))
 
