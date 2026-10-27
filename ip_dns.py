@@ -70,7 +70,7 @@ def request_json(url, headers=None, payload=None):
             path=urllib.parse.urlunsplit(('', '', p.path or '/', p.query, ''))
             conn.request('POST' if payload is not None else 'GET',path,body=payload,headers=headers or {})
             response=conn.getresponse()
-            if response.status!=200:raise IntegrationError('上游接口返回 HTTP '+str(response.status))
+            if not 200<=response.status<300:raise IntegrationError('上游接口返回 HTTP '+str(response.status))
             data=response.read(262145)
             if len(data)>262144:raise IntegrationError('接口响应过大')
             return json.loads(data)
@@ -90,6 +90,25 @@ def provider_ip(connection):
     headers={'Accept':'application/json'}
     if connection['secret']:headers[config['header']]=config['prefix']+connection['secret']
     return public_v4(field(request_json(config['url'],headers),config['ip_path']))
+
+def invoke_change_ip_api(connection,server_id,server_name,current_ip):
+    """Call an explicitly configured HTTPS JSON action API; never execute shell commands."""
+    config=connection['config']
+    try:template=json.loads(config['body_json'])
+    except (KeyError,TypeError,ValueError):raise IntegrationError('换 IP API 请求 JSON 无效') from None
+    values={'server_id':str(server_id),'server_name':str(server_name),'current_ip':str(current_ip)}
+    def expand(value):
+        if isinstance(value,str):
+            for key,item in values.items():value=value.replace('{{'+key+'}}',item)
+            return value
+        if isinstance(value,list):return [expand(x) for x in value]
+        if isinstance(value,dict):return {k:expand(v) for k,v in value.items()}
+        return value
+    headers={'Accept':'application/json','Content-Type':'application/json'}
+    if connection['secret']:headers[config['header']]=config['prefix']+connection['secret']
+    response=request_json(config['url'],headers,json.dumps(expand(template),ensure_ascii=False,separators=(',',':')))
+    if isinstance(response,dict) and response.get('success') is False:raise IntegrationError('换 IP API 返回失败；请核对供应商 API 参数')
+    return '换 IP API 已接受请求；等待服务器上报新 IP（请求异常不会自动重试）'
 
 def alidns(connection,action,**kwargs):
     params={'AccessKeyId':connection['config']['access_key_id'],'Action':action,'Format':'JSON',
@@ -256,18 +275,29 @@ def register(app,connect,cipher,auth,body,error,audit):
         d=body()
         try:
             kind=d.get('kind');name=d.get('name','').strip();config=d.get('config',{});secret=d.get('secret','')
-            if kind not in ('alidns','provider') or not 1<=len(name)<=80 or not isinstance(config,dict) or not isinstance(secret,str) or len(secret)>4096:raise IntegrationError('API 配置格式无效')
+            if kind not in ('alidns','provider','change_ip') or not 1<=len(name)<=80 or not isinstance(config,dict) or not isinstance(secret,str) or len(secret)>4096:raise IntegrationError('API 配置格式无效')
             if kind=='alidns':
                 key=config.get('access_key_id','').strip()
                 if not key or len(key)>128:raise IntegrationError('请填写 AccessKey ID')
                 config={'access_key_id':key}
-            else:
+            elif kind=='provider':
                 url=config.get('url','');endpoint(url)
                 header=config.get('header','Authorization');prefix=config.get('prefix','Bearer ');path=config.get('ip_path','data.ip')
                 import re
                 if not re.fullmatch(r'[A-Za-z0-9-]{1,64}',header) or header.lower() in ('host','content-length','connection','transfer-encoding') or any(x in prefix+secret for x in '\r\n') or len(prefix)>64 or not re.fullmatch(r'[A-Za-z0-9_.-]{1,160}',path):raise IntegrationError('认证头或字段路径格式无效')
                 if len(url)>2048:raise IntegrationError('API 地址过长')
                 config={'url':url,'header':header,'prefix':prefix,'ip_path':path}
+            else:
+                url=config.get('url','');endpoint(url)
+                header=config.get('header','Authorization');prefix=config.get('prefix','Bearer ');body_json=config.get('body_json','{}')
+                import re
+                if not re.fullmatch(r'[A-Za-z0-9-]{1,64}',header) or header.lower() in ('host','content-length','connection','transfer-encoding') or any(x in prefix+secret for x in '\r\n') or len(prefix)>64:raise IntegrationError('认证头或凭证前缀格式无效')
+                if len(url)>2048 or not isinstance(body_json,str) or len(body_json)>6000:raise IntegrationError('API 地址或请求 JSON 过长')
+                try:
+                    parsed=json.loads(body_json)
+                    if not isinstance(parsed,dict):raise ValueError()
+                except ValueError:raise IntegrationError('换 IP API 请求体必须是有效 JSON 对象') from None
+                config={'url':url,'header':header,'prefix':prefix,'body_json':body_json}
             with connect() as db:
                 cid=d.get('id')
                 if cid:
@@ -295,7 +325,8 @@ def register(app,connect,cipher,auth,body,error,audit):
                 records=data.get('DomainRecords',{}).get('Record',[])
                 # Return enough identity information for explicit bindings; never return credentials.
                 return jsonify(ok=True,records=[{k:r.get(k) for k in ('RecordId','RR','Type','Line','Value','TTL','Status')} for r in records],total=data.get('TotalCount'),page_size=100)
-            return jsonify(ok=True,ip=provider_ip(c))
+            if c['kind']=='provider':return jsonify(ok=True,ip=provider_ip(c))
+            return jsonify(ok=True,test_supported=False,message='为避免误触发换 IP，不会发送测试请求；已验证 HTTPS 地址和请求 JSON 格式。')
         except IntegrationError as e:return error(str(e))
 
     @app.post('/api/ip-dns/bindings')
