@@ -234,6 +234,29 @@ class DetectorTest(unittest.TestCase):
   r=self.post('/plans/1',{'source_id':source,'nodes':['self'],'interval_s':600,'daily_limit':1000,'automatic':True,'response_mode':'reboot','failure_threshold':1})
   self.assertEqual(r.status_code,400)
 
+ def test_resaving_plan_preserves_cooldown_for_both_automatic_actions(self):
+  for mode in ['reboot','change_api']:
+   with self.subTest(mode=mode):
+    source=self.source('self')['id'];options={'automatic':True,'response_mode':mode,'failure_threshold':2}
+    if mode=='change_api':
+     with self.connect() as db:options['action_connection_id']=db.execute('INSERT INTO ip_connections(name,kind,config,secret) VALUES(?,?,?,?)',('dry-run','change_ip','{}',self.cipher.encrypt(b'dummy').decode())).lastrowid
+    self.plan(source,**options)
+    last_action=int(time.time())-60
+    with self.connect() as db:db.execute('UPDATE detection_plans SET last_action=? WHERE server_id=1',(last_action,))
+    self.plan(source,**options)
+    with self.connect() as db:self.assertEqual(db.execute('SELECT last_action FROM detection_plans WHERE server_id=1').fetchone()[0],last_action)
+    with patch('detectors.queue_reboot') as reboot,patch('detectors.invoke_change_ip_api') as change:
+     for _ in range(2):
+      with self.connect() as db:
+       rid=db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,scheduled) VALUES(1,?,'8.8.8.8',443,'[\"self\"]','pending',?,?,1)",(source,int(time.time()),int(time.time()))).lastrowid
+       run=dict(db.execute('SELECT * FROM detection_runs WHERE id=?',(rid,)).fetchone())
+       detectors.finish(db,run,'不通',[{'node_id':'self','state':'unreachable'}])
+     detectors.execute_change_ip_actions(self.connect,self.cipher)
+     reboot.assert_not_called();change.assert_not_called()
+    with self.connect() as db:
+     self.assertIn('冷却期',db.execute('SELECT action_result FROM detection_runs WHERE id=?',(rid,)).fetchone()[0])
+     self.assertEqual(db.execute('SELECT COUNT(*) FROM commands').fetchone()[0],0)
+
  def test_queued_change_ip_is_cancelled_after_monitor_port_changes(self):
   source=self.source()['id']
   with self.connect() as db:
