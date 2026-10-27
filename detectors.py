@@ -34,11 +34,14 @@ def initialize(connect):
                 'failure_ip':'TEXT',
                 'failure_port':'INTEGER',
                 'last_action':'INTEGER',
+                'action_enabled':'INTEGER NOT NULL DEFAULT 1',
+                'action_after_run':'INTEGER NOT NULL DEFAULT 0',
             },
             'detection_runs':{
                 'scheduled':'INTEGER NOT NULL DEFAULT 0',
                 'action_result':'TEXT',
                 'action_status':'TEXT',
+                'action_command_id':'INTEGER',
             },
         }
         for table,columns in migrations.items():
@@ -117,7 +120,7 @@ def finish(db,run,status,rows):
     if plan and plan['source_enabled'] and plan['source_id']==run['source_id'] and plan['nodes']==run['nodes'] and current and current['enabled'] and current['port']==run['port'] and (not current['current_ip'] or current['current_ip']==run['ip']):
         scheduled=bool(run['scheduled']) if 'scheduled' in run.keys() else False
         streak=plan['failure_streak']
-        if scheduled:
+        if scheduled and plan['action_enabled'] and run['id']>plan['action_after_run']:
             complete_failure=bool(rows) and all(r.get('state')=='unreachable' for r in rows)
             if complete_failure:
                 same_target=plan['failure_ip']==run['ip'] and plan['failure_port']==run['port']
@@ -130,6 +133,9 @@ def finish(db,run,status,rows):
                         if plan['response_mode']=='reboot':
                             action_result=queue_reboot(db,run['server_id'],now)
                             action_status='queued' if action_result.startswith('已排队') else 'skipped'
+                            if action_status=='queued':
+                                command=db.execute("SELECT id FROM commands WHERE server_id=? AND action='reboot' AND status='queued' ORDER BY id DESC LIMIT 1",(run['server_id'],)).fetchone()
+                                db.execute('UPDATE detection_runs SET action_command_id=? WHERE id=?',(command['id'] if command else None,run['id']))
                         elif plan['action_connection_id']:
                             action_result='换 IP API 已排队；为避免重复换 IP，不会自动重试请求'
                             action_status='queued'
@@ -219,10 +225,10 @@ def execute_change_ip_actions(connect,cipher):
     now=int(time.time())
     with connect() as db:
         db.execute("UPDATE detection_runs SET action_status='cancelled',action_result='检测端口已更改，取消旧目标的换 IP 请求' WHERE action_status='queued' AND EXISTS (SELECT 1 FROM detection_plans p WHERE p.server_id=detection_runs.server_id AND p.response_mode='change_api') AND EXISTS (SELECT 1 FROM ip_monitors m WHERE m.server_id=detection_runs.server_id AND m.port!=detection_runs.port)")
-        queued=[dict(r) for r in db.execute("SELECT r.id,r.server_id,r.ip,p.action_connection_id,s.name FROM detection_runs r JOIN detection_plans p ON p.server_id=r.server_id AND p.source_id=r.source_id JOIN detection_sources ds ON ds.id=p.source_id JOIN ip_monitors m ON m.server_id=r.server_id JOIN servers s ON s.id=r.server_id WHERE r.action_status='queued' AND r.scheduled=1 AND p.automatic=1 AND p.response_mode='change_api' AND p.action_connection_id IS NOT NULL AND ds.enabled=1 AND m.enabled=1 AND m.port=r.port AND (m.current_ip IS NULL OR m.current_ip=r.ip) ORDER BY r.id LIMIT 20")]
+        queued=[dict(r) for r in db.execute("SELECT r.id,r.server_id,r.ip,p.action_connection_id,s.name FROM detection_runs r JOIN detection_plans p ON p.server_id=r.server_id AND p.source_id=r.source_id JOIN detection_sources ds ON ds.id=p.source_id JOIN ip_monitors m ON m.server_id=r.server_id JOIN servers s ON s.id=r.server_id WHERE r.action_status='queued' AND r.scheduled=1 AND p.automatic=1 AND p.action_enabled=1 AND r.id>p.action_after_run AND p.response_mode='change_api' AND p.action_connection_id IS NOT NULL AND ds.enabled=1 AND m.enabled=1 AND m.port=r.port AND (m.current_ip IS NULL OR m.current_ip=r.ip) ORDER BY r.id LIMIT 20")]
     for item in queued:
         with connect() as db:
-            if not db.execute("UPDATE detection_runs SET action_status='issued' WHERE id=? AND action_status='queued' AND EXISTS (SELECT 1 FROM ip_monitors m WHERE m.server_id=detection_runs.server_id AND m.port=detection_runs.port AND m.enabled=1)",(item['id'],)).rowcount:continue
+            if not db.execute("UPDATE detection_runs SET action_status='issued' WHERE id=? AND action_status='queued' AND EXISTS (SELECT 1 FROM ip_monitors m WHERE m.server_id=detection_runs.server_id AND m.port=detection_runs.port AND m.enabled=1) AND EXISTS (SELECT 1 FROM detection_plans p WHERE p.server_id=detection_runs.server_id AND p.action_enabled=1 AND p.automatic=1 AND detection_runs.id>p.action_after_run AND p.response_mode='change_api')",(item['id'],)).rowcount:continue
             try:connection=load_connection(db,cipher,item['action_connection_id'])
             except IntegrationError as e:
                 db.execute("UPDATE detection_runs SET action_status='failed',action_result=? WHERE id=?",('换 IP API 配置失效：'+str(e),item['id']))
@@ -260,7 +266,7 @@ def register(app,connect,cipher,auth,body,error,audit):
                 run=db.execute('SELECT id,ip,port,status,created,updated,details,action_result FROM detection_runs WHERE server_id=? AND source_id=? ORDER BY id DESC LIMIT 1',(p['server_id'],p['source_id'])).fetchone()
                 latest=dict(run) if run else None
                 if latest:latest['details']=json.loads(latest['details'])
-                result.append({'server_id':p['server_id'],'current_port':p['current_port'],'source_kind':p['source_kind'],'current_ip':p['current_ip'],'monitor_enabled':bool(p['monitor_enabled']),'source_name':p['source_name'],'source_enabled':bool(p['source_enabled']),'automatic':bool(p['automatic']),'status':p['status'],'checked':p['checked'],'next_at':p['next_at'],'failure_streak':p['failure_streak'],'failure_threshold':p['failure_threshold'],'run':latest})
+                result.append({'server_id':p['server_id'],'current_port':p['current_port'],'source_kind':p['source_kind'],'current_ip':p['current_ip'],'monitor_enabled':bool(p['monitor_enabled']),'source_name':p['source_name'],'source_enabled':bool(p['source_enabled']),'automatic':bool(p['automatic']),'action_enabled':bool(p['action_enabled']),'response_mode':p['response_mode'],'status':p['status'],'checked':p['checked'],'next_at':p['next_at'],'failure_streak':p['failure_streak'],'failure_threshold':p['failure_threshold'],'run':latest})
         return jsonify(monitors=result,now=int(time.time()))
 
     @app.post('/api/detection/sources')
@@ -329,6 +335,25 @@ def register(app,connect,cipher,auth,body,error,audit):
             if db.execute('SELECT 1 FROM detection_plans WHERE source_id=?',(sid,)).fetchone() or db.execute("SELECT 1 FROM detection_runs WHERE source_id=? AND status IN ('pending','queued','issued','creating')",(sid,)).fetchone():return error('来源仍被使用，请先更换或移除检测计划')
             db.execute('DELETE FROM detection_runs WHERE source_id=?',(sid,));db.execute('DELETE FROM detection_sources WHERE id=?',(sid,));audit(db,'删除检测来源 #'+str(sid))
         return jsonify(ok=True)
+
+    @app.patch('/api/detection/plans/<int:sid>/actions')
+    @auth(admin=True)
+    def detection_toggle_actions(sid):
+        enabled=body().get('enabled')
+        if type(enabled)is not bool:return error('开关值必须为布尔值')
+        with connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            plan=db.execute('SELECT p.*,s.enabled AS source_enabled,m.enabled AS monitor_enabled FROM detection_plans p JOIN detection_sources s ON s.id=p.source_id JOIN ip_monitors m ON m.server_id=p.server_id WHERE p.server_id=?',(sid,)).fetchone()
+            if not plan:return error('请先配置此 VPS 的检测计划',404)
+            if enabled and (not plan['automatic'] or not plan['source_enabled'] or not plan['monitor_enabled'] or plan['response_mode'] not in ('reboot','change_api')):return error('请先启用监控、探测来源和定时探测，并配置自动重启或换 IP API')
+            if bool(plan['action_enabled'])==enabled:return jsonify(ok=True,enabled=enabled)
+            last=db.execute('SELECT COALESCE(MAX(id),0) FROM detection_runs WHERE server_id=?',(sid,)).fetchone()[0]
+            db.execute('UPDATE detection_plans SET action_enabled=?,action_after_run=?,failure_streak=0,failure_ip=NULL,failure_port=NULL WHERE server_id=?',(int(enabled),last,sid))
+            # Cancel only reboot commands linked to this automation, never manual commands.
+            db.execute("UPDATE commands SET status='cancelled',updated=? WHERE server_id=? AND status IN ('queued','issued') AND id IN (SELECT action_command_id FROM detection_runs WHERE server_id=? AND action_command_id IS NOT NULL)",(int(time.time()),sid,sid))
+            db.execute("UPDATE detection_runs SET action_status='cancelled',action_result='自动处理已暂停或重新启用，取消旧任务动作' WHERE server_id=? AND action_status='queued'",(sid,))
+            audit(db,('开启' if enabled else '暂停')+' VPS 自动换 IP / 重启 #'+str(sid))
+        return jsonify(ok=True,enabled=enabled,message='已开启，从下一轮新任务累计失败；保留原冷却时间' if enabled else '已暂停自动动作，探测与 DNS 同步继续；已发出的供应商请求或已开始重启无法撤回')
 
     @app.post('/api/detection/plans/<int:sid>')
     @auth(admin=True)
