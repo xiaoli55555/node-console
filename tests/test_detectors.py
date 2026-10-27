@@ -74,6 +74,23 @@ class DetectorTest(unittest.TestCase):
   self.assertNotIn('testsecret',response.text)
   self.assertEqual(self.client.get('/api/detection/monitor-status').status_code,403)
 
+ def test_custom_probe_port_is_saved_and_sent_to_boce(self):
+  source=self.source()['id'];self.plan(source,port=23456)
+  with patch('detectors.boce',return_value={'data':{'id':'task123'}}) as call:detectors.start_run(self.connect,self.cipher,1)
+  self.assertEqual(call.call_args.args[2]['host'],'8.8.8.8:23456')
+  overview=self.client.get('/api/detection',headers=self.headers).json
+  self.assertEqual(overview['plans'][0]['port'],23456)
+  bad=self.post('/plans/1',{'source_id':source,'nodes':['1'],'port':0})
+  self.assertEqual(bad.status_code,400)
+ def test_old_port_result_does_not_update_reconfigured_plan(self):
+  source=self.source()['id'];self.plan(source)
+  with patch('detectors.boce',return_value={'data':{'id':'task123'}}):detectors.start_run(self.connect,self.cipher,1)
+  with self.connect() as db:
+   db.execute('UPDATE ip_monitors SET port=23456 WHERE server_id=1')
+   run=dict(db.execute('SELECT * FROM detection_runs').fetchone())
+   detectors.finish(db,run,'old-port-result',[{'state':'unreachable'}])
+   self.assertNotEqual(db.execute('SELECT status FROM detection_plans').fetchone()[0],'old-port-result')
+
  def test_boce_error_shows_safe_upstream_reason(self):
   with patch('detectors.request_json',return_value={'error_code':401,'error':'invalid API key: testsecret'}):
    with self.assertRaises(IntegrationError) as raised:detectors.boce('testsecret','node/list')

@@ -113,8 +113,8 @@ def finish(db,run,status,rows):
     db.execute('UPDATE detection_runs SET status=?,details=?,updated=? WHERE id=?',(status,json.dumps(rows),now,run['id']))
     # Do not apply old source/IP results to a reconfigured plan or a changed target.
     plan=db.execute('SELECT p.*,s.enabled AS source_enabled FROM detection_plans p JOIN detection_sources s ON s.id=p.source_id WHERE p.server_id=?',(run['server_id'],)).fetchone()
-    current=db.execute('SELECT current_ip,enabled FROM ip_monitors WHERE server_id=?',(run['server_id'],)).fetchone()
-    if plan and plan['source_enabled'] and plan['source_id']==run['source_id'] and plan['nodes']==run['nodes'] and current and current['enabled'] and (not current['current_ip'] or current['current_ip']==run['ip']):
+    current=db.execute('SELECT current_ip,enabled,port FROM ip_monitors WHERE server_id=?',(run['server_id'],)).fetchone()
+    if plan and plan['source_enabled'] and plan['source_id']==run['source_id'] and plan['nodes']==run['nodes'] and current and current['enabled'] and current['port']==run['port'] and (not current['current_ip'] or current['current_ip']==run['ip']):
         scheduled=bool(run['scheduled']) if 'scheduled' in run.keys() else False
         streak=plan['failure_streak']
         if scheduled:
@@ -242,7 +242,7 @@ def register(app,connect,cipher,auth,body,error,audit):
     def detection_overview():
         with connect() as db:
             sources=[{k:r[k] for k in ('id','name','kind','enabled','last_seen','verified_at')} for r in db.execute('SELECT * FROM detection_sources')]
-            plans=[dict(r) for r in db.execute('SELECT * FROM detection_plans')]
+            plans=[dict(r) for r in db.execute('SELECT p.*,m.port FROM detection_plans p JOIN ip_monitors m ON m.server_id=p.server_id')]
             runs=[dict(r) for r in db.execute('SELECT id,server_id,source_id,ip,port,status,created,updated,details,action_result,action_status FROM detection_runs ORDER BY id DESC LIMIT 50')]
         for p in plans:p['nodes']=json.loads(p['nodes'])
         for r in runs:r['details']=json.loads(r['details'])
@@ -253,13 +253,13 @@ def register(app,connect,cipher,auth,body,error,audit):
     def detection_monitor_status():
         # Read existing runs only: refreshing this view never creates paid tasks.
         with connect() as db:
-            plans=db.execute('SELECT p.*,s.name AS source_name,s.kind AS source_kind,s.enabled AS source_enabled,m.current_ip,m.enabled AS monitor_enabled FROM detection_plans p JOIN detection_sources s ON s.id=p.source_id JOIN ip_monitors m ON m.server_id=p.server_id').fetchall()
+            plans=db.execute('SELECT p.*,s.name AS source_name,s.kind AS source_kind,s.enabled AS source_enabled,m.current_ip,m.port AS current_port,m.enabled AS monitor_enabled FROM detection_plans p JOIN detection_sources s ON s.id=p.source_id JOIN ip_monitors m ON m.server_id=p.server_id').fetchall()
             result=[]
             for p in plans:
                 run=db.execute('SELECT id,ip,port,status,created,updated,details,action_result FROM detection_runs WHERE server_id=? AND source_id=? ORDER BY id DESC LIMIT 1',(p['server_id'],p['source_id'])).fetchone()
                 latest=dict(run) if run else None
                 if latest:latest['details']=json.loads(latest['details'])
-                result.append({'server_id':p['server_id'],'source_kind':p['source_kind'],'current_ip':p['current_ip'],'monitor_enabled':bool(p['monitor_enabled']),'source_name':p['source_name'],'source_enabled':bool(p['source_enabled']),'automatic':bool(p['automatic']),'status':p['status'],'checked':p['checked'],'next_at':p['next_at'],'failure_streak':p['failure_streak'],'failure_threshold':p['failure_threshold'],'run':latest})
+                result.append({'server_id':p['server_id'],'current_port':p['current_port'],'source_kind':p['source_kind'],'current_ip':p['current_ip'],'monitor_enabled':bool(p['monitor_enabled']),'source_name':p['source_name'],'source_enabled':bool(p['source_enabled']),'automatic':bool(p['automatic']),'status':p['status'],'checked':p['checked'],'next_at':p['next_at'],'failure_streak':p['failure_streak'],'failure_threshold':p['failure_threshold'],'run':latest})
         return jsonify(monitors=result,now=int(time.time()))
 
     @app.post('/api/detection/sources')
@@ -334,6 +334,8 @@ def register(app,connect,cipher,auth,body,error,audit):
     def detection_save_plan(sid):
         d=body();ids=d.get('nodes',[]);interval=d.get('interval_s',600);limit=d.get('daily_limit',1000);automatic=d.get('automatic',False);response_mode=d.get('response_mode','none');action_connection_id=d.get('action_connection_id') or None;failure_threshold=d.get('failure_threshold',3)
         if not isinstance(ids,list) or len(ids)>20 or any(not str(x).isdigit() for x in ids) or type(interval)is not int or not 120<=interval<=86400 or type(limit)is not int or not 1<=limit<=100000 or type(automatic)is not bool or response_mode not in ('none','reboot','change_api') or type(failure_threshold)is not int or not 2<=failure_threshold<=5:return error('检测节点、频率、上限或自动处理策略无效')
+        port=d.get('port')
+        if port is not None and (type(port)is not int or not 1<=port<=65535):return error('业务 TCP 端口必须为 1–65535 的整数')
         if response_mode!='none' and not automatic:return error('自动处理必须同时开启定时检测')
         if response_mode=='change_api' and type(action_connection_id)is not int:return error('请选择换 IP API 连接')
         if response_mode!='change_api':action_connection_id=None
@@ -347,6 +349,7 @@ def register(app,connect,cipher,auth,body,error,audit):
                 if not action or action['kind']!='change_ip':return error('请选择有效的换 IP API 连接')
             ids=sorted(set(map(str,ids))) if s['kind']=='boce' else ['self']
             if not ids:return error('请填写至少一个节点 ID')
+            if port is not None:db.execute('UPDATE ip_monitors SET port=? WHERE server_id=?',(port,sid))
             existing=db.execute('SELECT next_at FROM detection_plans WHERE server_id=?',(sid,)).fetchone()
             db.execute("UPDATE detection_runs SET action_status='cancelled',action_result='检测配置已更新，未发送换 IP 请求' WHERE server_id=? AND action_status='queued'",(sid,))
             db.execute('INSERT INTO detection_plans(server_id,source_id,nodes,interval_s,automatic,daily_limit,next_at,response_mode,action_connection_id,failure_threshold,failure_streak,failure_ip,failure_port,last_action) VALUES(?,?,?,?,?,?,?,?,?,?,0,NULL,NULL,NULL) ON CONFLICT(server_id) DO UPDATE SET source_id=excluded.source_id,nodes=excluded.nodes,interval_s=excluded.interval_s,automatic=excluded.automatic,daily_limit=excluded.daily_limit,response_mode=excluded.response_mode,action_connection_id=excluded.action_connection_id,failure_threshold=excluded.failure_threshold,failure_streak=0,failure_ip=NULL,failure_port=NULL,last_action=NULL,status=\'等待新配置检测\',checked=NULL',(sid,s['id'],json.dumps(ids),interval,int(automatic),limit,existing['next_at'] if existing else 0,response_mode,action_connection_id,failure_threshold))
