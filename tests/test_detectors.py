@@ -22,8 +22,9 @@ class DetectorTest(unittest.TestCase):
    finally:db.close()
   self.connect=connect
   with connect() as db:
-   db.executescript('CREATE TABLE servers(id INTEGER PRIMARY KEY,name TEXT,metrics TEXT,seen INTEGER);')
-   db.execute('INSERT INTO servers VALUES(1,?,?,?)',('test',json.dumps({'public_ips':['8.8.8.8']}),int(time.time())))
+   db.executescript('CREATE TABLE users(id INTEGER PRIMARY KEY,role TEXT); CREATE TABLE audit(id INTEGER PRIMARY KEY,user_id INTEGER,action TEXT,created INTEGER); CREATE TABLE commands(id INTEGER PRIMARY KEY,server_id INTEGER,user_id INTEGER,action TEXT,status TEXT,created INTEGER,updated INTEGER); CREATE TABLE servers(id INTEGER PRIMARY KEY,name TEXT,metrics TEXT,seen INTEGER);')
+   db.execute("INSERT INTO users VALUES(1,'admin')")
+   db.execute('INSERT INTO servers VALUES(1,?,?,?)',('test',json.dumps({'public_ips':['8.8.8.8'],'capabilities':['reboot']}),int(time.time())))
   init_schema(connect);detectors.initialize(connect)
   with connect() as db:db.execute('INSERT INTO ip_monitors(server_id) VALUES(1)')
   def auth(admin=False):
@@ -92,6 +93,22 @@ class DetectorTest(unittest.TestCase):
   with self.connect() as db:db.execute('UPDATE detection_runs SET created=1')
   detectors.tick(self.connect,self.cipher)
   with self.connect() as db:self.assertIn('不能判定',db.execute('SELECT status FROM detection_runs').fetchone()[0])
+ def test_only_scheduled_repeated_multi_point_failures_queue_reboot(self):
+  source=self.source();self.plan(source['id'],automatic=True,remediation='reboot',failure_threshold=2,cooldown_s=3600)
+  rows=[{'state':'unreachable'},{'state':'unreachable'}]
+  with self.connect() as db:db.execute('UPDATE servers SET metrics=?,seen=? WHERE id=1',(json.dumps({'public_ips':['8.8.8.8'],'capabilities':['reboot']}),int(time.time())))
+  with patch('detectors.boce',return_value={'data':{'id':'manual1'}}):rid=detectors.start_run(self.connect,self.cipher,1)
+  with self.connect() as db:
+   run=db.execute('SELECT * FROM detection_runs WHERE id=?',(rid,)).fetchone();detectors.finish(db,run,'all failed',rows)
+   self.assertEqual(db.execute('SELECT COUNT(*) FROM commands').fetchone()[0],0);db.execute('UPDATE detection_plans SET next_at=0')
+  with patch('detectors.boce',return_value={'data':{'id':'auto1'}}):rid=detectors.start_run(self.connect,self.cipher,1,scheduled=True)
+  with self.connect() as db:
+   run=db.execute('SELECT * FROM detection_runs WHERE id=?',(rid,)).fetchone();detectors.finish(db,run,'all failed',rows);db.execute('UPDATE detection_plans SET next_at=0')
+  with patch('detectors.boce',return_value={'data':{'id':'auto2'}}):rid=detectors.start_run(self.connect,self.cipher,1,scheduled=True)
+  with self.connect() as db:
+   run=db.execute('SELECT * FROM detection_runs WHERE id=?',(rid,)).fetchone();detectors.finish(db,run,'all failed',rows)
+   cmd=db.execute('SELECT action,status FROM commands').fetchone();self.assertEqual(tuple(cmd),('reboot','queued'))
+   self.assertIn('已排队自动重启',db.execute('SELECT status FROM detection_plans').fetchone()[0])
  def test_boce_nodes_request_uses_default_mainland(self):
   sid=self.source()['id']
   with patch('detectors.boce',return_value={'data':{'list':[{'id':6,'node_name':'河北','isp_name':'电信'}]}}) as call:

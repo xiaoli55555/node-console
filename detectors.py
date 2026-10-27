@@ -12,12 +12,20 @@ from ip_dns import IntegrationError, request_json, candidate_ip
 SCHEMA='''
 CREATE TABLE IF NOT EXISTS detection_sources(id INTEGER PRIMARY KEY,name TEXT NOT NULL,kind TEXT NOT NULL,secret TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE IF NOT EXISTS detection_plans(server_id INTEGER PRIMARY KEY REFERENCES servers(id) ON DELETE CASCADE,source_id INTEGER NOT NULL REFERENCES detection_sources(id),nodes TEXT NOT NULL DEFAULT '[]',interval_s INTEGER NOT NULL DEFAULT 600,automatic INTEGER NOT NULL DEFAULT 0,daily_limit INTEGER NOT NULL DEFAULT 1000,next_at INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT '等待检测',checked INTEGER);
-CREATE TABLE IF NOT EXISTS detection_runs(id INTEGER PRIMARY KEY,server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,source_id INTEGER NOT NULL REFERENCES detection_sources(id),ip TEXT NOT NULL,port INTEGER NOT NULL,nodes TEXT NOT NULL,status TEXT NOT NULL,remote_id TEXT,created INTEGER NOT NULL,updated INTEGER NOT NULL,details TEXT NOT NULL DEFAULT '[]',poll_at INTEGER NOT NULL DEFAULT 0,cost INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS detection_runs(id INTEGER PRIMARY KEY,server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,source_id INTEGER NOT NULL REFERENCES detection_sources(id),ip TEXT NOT NULL,port INTEGER NOT NULL,nodes TEXT NOT NULL,status TEXT NOT NULL,remote_id TEXT,created INTEGER NOT NULL,updated INTEGER NOT NULL,details TEXT NOT NULL DEFAULT '[]',poll_at INTEGER NOT NULL DEFAULT 0,cost INTEGER NOT NULL DEFAULT 0,scheduled INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS detection_pending ON detection_runs(status,poll_at);
 '''
 
 def initialize(connect):
-    with connect() as db:db.executescript(SCHEMA)
+    with connect() as db:
+        db.executescript(SCHEMA)
+        for table,columns in {
+            'detection_plans': [('remediation', "TEXT NOT NULL DEFAULT 'none'"),('failure_threshold','INTEGER NOT NULL DEFAULT 3'),('cooldown_s','INTEGER NOT NULL DEFAULT 21600'),('failure_streak','INTEGER NOT NULL DEFAULT 0'),('last_action_at','INTEGER')],
+            'detection_runs': [('scheduled','INTEGER NOT NULL DEFAULT 0')],
+        }.items():
+            existing={row[1] for row in db.execute('PRAGMA table_info('+table+')')}
+            for name,declaration in columns:
+                if name not in existing:db.execute('ALTER TABLE '+table+' ADD COLUMN '+name+' '+declaration)
 
 def boce(secret,path,params=None):
     # Fixed upstream host; credential is sent in POST body, never logged or returned.
@@ -62,9 +70,29 @@ def finish(db,run,status,rows):
     plan=db.execute('SELECT * FROM detection_plans WHERE server_id=?',(run['server_id'],)).fetchone()
     current=db.execute('SELECT current_ip FROM ip_monitors WHERE server_id=?',(run['server_id'],)).fetchone()
     if plan and plan['source_id']==run['source_id'] and plan['nodes']==run['nodes'] and (not current or not current['current_ip'] or current['current_ip']==run['ip']):
-        db.execute('UPDATE detection_plans SET status=?,checked=? WHERE server_id=?',(status,now,run['server_id']))
+        streak=plan['failure_streak'];states=[r.get('state') for r in rows if isinstance(r,dict)];node_count=len(json.loads(run['nodes']))
+        complete_failure=bool(states) and len(states)==node_count and all(s=='unreachable' for s in states)
+        if run['scheduled'] and complete_failure:streak+=1
+        elif 'reachable' in states:streak=0
+        db.execute('UPDATE detection_plans SET status=?,checked=?,failure_streak=? WHERE server_id=?',(status,now,streak,run['server_id']))
+        eligible=(run['scheduled'] and complete_failure and plan['automatic'] and plan['remediation']=='reboot' and node_count>=2 and streak>=plan['failure_threshold'])
+        if eligible:
+            server=db.execute('SELECT metrics,seen FROM servers WHERE id=?',(run['server_id'],)).fetchone()
+            metrics=json.loads(server['metrics'] or '{}') if server else {}
+            online=bool(server and server['seen'] and now-server['seen']<=60 and 'reboot' in metrics.get('capabilities',[]))
+            pending=db.execute("SELECT 1 FROM commands WHERE server_id=? AND status IN ('queued','issued','accepted')",(run['server_id'],)).fetchone()
+            cooldown_ok=not plan['last_action_at'] or now-plan['last_action_at']>=plan['cooldown_s']
+            if online and not pending and cooldown_ok:
+                admin=db.execute("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1").fetchone()
+                if admin:
+                    db.execute("INSERT INTO commands(server_id,user_id,action,status,created,updated) VALUES(?,?,'reboot','queued',?,?)",(run['server_id'],admin['id'],now,now))
+                    db.execute('UPDATE detection_plans SET failure_streak=0,last_action_at=?,status=? WHERE server_id=?',(now,'多点连续检测均不通，已排队自动重启',run['server_id']))
+                    db.execute('INSERT INTO audit(user_id,action,created) VALUES(?,?,?)',(admin['id'],f'检测计划自动为 VPS #{run["server_id"]} 排队重启（多点连续不通）',now))
+            elif not online:db.execute('UPDATE detection_plans SET status=? WHERE server_id=?',('多点连续检测均不通，但 VPS 采集端离线或不支持重启，未执行',run['server_id']))
+            elif pending:db.execute('UPDATE detection_plans SET status=? WHERE server_id=?',('多点连续检测均不通，已有任务待完成，未重复重启',run['server_id']))
+            elif not cooldown_ok:db.execute('UPDATE detection_plans SET status=? WHERE server_id=?',('多点连续检测均不通，处于重启冷却期，未执行',run['server_id']))
 
-def start_run(connect,cipher,sid):
+def start_run(connect,cipher,sid,scheduled=False):
     # Hold the SQLite write lock across creation. Ambiguous POST failure is NOT retried automatically.
     with connect() as db:
         db.execute('BEGIN IMMEDIATE')
@@ -77,13 +105,14 @@ def start_run(connect,cipher,sid):
         if now<p['next_at']:raise IntegrationError('尚未到下一次检测时间，请避免重复扣费')
         ip=candidate_ip(db,m,cipher);nodes=json.loads(p['nodes']) if p['kind']=='boce' else ['self']
         if not nodes:raise IntegrationError('请至少选择一个国内检测点')
+        if p['remediation']=='reboot' and (p['kind']!='boce' or len(nodes)<2 or not p['automatic']):raise IntegrationError('自动重启要求开启定时检测并至少配置两个 BOCE 国内检测点')
         cost=len(nodes) if p['kind']=='boce' else 0
         from datetime import datetime
         from zoneinfo import ZoneInfo
         z=ZoneInfo('Asia/Shanghai');today=datetime.now(z).replace(hour=0,minute=0,second=0,microsecond=0).timestamp()
         used=db.execute('SELECT COALESCE(SUM(cost),0) FROM detection_runs WHERE server_id=? AND created>=?',(sid,today)).fetchone()[0]
         if used+cost>p['daily_limit']:raise IntegrationError('已达到此 VPS 的每日节点检测次数上限')
-        rid=db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,poll_at,cost) VALUES(?,?,?,?,?,'creating',?,?,?,?)",(sid,p['source_id'],ip,m['port'],json.dumps(nodes),now,now,now+10,cost)).lastrowid
+        rid=db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,poll_at,cost,scheduled) VALUES(?,?,?,?,?,'creating',?,?,?,?,?)",(sid,p['source_id'],ip,m['port'],json.dumps(nodes),now,now,now+10,cost,int(scheduled))).lastrowid
         db.execute('UPDATE detection_plans SET next_at=?,status=? WHERE server_id=?',(now+p['interval_s'],'检测中',sid))
         try:
             if p['kind']=='boce':
@@ -119,7 +148,7 @@ def tick(connect,cipher):
     with connect() as db:
         due=[r[0] for r in db.execute('SELECT p.server_id FROM detection_plans p JOIN ip_monitors m ON m.server_id=p.server_id JOIN detection_sources s ON s.id=p.source_id WHERE p.automatic=1 AND m.enabled=1 AND s.enabled=1 AND p.next_at<=?',(now,))]
     for sid in due:
-        try:start_run(connect,cipher,sid)
+        try:start_run(connect,cipher,sid,scheduled=True)
         except IntegrationError as e:
             with connect() as db:db.execute('UPDATE detection_plans SET next_at=?,status=? WHERE server_id=?',(now+60,str(e),sid))
 
@@ -178,16 +207,17 @@ def register(app,connect,cipher,auth,body,error,audit):
     @app.post('/api/detection/plans/<int:sid>')
     @auth(admin=True)
     def detection_save_plan(sid):
-        d=body();ids=d.get('nodes',[]);interval=d.get('interval_s',600);limit=d.get('daily_limit',1000);automatic=d.get('automatic',False)
-        if not isinstance(ids,list) or len(ids)>20 or any(not str(x).isdigit() for x in ids) or type(interval)is not int or not 120<=interval<=86400 or type(limit)is not int or not 1<=limit<=100000 or type(automatic)is not bool:return error('检测节点、频率或每日上限无效')
+        d=body();ids=d.get('nodes',[]);interval=d.get('interval_s',600);limit=d.get('daily_limit',1000);automatic=d.get('automatic',False);remediation=d.get('remediation','none');threshold=d.get('failure_threshold',3);cooldown=d.get('cooldown_s',21600)
+        if not isinstance(ids,list) or len(ids)>20 or any(not str(x).isdigit() for x in ids) or type(interval)is not int or not 120<=interval<=86400 or type(limit)is not int or not 1<=limit<=100000 or type(automatic)is not bool or remediation not in ('none','reboot') or type(threshold)is not int or not 2<=threshold<=10 or type(cooldown)is not int or not 3600<=cooldown<=604800:return error('检测节点、频率、失败阈值或冷却时间无效')
         with connect() as db:
             if not db.execute('SELECT 1 FROM ip_monitors WHERE server_id=?',(sid,)).fetchone():return error('请先选择被监控的 VPS')
             s=db.execute('SELECT * FROM detection_sources WHERE id=?',(d.get('source_id'),)).fetchone()
             if not s:return error('请选择检测来源')
             ids=sorted(set(map(str,ids))) if s['kind']=='boce' else ['self']
             if not ids:return error('请填写至少一个节点 ID')
+            if remediation=='reboot' and (s['kind']!='boce' or len(ids)<2 or not automatic):return error('自动重启需要开启定时检测并至少选择两个 BOCE 国内检测点')
             existing=db.execute('SELECT next_at FROM detection_plans WHERE server_id=?',(sid,)).fetchone()
-            db.execute('INSERT INTO detection_plans(server_id,source_id,nodes,interval_s,automatic,daily_limit,next_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(server_id) DO UPDATE SET source_id=excluded.source_id,nodes=excluded.nodes,interval_s=excluded.interval_s,automatic=excluded.automatic,daily_limit=excluded.daily_limit,status=\'等待新配置检测\',checked=NULL',(sid,s['id'],json.dumps(ids),interval,int(automatic),limit,existing['next_at'] if existing else 0))
+            db.execute('INSERT INTO detection_plans(server_id,source_id,nodes,interval_s,automatic,daily_limit,next_at,remediation,failure_threshold,cooldown_s) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(server_id) DO UPDATE SET source_id=excluded.source_id,nodes=excluded.nodes,interval_s=excluded.interval_s,automatic=excluded.automatic,daily_limit=excluded.daily_limit,remediation=excluded.remediation,failure_threshold=excluded.failure_threshold,cooldown_s=excluded.cooldown_s,failure_streak=0,status=\'等待新配置检测\',checked=NULL',(sid,s['id'],json.dumps(ids),interval,int(automatic),limit,existing['next_at'] if existing else 0,remediation,threshold,cooldown))
             # Old source jobs can finish for history, but must not change the new plan status.
             audit(db,'配置 VPS 检测点 #'+str(sid))
         return jsonify(ok=True)
