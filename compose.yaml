@@ -17,6 +17,23 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+  dns-worker:
+    build: .
+    command: ["python", "dns_worker.py"]
+    restart: unless-stopped
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - panel-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      disable: true
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
