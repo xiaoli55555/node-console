@@ -168,14 +168,17 @@ def start_run(connect,cipher,sid,scheduled=False):
         try:
             if p['kind']=='boce':
                 data=boce(source_secret(p,cipher),'task/create/tcping',{'node_ids':','.join(map(str,nodes)),'host':ip+':'+str(m['port'])})
-                remote=data.get('data',{}).get('id')
+                payload=data.get('data')
+                remote=payload.get('id') if isinstance(payload,dict) else None
                 if not isinstance(remote,str) or not remote or len(remote)>200 or not remote.isalnum():raise IntegrationError('BOCE 未返回有效任务 ID')
                 db.execute("UPDATE detection_runs SET remote_id=?,status='pending' WHERE id=?",(remote,rid))
             else:db.execute("UPDATE detection_runs SET status='queued' WHERE id=?",(rid,))
-        except IntegrationError:
-            # Keep conservative cost reservation and cooldown; upstream may have accepted the POST.
-            db.execute("UPDATE detection_runs SET status='提交异常（不自动重试）' WHERE id=?",(rid,))
-            db.execute("UPDATE detection_plans SET status='提交异常，请检查 API 状态；不自动重试本任务' WHERE server_id=?",(sid,))
+        except IntegrationError as e:
+            # Preserve the safe reason; ambiguous submission is never retried.
+            reason=str(e).replace(source_secret(p,cipher),'[已隐藏]')[:300]
+            status='提交异常（不自动重试）：'+reason
+            db.execute('UPDATE detection_runs SET status=? WHERE id=?',(status,rid))
+            db.execute('UPDATE detection_plans SET status=? WHERE server_id=?',(status,sid))
         db.execute('DELETE FROM detection_runs WHERE id IN (SELECT id FROM detection_runs WHERE created<? AND status NOT IN (\'pending\',\'queued\',\'issued\',\'creating\'))',(now-30*86400,))
         return rid
 
