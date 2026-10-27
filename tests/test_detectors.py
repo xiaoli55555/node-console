@@ -234,6 +234,56 @@ class DetectorTest(unittest.TestCase):
   r=self.post('/plans/1',{'source_id':source,'nodes':['self'],'interval_s':600,'daily_limit':1000,'automatic':True,'response_mode':'reboot','failure_threshold':1})
   self.assertEqual(r.status_code,400)
 
+ def test_action_switch_pauses_without_stopping_detection_and_ignores_old_runs(self):
+  source=self.source()['id'];self.plan(source,automatic=True,response_mode='reboot',failure_threshold=2)
+  def make_run():
+   with self.connect() as db:
+    rid=db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,scheduled) VALUES(1,?,'8.8.8.8',443,?,'pending',?,?,1)",(source,json.dumps(['1','2']),int(time.time()),int(time.time()))).lastrowid
+    return dict(db.execute('SELECT * FROM detection_runs WHERE id=?',(rid,)).fetchone())
+  old=make_run()
+  route='/api/detection/plans/1/actions'
+  self.assertEqual(self.client.patch(route,json={'enabled':False}).status_code,403)
+  self.assertEqual(self.client.patch(route,json={'enabled':'false'},headers=self.headers).status_code,400)
+  self.assertEqual(self.client.patch(route,json={'enabled':False},headers=self.headers).status_code,200)
+  with self.connect() as db:
+   self.assertEqual(db.execute('SELECT automatic FROM detection_plans').fetchone()[0],1)
+   self.assertEqual(db.execute('SELECT enabled FROM ip_monitors').fetchone()[0],1)
+  self.assertEqual(self.client.patch(route,json={'enabled':True},headers=self.headers).status_code,200)
+  with patch('detectors.queue_reboot') as reboot:
+   with self.connect() as db:detectors.finish(db,old,'不通',[{'state':'unreachable'},{'state':'unreachable'}])
+   reboot.assert_not_called()
+  with self.connect() as db:self.assertEqual(db.execute('SELECT failure_streak FROM detection_plans').fetchone()[0],0)
+  new=make_run()
+  with self.connect() as db:detectors.finish(db,new,'不通',[{'state':'unreachable'},{'state':'unreachable'}])
+  with self.connect() as db:self.assertEqual(db.execute('SELECT failure_streak FROM detection_plans').fetchone()[0],1)
+
+ def test_pausing_cancels_linked_auto_reboot_but_keeps_manual_command(self):
+  source=self.source('self')['id'];self.plan(source,automatic=True,response_mode='reboot',failure_threshold=2)
+  for _ in range(2):
+   with self.connect() as db:
+    rid=db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,scheduled) VALUES(1,?,'8.8.8.8',443,'[\"self\"]','pending',?,?,1)",(source,int(time.time()),int(time.time()))).lastrowid
+    detectors.finish(db,dict(db.execute('SELECT * FROM detection_runs WHERE id=?',(rid,)).fetchone()),'不通',[{'state':'unreachable'}])
+  with self.connect() as db:
+   auto=db.execute('SELECT action_command_id FROM detection_runs WHERE id=?',(rid,)).fetchone()[0]
+   self.assertIsNotNone(auto)
+   manual=db.execute("INSERT INTO commands(server_id,user_id,action,status,created,updated) VALUES(1,1,'reboot','queued',?,?)",(int(time.time()),int(time.time()))).lastrowid
+   cooldown=db.execute('SELECT last_action FROM detection_plans').fetchone()[0]
+  self.assertEqual(self.client.patch('/api/detection/plans/1/actions',json={'enabled':False},headers=self.headers).status_code,200)
+  with self.connect() as db:
+   self.assertEqual(db.execute('SELECT status FROM commands WHERE id=?',(auto,)).fetchone()[0],'cancelled')
+   self.assertEqual(db.execute('SELECT status FROM commands WHERE id=?',(manual,)).fetchone()[0],'queued')
+   self.assertEqual(db.execute('SELECT last_action FROM detection_plans').fetchone()[0],cooldown)
+
+ def test_pausing_cancels_queued_api_action(self):
+  source=self.source()['id']
+  with self.connect() as db:action=db.execute('INSERT INTO ip_connections(name,kind,config,secret) VALUES(?,?,?,?)',('dry-run','change_ip','{}',self.cipher.encrypt(b'dummy').decode())).lastrowid
+  self.plan(source,automatic=True,response_mode='change_api',action_connection_id=action)
+  with self.connect() as db:db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,scheduled,action_status) VALUES(1,?,'8.8.8.8',443,'[]','failed',?,?,1,'queued')",(source,int(time.time()),int(time.time())))
+  self.assertEqual(self.client.patch('/api/detection/plans/1/actions',json={'enabled':False},headers=self.headers).status_code,200)
+  with patch('detectors.invoke_change_ip_api') as api:
+   detectors.execute_change_ip_actions(self.connect,self.cipher);api.assert_not_called()
+  with self.connect() as db:self.assertEqual(db.execute('SELECT action_status FROM detection_runs').fetchone()[0],'cancelled')
+
  def test_resaving_plan_preserves_cooldown_for_both_automatic_actions(self):
   for mode in ['reboot','change_api']:
    with self.subTest(mode=mode):
