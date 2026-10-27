@@ -18,6 +18,82 @@ class PanelTest(unittest.TestCase):
             self.assertEqual(client.post('/api/login',json={'username':name,'password':'correct-password-123'}).status_code,200)
             self.tokens[name]=client.get('/api/me').json['csrf']
     def post(self,path,data=None):return self.admin.post(path,json=data or {},headers={'X-CSRF-Token':self.tokens['admin']})
+    def test_simulated_boce_moonvm_agent_alidns_full_flow(self):
+        from unittest.mock import patch, MagicMock
+        from urllib.parse import urlsplit, parse_qs
+        import detectors, ip_dns
+        old_ip,new_ip,port='8.8.8.8','1.1.1.1',23456
+        clock=[int(time.time())];created=[];dns_writes=[]
+        records={
+            'mobile-record':{'RecordId':'mobile-record','RR':'edge','Line':'cmcc','Type':'A','Value':old_ip,'TTL':600,'Status':'ENABLE'},
+            'telecom-record':{'RecordId':'telecom-record','RR':'edge','Line':'telecom','Type':'A','Value':'9.9.9.9','TTL':600,'Status':'ENABLE'},
+        }
+        def dns(connection,action,**params):
+            if action=='DescribeDomainRecords':return {'DomainRecords':{'Record':[dict(r) for r in records.values()]}}
+            if action=='UpdateDomainRecord':
+                self.assertEqual(params['RecordId'],'mobile-record');self.assertEqual(params['Line'],'cmcc')
+                self.assertEqual(params['Value'],new_ip);self.assertEqual(params['TTL'],600)
+                dns_writes.append(dict(params));records['mobile-record']['Value']=params['Value']
+                return {'RecordId':'mobile-record'}
+            return dict(records[params['RecordId']])
+        def boce_response(url,*args,**kwargs):
+            path=urlsplit(url).path;query=parse_qs(urlsplit(url).query)
+            if path.endswith('/node/list'):return {'code':200,'data':{'error_code':0,'data':{'list':[{'id':13},{'id':14}]}}}
+            if path.endswith('/create/tcping'):
+                self.assertEqual(query['host'],[old_ip+':'+str(port)]);self.assertEqual(query['node_ids'],['13,14'])
+                task='20261028_simulated_'+str(len(created)+1);created.append(task)
+                return {'code':200,'data':{'error_code':0,'data':{'id':task}}}
+            self.assertIn(path.rsplit('/',1)[-1],created)
+            return {'code':200,'data':{'done':True,'list':[{'node_id':i,'node_name':str(i),'packets_transmitted':10,'packets_received':0,'error_code':0} for i in [13,14]]}}
+        def saved(path,data):
+            response=self.post(path,data);self.assertIn(response.status_code,(200,201),response.json);return response.json
+        with patch('time.time',side_effect=lambda:clock[0]),patch('detectors.request_json',side_effect=boce_response),patch('ip_dns.alidns',side_effect=dns),patch('ip_dns.request_moonvm',return_value='accepted (simulation)') as moonvm,patch('ip_dns.socket.create_connection',return_value=MagicMock()) as tcp,patch('detectors.queue_reboot',side_effect=AssertionError('Reboot must never be called')) as reboot:
+            node=saved('/api/servers',{'name':'full-flow-dry-run'});sid=node['id'];agent={'Authorization':'Bearer '+node['token']}
+            def report(address):
+                # Exercise the actual authenticated Agent report route, including IP history.
+                response=self.admin.post('/api/agent/report',json={'public_ips':[],'egress_ips':[address],'egress_checked':clock[0],'uptime':clock[0]},headers=agent)
+                self.assertEqual(response.status_code,200,response.json)
+            report(old_ip)
+            saved('/api/ip-dns/monitors',{'server_ids':[sid],'port':port})
+            ip_dns.check_monitor(server.connect,sid,server.CIPHER)
+            source=saved('/api/detection/sources',{'name':'simulated BOCE','kind':'boce','secret':'dummy-boce'})
+            saved('/api/detection/sources/'+str(source['id'])+'/test',{})
+            action=saved('/api/ip-dns/connections',{'name':'simulated MoonVM','kind':'change_ip','config':{'provider':'moonvm','url':'https://store.moonvm.com/ddns.php?product=12345&flag=changeip&iptoken=dummy-token-12345'}})
+            ali=saved('/api/ip-dns/connections',{'name':'simulated AliDNS','kind':'alidns','config':{'access_key_id':'dummy-id'},'secret':'dummy-secret'})
+            binding=saved('/api/ip-dns/bindings',{'server_id':sid,'connection_id':ali['id'],'domain':'example.com','rr':'edge','record_id':'mobile-record','line':'cmcc','expected_ip':old_ip,'port':port,'automatic':True})
+            saved('/api/detection/plans/'+str(sid),{'source_id':source['id'],'nodes':['13','14'],'port':port,'interval_s':120,'daily_limit':1000,'automatic':True,'response_mode':'change_api','action_connection_id':action['id'],'failure_threshold':3})
+            start=clock[0]
+            for n in range(3):
+                clock[0]=start+n*120;report(old_ip)
+                detectors.tick(server.connect,server.CIPHER)
+                clock[0]+=10
+                detectors.tick(server.connect,server.CIPHER)
+                self.assertEqual(moonvm.call_count,1 if n==2 else 0)
+            self.assertEqual(len(created),3);self.assertEqual(moonvm.call_count,1)
+            # Claiming again must not resend the provider request.
+            detectors.execute_change_ip_actions(server.connect,server.CIPHER);self.assertEqual(moonvm.call_count,1)
+            clock[0]+=1;report(new_ip)
+            monitor=ip_dns.check_monitor(server.connect,sid,server.CIPHER);self.assertEqual(monitor['ip'],new_ip)
+            first=ip_dns.run_binding(server.connect,server.CIPHER,binding['id'],apply=True)
+            self.assertIn('60',first['status']);self.assertEqual(dns_writes,[])
+            clock[0]+=61;report(new_ip)
+            ip_dns.check_monitor(server.connect,sid,server.CIPHER)
+            final=ip_dns.run_binding(server.connect,server.CIPHER,binding['id'],apply=True)
+            self.assertIn('回读验证',final['status']);self.assertEqual(len(dns_writes),1)
+            tcp.assert_any_call((new_ip,port),timeout=4)
+            self.assertEqual(records['mobile-record']['Value'],new_ip)
+            self.assertEqual(records['telecom-record']['Value'],'9.9.9.9')
+            ip_dns.run_binding(server.connect,server.CIPHER,binding['id'],apply=True)
+            self.assertEqual(len(dns_writes),1);self.assertEqual(moonvm.call_count,1);reboot.assert_not_called()
+            with server.connect() as db:
+                self.assertEqual(db.execute('SELECT COUNT(*) FROM commands WHERE server_id=?',(sid,)).fetchone()[0],0)
+                b=db.execute('SELECT * FROM dns_bindings WHERE id=?',(binding['id'],)).fetchone()
+                self.assertEqual(b['expected_ip'],new_ip);self.assertIsNone(b['candidate'])
+                run=db.execute('SELECT action_status FROM detection_runs WHERE server_id=? ORDER BY id DESC LIMIT 1',(sid,)).fetchone()
+                self.assertEqual(run['action_status'],'submitted')
+            history=self.admin.get(f'/api/servers/{sid}/ip-history').json
+            self.assertEqual(history['events'][0]['addresses'],[new_ip]);self.assertEqual(history['events'][0]['previous_addresses'],[old_ip])
+
     def test_natural_month_subscription_settings_and_countdown(self):
         from datetime import date, datetime, timezone
         from unittest.mock import patch
