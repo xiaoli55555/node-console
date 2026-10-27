@@ -134,6 +134,25 @@ class DetectorTest(unittest.TestCase):
   r=self.post('/plans/1',{'source_id':source,'nodes':['self'],'interval_s':600,'daily_limit':1000,'automatic':True,'response_mode':'reboot','failure_threshold':1})
   self.assertEqual(r.status_code,400)
 
+ def test_change_ip_api_runs_once_after_confirmed_scheduled_failures(self):
+  source=self.source('self')['id']
+  with self.connect() as db:
+   encrypted=self.cipher.encrypt(b'api-token').decode()
+   action_id=db.execute('INSERT INTO ip_connections(name,kind,config,secret) VALUES(?,?,?,?)',('provider','change_ip',json.dumps({'url':'https://provider.example/change','header':'Authorization','prefix':'Bearer ','body_json':'{}'}),encrypted)).lastrowid
+  self.plan(source,automatic=True,response_mode='change_api',action_connection_id=action_id,failure_threshold=2)
+  rows=[{'node_id':'self','name':'probe','state':'unreachable','latency_ms':None}]
+  for run_id in (1,2):
+   with self.connect() as db:
+    db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,scheduled) VALUES(1,?,'8.8.8.8',443,'[\"self\"]','检测中',?,?,1)",(source,int(time.time()),int(time.time())))
+    run=dict(db.execute('SELECT * FROM detection_runs WHERE id=?',(run_id,)).fetchone())
+    detectors.finish(db,run,'自建探针 TCP 不通（待复核）',rows)
+  with self.connect() as db:self.assertEqual(db.execute('SELECT action_status FROM detection_runs WHERE id=2').fetchone()[0],'queued')
+  with patch('detectors.invoke_change_ip_api',return_value='submitted') as call:
+   detectors.execute_change_ip_actions(self.connect,self.cipher)
+   detectors.execute_change_ip_actions(self.connect,self.cipher)
+  self.assertEqual(call.call_count,1)
+  with self.connect() as db:self.assertEqual(db.execute('SELECT action_status FROM detection_runs WHERE id=2').fetchone()[0],'submitted')
+
  def test_initialize_adds_response_columns_to_existing_database(self):
   path=self.tmp.name+'/legacy-db'
   @contextmanager
