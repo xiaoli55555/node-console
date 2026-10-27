@@ -131,6 +131,14 @@ class DetectorTest(unittest.TestCase):
   self.assertIn('quota',result.json['monitors'][0]['run']['status'])
   self.assertNotIn('testsecret',result.text)
   with self.connect() as db:self.assertIn('quota',db.execute('SELECT status FROM detection_plans').fetchone()[0])
+ def test_task_ids_are_opaque_strings_and_encoded_when_polled(self):
+  self.plan(self.source()['id'])
+  with patch('detectors.boce',return_value={'data':{'id':'task-123_abc/part?x=1'}}):detectors.start_run(self.connect,self.cipher,1)
+  with self.connect() as db:db.execute('UPDATE detection_runs SET poll_at=0')
+  with patch('detectors.boce',return_value={'done':False}) as call:detectors.tick(self.connect,self.cipher)
+  self.assertEqual(call.call_args.args[1],'task/tcping/task-123_abc%2Fpart%3Fx%3D1')
+  with self.connect() as db:self.assertEqual(db.execute('SELECT status FROM detection_runs').fetchone()[0],'pending')
+
  def test_malformed_task_response_is_recorded_without_crashing(self):
   self.plan(self.source()['id'])
   with patch('detectors.boce',return_value={'data':None}):detectors.start_run(self.connect,self.cipher,1)
