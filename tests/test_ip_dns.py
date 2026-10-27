@@ -90,6 +90,25 @@ class IPDNSTest(unittest.TestCase):
             self.assertEqual(ip_dns.provider_ip(c),'1.1.1.1');self.assertEqual(call.call_args.args[1]['Authorization'],'Bearer abc')
         with patch('ip_dns.request_json',return_value={'data':[{'ip':'127.0.0.1'}]}):
             with self.assertRaises(ip_dns.IntegrationError):ip_dns.provider_ip(c)
+    def test_change_ip_connection_validates_without_sending_request(self):
+        config={'url':'https://provider.example/change','header':'Authorization','prefix':'Bearer ','body_json':'{"id":"{{server_id}}"}'}
+        with patch('ip_dns.request_json') as request:
+            saved=self.post('/connections',{'kind':'change_ip','name':'provider','config':config,'secret':'secret'})
+            self.assertEqual(saved.status_code,200,saved.json)
+            tested=self.post('/connections/'+str(saved.json['id'])+'/test',{})
+            self.assertEqual(tested.status_code,200,tested.json)
+            self.assertFalse(tested.json['test_supported'])
+            request.assert_not_called()
+        with self.connect() as db:
+            row=db.execute('SELECT * FROM ip_connections WHERE id=?',(saved.json['id'],)).fetchone()
+            self.assertNotIn('secret',row['secret'])
+    def test_change_ip_api_expands_placeholders_and_posts_json(self):
+        connection={'config':{'url':'https://provider.example/change','header':'X-Token','prefix':'Token ','body_json':'{"instance":"{{server_name}}","ip":"{{current_ip}}","id":"{{server_id}}"}'},'secret':'abc'}
+        with patch('ip_dns.request_json',return_value={'success':True}) as request:
+            result=ip_dns.invoke_change_ip_api(connection,7,'edge-7','8.8.8.8')
+        self.assertIn('已接受',result)
+        self.assertEqual(request.call_args.args[1]['X-Token'],'Token abc')
+        self.assertEqual(json.loads(request.call_args.args[2]),{'instance':'edge-7','ip':'8.8.8.8','id':'7'})
     def test_ssrf_dns_rebinding_guard_and_url_validation(self):
         for url in ['http://example.com','https://user:pass@example.com','https://example.com:8080']:
             with self.assertRaises(ip_dns.IntegrationError):ip_dns.endpoint(url)
