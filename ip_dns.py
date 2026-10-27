@@ -145,13 +145,28 @@ def candidate_ip(db,binding,cipher):
     node=db.execute('SELECT metrics,seen FROM servers WHERE id=?',(binding['server_id'],)).fetchone()
     if not node or not node['seen'] or time.time()-node['seen']>90:raise IntegrationError('agent 离线或上报过期，暂停同步')
     metrics=json.loads(node['metrics'] or '{}')
-    # Interface addresses, not NAT egress (which could be a proxy exit).
+    # Prefer an address assigned directly to a network interface. If the host
+    # has no globally-routable interface IPv4, fall back to the existing
+    # external egress-IP sampler, but only when it reports exactly one fresh
+    # public IPv4. The DNS worker still verifies that the service port is
+    # reachable before any record update.
     ips=[]
     for value in metrics.get('public_ips',[]):
         try:ips.append(public_v4(value))
         except IntegrationError:pass
-    if len(ips)!=1:raise IntegrationError('agent 必须上报唯一的网卡公网 IPv4，不能猜测目标地址')
-    return ips[0]
+    ips=sorted(set(ips))
+    if len(ips)==1:return ips[0]
+    if len(ips)>1:raise IntegrationError('agent 上报了多个网卡公网 IPv4，无法确定目标地址')
+    egress=[]
+    for value in metrics.get('egress_ips') or []:
+        try:egress.append(public_v4(value))
+        except IntegrationError:pass
+    egress=sorted(set(egress))
+    try:egress_checked=int(metrics.get('egress_checked') or 0)
+    except (TypeError,ValueError):egress_checked=0
+    if len(egress)==1 and 0<=time.time()-egress_checked<=180:return egress[0]
+    if len(egress)>1:raise IntegrationError('出口 IP 检测到多个公网 IPv4，无法确定目标地址')
+    raise IntegrationError('未取得网卡公网 IPv4，也没有新鲜且唯一的出口公网 IPv4')
 
 def run_binding(connect,cipher,bid,apply=False):
     # The process lock serializes workers AND admin-triggered updates across gunicorn processes.

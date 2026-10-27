@@ -58,6 +58,20 @@ class IPDNSTest(unittest.TestCase):
     def test_identity_validation_blocks_wrong_line(self):
         r=self.post('/bindings',{'server_id':1,'connection_id':self.cid,'domain':'example.com','rr':'addf','record_id':'123','line':'telecom','expected_ip':'8.8.8.8'})
         self.assertEqual(r.status_code,400)
+    def test_same_hostname_carrier_lines_bind_as_separate_records(self):
+        records=[{'RecordId':'telecom-1','RR':'addf','Line':'telecom','Type':'A','Value':'1.1.1.1','TTL':600,'Status':'ENABLE'},
+                 {'RecordId':'mobile-2','RR':'addf','Line':'mobile','Type':'A','Value':'8.8.8.8','TTL':600,'Status':'ENABLE'}]
+        def ali(connection,action,**kwargs):
+            if action=='DescribeDomainRecords':return {'DomainRecords':{'Record':[r for r in records if r['RR']==kwargs.get('RRKeyWord')]}}
+            return next(r for r in records if r['RecordId']==kwargs['RecordId'])
+        self.post('/monitors',{'server_ids':[1]})
+        with patch('ip_dns.alidns',side_effect=ali):
+            first=self.post('/bindings',{'server_id':1,'connection_id':self.cid,'domain':'example.com','rr':'addf','record_id':'telecom-1','line':'telecom','expected_ip':'1.1.1.1','port':443})
+            second=self.post('/bindings',{'server_id':1,'connection_id':self.cid,'domain':'example.com','rr':'addf','record_id':'mobile-2','line':'mobile','expected_ip':'8.8.8.8','port':443})
+        self.assertEqual(first.status_code,200,first.json);self.assertEqual(second.status_code,200,second.json)
+        with self.connect() as db:
+            rows=db.execute('SELECT record_id,line,expected_ip FROM dns_bindings ORDER BY record_id').fetchall()
+            self.assertEqual([tuple(r) for r in rows],[('mobile-2','mobile','8.8.8.8'),('telecom-1','telecom','1.1.1.1')])
     def test_stable_candidate_updates_only_bound_record(self):
         bid=self.binding()
         result=ip_dns.run_binding(self.connect,self.cipher,bid,True)
@@ -90,6 +104,15 @@ class IPDNSTest(unittest.TestCase):
             self.assertEqual(ip_dns.provider_ip(c),'1.1.1.1');self.assertEqual(call.call_args.args[1]['Authorization'],'Bearer abc')
         with patch('ip_dns.request_json',return_value={'data':[{'ip':'127.0.0.1'}]}):
             with self.assertRaises(ip_dns.IntegrationError):ip_dns.provider_ip(c)
+    def test_monitor_falls_back_to_existing_unique_fresh_egress_ipv4(self):
+        with self.connect() as db:
+            db.execute('UPDATE servers SET metrics=? WHERE id=1',(json.dumps({'public_ips':[],'egress_ips':['1.1.1.1'],'egress_checked':int(time.time())}),))
+            self.assertEqual(ip_dns.candidate_ip(db,{'server_id':1,'source_id':None},self.cipher),'1.1.1.1')
+    def test_monitor_rejects_multiple_or_stale_egress_ipv4(self):
+        with self.connect() as db:
+            for ips,checked in [(['1.1.1.1','8.8.8.8'],int(time.time())),(['1.1.1.1'],int(time.time())-181)]:
+                db.execute('UPDATE servers SET metrics=? WHERE id=1',(json.dumps({'public_ips':[],'egress_ips':ips,'egress_checked':checked}),))
+                with self.assertRaises(ip_dns.IntegrationError):ip_dns.candidate_ip(db,{'server_id':1,'source_id':None},self.cipher)
     def test_change_ip_connection_validates_without_sending_request(self):
         config={'url':'https://provider.example/change','header':'Authorization','prefix':'Bearer ','body_json':'{"id":"{{server_id}}"}'}
         with patch('ip_dns.request_json') as request:
