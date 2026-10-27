@@ -22,8 +22,8 @@ class PanelTest(unittest.TestCase):
         from unittest.mock import patch, MagicMock
         from urllib.parse import urlsplit, parse_qs
         import detectors, ip_dns
-        old_ip,new_ip,port='8.8.8.8','1.1.1.1',23456
-        clock=[int(time.time())];created=[];dns_writes=[]
+        old_ip,new_ip,bad_ip,port='8.8.8.8','1.1.1.1','8.8.4.4',23456
+        clock=[int(time.time())];created=[];dns_writes=[];targets={};dns_failures=[1]
         records={
             'mobile-record':{'RecordId':'mobile-record','RR':'edge','Line':'cmcc','Type':'A','Value':old_ip,'TTL':600,'Status':'ENABLE'},
             'telecom-record':{'RecordId':'telecom-record','RR':'edge','Line':'telecom','Type':'A','Value':'9.9.9.9','TTL':600,'Status':'ENABLE'},
@@ -31,6 +31,9 @@ class PanelTest(unittest.TestCase):
         def dns(connection,action,**params):
             if action=='DescribeDomainRecords':return {'DomainRecords':{'Record':[dict(r) for r in records.values()]}}
             if action=='UpdateDomainRecord':
+                if dns_failures[0]:
+                    dns_failures[0]-=1
+                    raise ip_dns.IntegrationError('simulated AliDNS failure')
                 self.assertEqual(params['RecordId'],'mobile-record');self.assertEqual(params['Line'],'cmcc')
                 self.assertEqual(params['Value'],new_ip);self.assertEqual(params['TTL'],600)
                 dns_writes.append(dict(params));records['mobile-record']['Value']=params['Value']
@@ -40,14 +43,14 @@ class PanelTest(unittest.TestCase):
             path=urlsplit(url).path;query=parse_qs(urlsplit(url).query)
             if path.endswith('/node/list'):return {'code':200,'data':{'error_code':0,'data':{'list':[{'id':13},{'id':14}]}}}
             if path.endswith('/create/tcping'):
-                self.assertEqual(query['host'],[old_ip+':'+str(port)]);self.assertEqual(query['node_ids'],['13,14'])
-                task='20261028_simulated_'+str(len(created)+1);created.append(task)
+                self.assertIn(query['host'][0],[ip+':'+str(port) for ip in [old_ip,new_ip,bad_ip]]);self.assertEqual(query['node_ids'],['13,14'])
+                task='20261028_simulated_'+str(len(created)+1);created.append(task);targets[task]=query['host'][0]
                 return {'code':200,'data':{'error_code':0,'data':{'id':task}}}
             self.assertIn(path.rsplit('/',1)[-1],created)
-            return {'code':200,'data':{'done':True,'list':[{'node_id':i,'node_name':str(i),'packets_transmitted':10,'packets_received':0,'error_code':0} for i in [13,14]]}}
+            return {'code':200,'data':{'done':True,'list':[{'node_id':i,'node_name':str(i),'packets_transmitted':10,'packets_received':10 if targets[path.rsplit('/',1)[-1]]==new_ip+':'+str(port) else 0,'error_code':0} for i in [13,14]]}}
         def saved(path,data):
             response=self.post(path,data);self.assertIn(response.status_code,(200,201),response.json);return response.json
-        with patch('time.time',side_effect=lambda:clock[0]),patch('detectors.request_json',side_effect=boce_response),patch('ip_dns.alidns',side_effect=dns),patch('ip_dns.request_moonvm',return_value='accepted (simulation)') as moonvm,patch('ip_dns.socket.create_connection',return_value=MagicMock()) as tcp,patch('detectors.queue_reboot',side_effect=AssertionError('Reboot must never be called')) as reboot:
+        with patch('time.time',side_effect=lambda:clock[0]),patch('detectors.request_json',side_effect=boce_response),patch('ip_dns.alidns',side_effect=dns),patch('ip_dns.request_moonvm',side_effect=[ip_dns.IntegrationError('provider rejected (simulation)'),'accepted bad IP (simulation)','accepted good IP (simulation)']) as moonvm,patch('ip_dns.socket.create_connection',return_value=MagicMock()) as tcp,patch('detectors.queue_reboot',side_effect=AssertionError('Reboot must never be called')) as reboot:
             node=saved('/api/servers',{'name':'full-flow-dry-run'});sid=node['id'];agent={'Authorization':'Bearer '+node['token']}
             def report(address):
                 # Exercise the actual authenticated Agent report route, including IP history.
@@ -70,29 +73,57 @@ class PanelTest(unittest.TestCase):
                 detectors.tick(server.connect,server.CIPHER)
                 self.assertEqual(moonvm.call_count,1 if n==2 else 0)
             self.assertEqual(len(created),3);self.assertEqual(moonvm.call_count,1)
-            # Claiming again must not resend the provider request.
-            detectors.execute_change_ip_actions(server.connect,server.CIPHER);self.assertEqual(moonvm.call_count,1)
+            # Explicit rejection retries without a one-hour delay; accepted requests wait for IP.
+            detectors.execute_change_ip_actions(server.connect,server.CIPHER);self.assertEqual(moonvm.call_count,2)
+            detectors.execute_change_ip_actions(server.connect,server.CIPHER);self.assertEqual(moonvm.call_count,2)
+            clock[0]+=1;report(bad_ip)
+            ip_dns.check_monitor(server.connect,sid,server.CIPHER)
+            detectors.execute_change_ip_actions(server.connect,server.CIPHER)
+            self.assertIn('BOCE',ip_dns.run_binding(server.connect,server.CIPHER,binding['id'],apply=True)['status'])
+            self.assertEqual(dns_writes,[])
+            # The first new IP is still blocked: three complete failures trigger another change.
+            for n in range(3):
+                if n:clock[0]+=110
+                report(bad_ip);detectors.tick(server.connect,server.CIPHER)
+                clock[0]+=10;detectors.tick(server.connect,server.CIPHER)
+            self.assertEqual(moonvm.call_count,3)
+            self.assertEqual(records['mobile-record']['Value'],old_ip)
             clock[0]+=1;report(new_ip)
             monitor=ip_dns.check_monitor(server.connect,sid,server.CIPHER);self.assertEqual(monitor['ip'],new_ip)
-            first=ip_dns.run_binding(server.connect,server.CIPHER,binding['id'],apply=True)
-            self.assertIn('60',first['status']);self.assertEqual(dns_writes,[])
+            detectors.execute_change_ip_actions(server.connect,server.CIPHER)
+            self.assertIn('BOCE',ip_dns.run_binding(server.connect,server.CIPHER,binding['id'],apply=True)['status'])
+            for n in range(2):
+                if n:clock[0]+=110
+                report(new_ip);detectors.tick(server.connect,server.CIPHER)
+                clock[0]+=10;detectors.tick(server.connect,server.CIPHER)
+                if n==0:
+                    self.assertEqual(dns_writes,[])
+                    self.assertIn('BOCE',ip_dns.run_binding(server.connect,server.CIPHER,binding['id'],apply=True)['status'])
+            self.assertEqual(len(created),8)
+            # A DNS error must retry DNS only, never change an already verified IP again.
+            with self.assertRaises(ip_dns.IntegrationError):ip_dns.run_binding(server.connect,server.CIPHER,binding['id'],apply=True)
+            detectors.execute_change_ip_actions(server.connect,server.CIPHER)
+            self.assertEqual(moonvm.call_count,3)
+            clock[0]+=1;report(new_ip)
+            ip_dns.run_binding(server.connect,server.CIPHER,binding['id'],apply=True)
             clock[0]+=61;report(new_ip)
-            ip_dns.check_monitor(server.connect,sid,server.CIPHER)
             final=ip_dns.run_binding(server.connect,server.CIPHER,binding['id'],apply=True)
             self.assertIn('回读验证',final['status']);self.assertEqual(len(dns_writes),1)
+            detectors.execute_change_ip_actions(server.connect,server.CIPHER)
             tcp.assert_any_call((new_ip,port),timeout=4)
             self.assertEqual(records['mobile-record']['Value'],new_ip)
             self.assertEqual(records['telecom-record']['Value'],'9.9.9.9')
             ip_dns.run_binding(server.connect,server.CIPHER,binding['id'],apply=True)
-            self.assertEqual(len(dns_writes),1);self.assertEqual(moonvm.call_count,1);reboot.assert_not_called()
+            detectors.execute_change_ip_actions(server.connect,server.CIPHER)
+            self.assertEqual(len(dns_writes),1);self.assertEqual(moonvm.call_count,3);reboot.assert_not_called()
             with server.connect() as db:
                 self.assertEqual(db.execute('SELECT COUNT(*) FROM commands WHERE server_id=?',(sid,)).fetchone()[0],0)
                 b=db.execute('SELECT * FROM dns_bindings WHERE id=?',(binding['id'],)).fetchone()
                 self.assertEqual(b['expected_ip'],new_ip);self.assertIsNone(b['candidate'])
-                run=db.execute('SELECT action_status FROM detection_runs WHERE server_id=? ORDER BY id DESC LIMIT 1',(sid,)).fetchone()
-                self.assertEqual(run['action_status'],'submitted')
+                run=db.execute('SELECT action_status FROM detection_runs WHERE server_id=? AND action_status IS NOT NULL ORDER BY id DESC LIMIT 1',(sid,)).fetchone()
+                self.assertEqual(run['action_status'],'completed')
             history=self.admin.get(f'/api/servers/{sid}/ip-history').json
-            self.assertEqual(history['events'][0]['addresses'],[new_ip]);self.assertEqual(history['events'][0]['previous_addresses'],[old_ip])
+            self.assertEqual(history['events'][0]['addresses'],[new_ip]);self.assertEqual(history['events'][0]['previous_addresses'],[bad_ip])
 
     def test_natural_month_subscription_settings_and_countdown(self):
         from datetime import date, datetime, timezone
