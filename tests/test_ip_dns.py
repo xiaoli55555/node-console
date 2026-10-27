@@ -90,6 +90,15 @@ class IPDNSTest(unittest.TestCase):
             self.assertEqual(ip_dns.provider_ip(c),'1.1.1.1');self.assertEqual(call.call_args.args[1]['Authorization'],'Bearer abc')
         with patch('ip_dns.request_json',return_value={'data':[{'ip':'127.0.0.1'}]}):
             with self.assertRaises(ip_dns.IntegrationError):ip_dns.provider_ip(c)
+    def test_monitor_falls_back_to_existing_unique_fresh_egress_ipv4(self):
+        with self.connect() as db:
+            db.execute('UPDATE servers SET metrics=? WHERE id=1',(json.dumps({'public_ips':[],'egress_ips':['1.1.1.1'],'egress_checked':int(time.time())}),))
+            self.assertEqual(ip_dns.candidate_ip(db,{'server_id':1,'source_id':None},self.cipher),'1.1.1.1')
+    def test_monitor_rejects_multiple_or_stale_egress_ipv4(self):
+        with self.connect() as db:
+            for ips,checked in [(['1.1.1.1','8.8.8.8'],int(time.time())),(['1.1.1.1'],int(time.time())-181)]:
+                db.execute('UPDATE servers SET metrics=? WHERE id=1',(json.dumps({'public_ips':[],'egress_ips':ips,'egress_checked':checked}),))
+                with self.assertRaises(ip_dns.IntegrationError):ip_dns.candidate_ip(db,{'server_id':1,'source_id':None},self.cipher)
     def test_change_ip_connection_validates_without_sending_request(self):
         config={'url':'https://provider.example/change','header':'Authorization','prefix':'Bearer ','body_json':'{"id":"{{server_id}}"}'}
         with patch('ip_dns.request_json') as request:
