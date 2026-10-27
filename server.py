@@ -739,8 +739,11 @@ def static(path):
 def too_large(e): return error('请求内容过大',413)
 
 init()
+from ip_dns import init_schema, register as register_ip_dns
+init_schema(connect)
 with connect() as cipher_db:
-    CIPHER=load_cipher(DATA,bool(cipher_db.execute('SELECT 1 FROM users WHERE password_encrypted IS NOT NULL LIMIT 1').fetchone()))
+    CIPHER=load_cipher(DATA,bool(cipher_db.execute('SELECT 1 FROM users WHERE password_encrypted IS NOT NULL LIMIT 1').fetchone() or cipher_db.execute('SELECT 1 FROM ip_connections LIMIT 1').fetchone()))
+register_ip_dns(app,connect,CIPHER,auth,body,error,audit)
 if __name__=='__main__':
     import argparse, getpass
     parser=argparse.ArgumentParser();parser.add_argument('command',choices=['admin','backup','entry']);parser.add_argument('target',nargs='?');args=parser.parse_args()
