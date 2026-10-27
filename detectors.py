@@ -48,7 +48,12 @@ def initialize(connect):
 def boce(secret,path,params=None):
     # Fixed upstream host; credential is sent in POST body, never logged or returned.
     data=request_json('https://api.boce.com/v3/'+path,{'Content-Type':'application/x-www-form-urlencoded'},urllib.parse.urlencode({'key':secret,**(params or {})}))
-    if not isinstance(data,dict) or data.get('error_code',0)!=0:raise IntegrationError('BOCE API 返回异常；请检查权限、余额和调用限制')
+    if not isinstance(data,dict):raise IntegrationError('BOCE API 返回格式错误（不是 JSON 对象）')
+    code=data.get('error_code',0)
+    if code not in (0,'0'):
+        detail=str(data.get('error') or '').strip().replace(secret,'[已隐藏]')[:240]
+        suffix=('：'+detail) if detail else ''
+        raise IntegrationError('BOCE 返回错误码 '+str(code)[:40]+suffix)
     return data
 
 def source_secret(row,cipher):return cipher.decrypt(row['secret'].encode()).decode()
