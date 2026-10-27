@@ -7,12 +7,12 @@ import secrets
 import time
 import urllib.parse
 from flask import jsonify,request
-from ip_dns import IntegrationError, request_json, candidate_ip
+from ip_dns import IntegrationError, request_json, candidate_ip, load_connection, invoke_change_ip_api
 
 SCHEMA='''
 CREATE TABLE IF NOT EXISTS detection_sources(id INTEGER PRIMARY KEY,name TEXT NOT NULL,kind TEXT NOT NULL,secret TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1);
-CREATE TABLE IF NOT EXISTS detection_plans(server_id INTEGER PRIMARY KEY REFERENCES servers(id) ON DELETE CASCADE,source_id INTEGER NOT NULL REFERENCES detection_sources(id),nodes TEXT NOT NULL DEFAULT '[]',interval_s INTEGER NOT NULL DEFAULT 600,automatic INTEGER NOT NULL DEFAULT 0,daily_limit INTEGER NOT NULL DEFAULT 1000,next_at INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT '等待检测',checked INTEGER,response_mode TEXT NOT NULL DEFAULT 'none',failure_threshold INTEGER NOT NULL DEFAULT 3,failure_streak INTEGER NOT NULL DEFAULT 0,failure_ip TEXT,failure_port INTEGER,last_action INTEGER);
-CREATE TABLE IF NOT EXISTS detection_runs(id INTEGER PRIMARY KEY,server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,source_id INTEGER NOT NULL REFERENCES detection_sources(id),ip TEXT NOT NULL,port INTEGER NOT NULL,nodes TEXT NOT NULL,status TEXT NOT NULL,remote_id TEXT,created INTEGER NOT NULL,updated INTEGER NOT NULL,details TEXT NOT NULL DEFAULT '[]',poll_at INTEGER NOT NULL DEFAULT 0,cost INTEGER NOT NULL DEFAULT 0,scheduled INTEGER NOT NULL DEFAULT 0,action_result TEXT);
+CREATE TABLE IF NOT EXISTS detection_plans(server_id INTEGER PRIMARY KEY REFERENCES servers(id) ON DELETE CASCADE,source_id INTEGER NOT NULL REFERENCES detection_sources(id),nodes TEXT NOT NULL DEFAULT '[]',interval_s INTEGER NOT NULL DEFAULT 600,automatic INTEGER NOT NULL DEFAULT 0,daily_limit INTEGER NOT NULL DEFAULT 1000,next_at INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT '等待检测',checked INTEGER,response_mode TEXT NOT NULL DEFAULT 'none',action_connection_id INTEGER REFERENCES ip_connections(id),failure_threshold INTEGER NOT NULL DEFAULT 3,failure_streak INTEGER NOT NULL DEFAULT 0,failure_ip TEXT,failure_port INTEGER,last_action INTEGER);
+CREATE TABLE IF NOT EXISTS detection_runs(id INTEGER PRIMARY KEY,server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,source_id INTEGER NOT NULL REFERENCES detection_sources(id),ip TEXT NOT NULL,port INTEGER NOT NULL,nodes TEXT NOT NULL,status TEXT NOT NULL,remote_id TEXT,created INTEGER NOT NULL,updated INTEGER NOT NULL,details TEXT NOT NULL DEFAULT '[]',poll_at INTEGER NOT NULL DEFAULT 0,cost INTEGER NOT NULL DEFAULT 0,scheduled INTEGER NOT NULL DEFAULT 0,action_result TEXT,action_status TEXT);
 CREATE INDEX IF NOT EXISTS detection_pending ON detection_runs(status,poll_at);
 '''
 
@@ -23,6 +23,7 @@ def initialize(connect):
         migrations={
             'detection_plans':{
                 'response_mode':"TEXT NOT NULL DEFAULT 'none'",
+                'action_connection_id':'INTEGER REFERENCES ip_connections(id)',
                 'failure_threshold':'INTEGER NOT NULL DEFAULT 3',
                 'failure_streak':'INTEGER NOT NULL DEFAULT 0',
                 'failure_ip':'TEXT',
@@ -32,6 +33,7 @@ def initialize(connect):
             'detection_runs':{
                 'scheduled':'INTEGER NOT NULL DEFAULT 0',
                 'action_result':'TEXT',
+                'action_status':'TEXT',
             },
         }
         for table,columns in migrations.items():
@@ -91,6 +93,7 @@ def queue_reboot(db,sid,now):
 def finish(db,run,status,rows):
     now=int(time.time())
     action_result=None
+    action_status=None
     db.execute('UPDATE detection_runs SET status=?,details=?,updated=? WHERE id=?',(status,json.dumps(rows),now,run['id']))
     # Do not apply old source/IP results to a reconfigured plan or a changed target.
     plan=db.execute('SELECT p.*,s.enabled AS source_enabled FROM detection_plans p JOIN detection_sources s ON s.id=p.source_id WHERE p.server_id=?',(run['server_id'],)).fetchone()
@@ -104,12 +107,22 @@ def finish(db,run,status,rows):
                 same_target=plan['failure_ip']==run['ip'] and plan['failure_port']==run['port']
                 streak=streak+1 if same_target else 1
                 db.execute('UPDATE detection_plans SET failure_streak=?,failure_ip=?,failure_port=? WHERE server_id=?',(streak,run['ip'],run['port'],run['server_id']))
-                if plan['automatic'] and plan['response_mode']=='reboot' and streak>=plan['failure_threshold']:
+                if plan['automatic'] and plan['response_mode'] in ('reboot','change_api') and streak>=plan['failure_threshold']:
                     if plan['last_action'] and now-plan['last_action']<3600:
-                        action_result='已达到失败次数，仍在自动重启冷却期内（1 小时）'
+                        action_result='已达到失败次数，仍在自动处理冷却期内（1 小时）'
                     else:
-                        action_result=queue_reboot(db,run['server_id'],now)
-                        if action_result.startswith('已排队'):
+                        if plan['response_mode']=='reboot':
+                            action_result=queue_reboot(db,run['server_id'],now)
+                            action_status='queued' if action_result.startswith('已排队') else 'skipped'
+                        elif plan['action_connection_id']:
+                            action_result='换 IP API 已排队；为避免重复换 IP，不会自动重试请求'
+                            action_status='queued'
+                        else:
+                            action_result='未执行换 IP：未配置 API 连接'
+                            action_status='skipped'
+                        if action_status:
+                            db.execute('UPDATE detection_runs SET action_status=? WHERE id=?',(action_status,run['id']))
+                        if action_status=='queued':
                             db.execute('UPDATE detection_plans SET last_action=?,failure_streak=0,failure_ip=NULL,failure_port=NULL WHERE server_id=?',(now,run['server_id']))
             else:
                 streak=0
@@ -117,7 +130,7 @@ def finish(db,run,status,rows):
         plan_status=status
         if action_result:plan_status+='；'+action_result
         db.execute('UPDATE detection_plans SET status=?,checked=? WHERE server_id=?',(plan_status,now,run['server_id']))
-    db.execute('UPDATE detection_runs SET action_result=? WHERE id=?',(action_result,run['id']))
+    db.execute('UPDATE detection_runs SET action_result=COALESCE(?,action_result),action_status=COALESCE(?,action_status) WHERE id=?',(action_result,action_status,run['id']))
 
 def start_run(connect,cipher,sid,scheduled=False):
     # Hold the SQLite write lock across creation. Ambiguous POST failure is NOT retried automatically.
@@ -177,6 +190,29 @@ def tick(connect,cipher):
         try:start_run(connect,cipher,sid,scheduled=True)
         except IntegrationError as e:
             with connect() as db:db.execute('UPDATE detection_plans SET next_at=?,status=? WHERE server_id=?',(now+60,str(e),sid))
+    execute_change_ip_actions(connect,cipher)
+
+def execute_change_ip_actions(connect,cipher):
+    """Claim each queued provider API action once; ambiguous failures are never retried."""
+    now=int(time.time())
+    with connect() as db:
+        queued=[dict(r) for r in db.execute("SELECT r.id,r.server_id,r.ip,p.action_connection_id,s.name FROM detection_runs r JOIN detection_plans p ON p.server_id=r.server_id AND p.source_id=r.source_id JOIN detection_sources ds ON ds.id=p.source_id JOIN ip_monitors m ON m.server_id=r.server_id JOIN servers s ON s.id=r.server_id WHERE r.action_status='queued' AND r.scheduled=1 AND p.automatic=1 AND p.response_mode='change_api' AND p.action_connection_id IS NOT NULL AND ds.enabled=1 AND m.enabled=1 AND (m.current_ip IS NULL OR m.current_ip=r.ip) ORDER BY r.id LIMIT 20")]
+    for item in queued:
+        with connect() as db:
+            if not db.execute("UPDATE detection_runs SET action_status='issued' WHERE id=? AND action_status='queued'",(item['id'],)).rowcount:continue
+            try:connection=load_connection(db,cipher,item['action_connection_id'])
+            except IntegrationError as e:
+                db.execute("UPDATE detection_runs SET action_status='failed',action_result=? WHERE id=?",('换 IP API 配置失效：'+str(e),item['id']))
+                continue
+        try:
+            if connection['kind']!='change_ip':raise IntegrationError('连接不是换 IP API')
+            result=invoke_change_ip_api(connection,item['server_id'],item['name'],item['ip'])
+            state='submitted'
+        except IntegrationError as e:
+            result='换 IP API 调用失败或结果不确定：'+str(e)+'；为避免重复操作不会自动重试'
+            state='failed'
+        with connect() as db:
+            db.execute('UPDATE detection_runs SET action_status=?,action_result=? WHERE id=? AND action_status=\'issued\'',(state,result,item['id']))
 
 def register(app,connect,cipher,auth,body,error,audit):
     @app.get('/api/detection')
@@ -185,7 +221,7 @@ def register(app,connect,cipher,auth,body,error,audit):
         with connect() as db:
             sources=[{k:r[k] for k in ('id','name','kind','enabled')} for r in db.execute('SELECT * FROM detection_sources')]
             plans=[dict(r) for r in db.execute('SELECT * FROM detection_plans')]
-            runs=[dict(r) for r in db.execute('SELECT id,server_id,source_id,ip,port,status,created,updated,details,action_result FROM detection_runs ORDER BY id DESC LIMIT 50')]
+            runs=[dict(r) for r in db.execute('SELECT id,server_id,source_id,ip,port,status,created,updated,details,action_result,action_status FROM detection_runs ORDER BY id DESC LIMIT 50')]
         for p in plans:p['nodes']=json.loads(p['nodes'])
         for r in runs:r['details']=json.loads(r['details'])
         return jsonify(sources=sources,plans=plans,runs=runs)
@@ -233,17 +269,23 @@ def register(app,connect,cipher,auth,body,error,audit):
     @app.post('/api/detection/plans/<int:sid>')
     @auth(admin=True)
     def detection_save_plan(sid):
-        d=body();ids=d.get('nodes',[]);interval=d.get('interval_s',600);limit=d.get('daily_limit',1000);automatic=d.get('automatic',False);response_mode=d.get('response_mode','none');failure_threshold=d.get('failure_threshold',3)
-        if not isinstance(ids,list) or len(ids)>20 or any(not str(x).isdigit() for x in ids) or type(interval)is not int or not 120<=interval<=86400 or type(limit)is not int or not 1<=limit<=100000 or type(automatic)is not bool or response_mode not in ('none','reboot') or type(failure_threshold)is not int or not 2<=failure_threshold<=5:return error('检测节点、频率、上限或自动处理策略无效')
-        if response_mode!='none' and not automatic:return error('自动重启必须同时开启定时检测')
+        d=body();ids=d.get('nodes',[]);interval=d.get('interval_s',600);limit=d.get('daily_limit',1000);automatic=d.get('automatic',False);response_mode=d.get('response_mode','none');action_connection_id=d.get('action_connection_id') or None;failure_threshold=d.get('failure_threshold',3)
+        if not isinstance(ids,list) or len(ids)>20 or any(not str(x).isdigit() for x in ids) or type(interval)is not int or not 120<=interval<=86400 or type(limit)is not int or not 1<=limit<=100000 or type(automatic)is not bool or response_mode not in ('none','reboot','change_api') or type(failure_threshold)is not int or not 2<=failure_threshold<=5:return error('检测节点、频率、上限或自动处理策略无效')
+        if response_mode!='none' and not automatic:return error('自动处理必须同时开启定时检测')
+        if response_mode=='change_api' and type(action_connection_id)is not int:return error('请选择换 IP API 连接')
+        if response_mode!='change_api':action_connection_id=None
         with connect() as db:
             if not db.execute('SELECT 1 FROM ip_monitors WHERE server_id=?',(sid,)).fetchone():return error('请先选择被监控的 VPS')
             s=db.execute('SELECT * FROM detection_sources WHERE id=?',(d.get('source_id'),)).fetchone()
             if not s:return error('请选择检测来源')
+            if action_connection_id:
+                action=db.execute('SELECT kind FROM ip_connections WHERE id=?',(action_connection_id,)).fetchone()
+                if not action or action['kind']!='change_ip':return error('请选择有效的换 IP API 连接')
             ids=sorted(set(map(str,ids))) if s['kind']=='boce' else ['self']
             if not ids:return error('请填写至少一个节点 ID')
             existing=db.execute('SELECT next_at FROM detection_plans WHERE server_id=?',(sid,)).fetchone()
-            db.execute('INSERT INTO detection_plans(server_id,source_id,nodes,interval_s,automatic,daily_limit,next_at,response_mode,failure_threshold,failure_streak,failure_ip,failure_port,last_action) VALUES(?,?,?,?,?,?,?,?,?,0,NULL,NULL,NULL) ON CONFLICT(server_id) DO UPDATE SET source_id=excluded.source_id,nodes=excluded.nodes,interval_s=excluded.interval_s,automatic=excluded.automatic,daily_limit=excluded.daily_limit,response_mode=excluded.response_mode,failure_threshold=excluded.failure_threshold,failure_streak=0,failure_ip=NULL,failure_port=NULL,last_action=NULL,status=\'等待新配置检测\',checked=NULL',(sid,s['id'],json.dumps(ids),interval,int(automatic),limit,existing['next_at'] if existing else 0,response_mode,failure_threshold))
+            db.execute("UPDATE detection_runs SET action_status='cancelled',action_result='检测配置已更新，未发送换 IP 请求' WHERE server_id=? AND action_status='queued'",(sid,))
+            db.execute('INSERT INTO detection_plans(server_id,source_id,nodes,interval_s,automatic,daily_limit,next_at,response_mode,action_connection_id,failure_threshold,failure_streak,failure_ip,failure_port,last_action) VALUES(?,?,?,?,?,?,?,?,?,?,0,NULL,NULL,NULL) ON CONFLICT(server_id) DO UPDATE SET source_id=excluded.source_id,nodes=excluded.nodes,interval_s=excluded.interval_s,automatic=excluded.automatic,daily_limit=excluded.daily_limit,response_mode=excluded.response_mode,action_connection_id=excluded.action_connection_id,failure_threshold=excluded.failure_threshold,failure_streak=0,failure_ip=NULL,failure_port=NULL,last_action=NULL,status=\'等待新配置检测\',checked=NULL',(sid,s['id'],json.dumps(ids),interval,int(automatic),limit,existing['next_at'] if existing else 0,response_mode,action_connection_id,failure_threshold))
             # Old source jobs can finish for history, but must not change the new plan status.
             audit(db,'配置 VPS 检测点 #'+str(sid))
         return jsonify(ok=True)
