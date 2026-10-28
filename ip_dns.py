@@ -16,7 +16,7 @@ import time
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
-from flask import jsonify
+from flask import g, jsonify
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS ip_connections(
@@ -336,6 +336,33 @@ def register(app,connect,cipher,auth,body,error,audit):
                 events=[dict(r) for r in db.execute('SELECT * FROM dns_events ORDER BY id DESC LIMIT 50')],
                 servers=[dict(r) for r in db.execute('SELECT id,name FROM servers')],
                 monitors=[dict(r) for r in db.execute('SELECT ip_monitors.*,servers.name,servers.seen FROM ip_monitors JOIN servers ON servers.id=ip_monitors.server_id')])
+
+    @app.get('/api/client/servers/<int:sid>/dns-bindings')
+    @auth()
+    def client_dns_bindings(sid):
+        if g.user['role']!='client':return error('此功能仅供客户账号使用',403)
+        with connect() as db:
+            server=db.execute('SELECT id FROM servers WHERE id=? AND owner_id=?',(sid,g.user['id'])).fetchone()
+            if not server:return error('服务器不存在',404)
+            rows=db.execute('SELECT id,domain,rr,line,expected_ip,candidate,port,automatic,verify_new_ip,status,updated FROM dns_bindings WHERE server_id=? ORDER BY id',(sid,)).fetchall()
+        return jsonify(bindings=[dict(r) for r in rows])
+
+    @app.patch('/api/client/dns-bindings/<int:bid>')
+    @auth()
+    def client_toggle_dns_binding(bid):
+        if g.user['role']!='client':return error('此功能仅供客户账号使用',403)
+        d=body();enabled=d.get('automatic')
+        if type(enabled)is not bool:return error('自动解析开关格式无效')
+        with connect() as db:
+            binding=db.execute('SELECT b.id,b.server_id,s.name FROM dns_bindings b JOIN servers s ON s.id=b.server_id WHERE b.id=? AND s.owner_id=?',(bid,g.user['id'])).fetchone()
+            if not binding:return error('解析绑定不存在',404)
+            if enabled:
+                plan=db.execute('SELECT p.automatic,s.enabled AS source_enabled,m.enabled AS monitor_enabled FROM detection_plans p JOIN detection_sources s ON s.id=p.source_id JOIN ip_monitors m ON m.server_id=p.server_id WHERE p.server_id=?',(binding['server_id'],)).fetchone()
+                if not plan or not plan['automatic'] or not plan['source_enabled'] or not plan['monitor_enabled']:
+                    return error('管理员尚未启用此服务器的自动探测，暂时不能开启自动解析',409)
+            db.execute('UPDATE dns_bindings SET automatic=?,verify_new_ip=1 WHERE id=?',(int(enabled),bid))
+            audit(db,('客户开启' if enabled else '客户暂停')+'服务器 #'+str(binding['server_id'])+' DNS 自动解析 #'+str(bid))
+        return jsonify(ok=True,automatic=enabled,verify_new_ip=True)
 
     @app.post('/api/ip-dns/monitors')
     @auth(admin=True)

@@ -298,6 +298,31 @@ class PanelTest(unittest.TestCase):
         self.assertEqual(len(self.alice.get(f'/api/servers/{sid}/ip-history').json['events']),2)
         self.assertEqual(self.admin.post('/api/agent/report',json={'public_ips':['127.0.0.1']},headers=h).status_code,400)
 
+    def test_client_can_manage_only_owned_preconfigured_dns_auto_sync(self):
+        node=self.post('/api/servers',{'name':'client-dns'}).json;sid=node['id']
+        uid=self.alice.get('/api/me').json['id'];headers={'X-CSRF-Token':self.tokens['alice']}
+        self.admin.patch('/api/servers/'+str(sid),json={'owner_id':uid},headers={'X-CSRF-Token':self.tokens['admin']})
+        with server.connect() as db:
+            db.execute('INSERT INTO ip_monitors(server_id,port,enabled) VALUES(?,443,1)',(sid,))
+            conn=db.execute("INSERT INTO ip_connections(name,kind,config,secret) VALUES('hidden','alidns','{}','secret')").lastrowid
+            bid=db.execute("INSERT INTO dns_bindings(server_id,connection_id,domain,record_id,rr,line,expected_ip,port,automatic,verify_new_ip) VALUES(?,?,'example.com','rec1','edge','cmcc','8.8.8.8',443,0,0)",(sid,conn)).lastrowid
+        own='/api/client/servers/'+str(sid)+'/dns-bindings'
+        self.assertEqual(self.alice.get(own).status_code,200)
+        self.assertNotIn('secret',self.alice.get(own).text)
+        self.assertEqual(self.bob.get(own).status_code,404)
+        toggle='/api/client/dns-bindings/'+str(bid)
+        denied=self.alice.patch(toggle,json={'automatic':True},headers=headers)
+        self.assertEqual(denied.status_code,409)
+        with server.connect() as db:
+            source=db.execute("INSERT INTO detection_sources(name,kind,secret,enabled) VALUES('probe','self','',1)").lastrowid
+            db.execute("INSERT INTO detection_plans(server_id,source_id,nodes,automatic,interval_s,daily_limit) VALUES(?,?,?,1,120,100)",(sid,source,'[\"self\"]'))
+        enabled=self.alice.patch(toggle,json={'automatic':True,'verify_new_ip':False},headers=headers)
+        self.assertEqual(enabled.status_code,200)
+        with server.connect() as db:
+            row=db.execute('SELECT automatic,verify_new_ip FROM dns_bindings WHERE id=?',(bid,)).fetchone()
+            self.assertEqual(tuple(row),(1,1))
+        self.assertEqual(self.bob.patch(toggle,json={'automatic':False},headers={'X-CSRF-Token':self.tokens['bob']}).status_code,404)
+
     def test_reboot_permissions_one_time_delivery_and_completion(self):
         r=self.post('/api/servers',{'name':'reboot-test'}).json;sid=r['id'];h={'Authorization':'Bearer '+r['token']}
         uid=self.alice.get('/api/me').json['id']
