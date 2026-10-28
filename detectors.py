@@ -11,7 +11,7 @@ from ip_dns import IntegrationError, request_json, candidate_ip, load_connection
 
 SCHEMA='''
 CREATE TABLE IF NOT EXISTS detection_sources(id INTEGER PRIMARY KEY,name TEXT NOT NULL,kind TEXT NOT NULL,secret TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,last_seen INTEGER,verified_at INTEGER,owner_id INTEGER REFERENCES users(id) ON DELETE CASCADE,server_id INTEGER REFERENCES servers(id) ON DELETE CASCADE);
-CREATE TABLE IF NOT EXISTS detection_plans(server_id INTEGER PRIMARY KEY REFERENCES servers(id) ON DELETE CASCADE,source_id INTEGER NOT NULL REFERENCES detection_sources(id),nodes TEXT NOT NULL DEFAULT '[]',interval_s INTEGER NOT NULL DEFAULT 600,automatic INTEGER NOT NULL DEFAULT 0,daily_limit INTEGER NOT NULL DEFAULT 1000,next_at INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT '等待检测',checked INTEGER,response_mode TEXT NOT NULL DEFAULT 'none',action_connection_id INTEGER REFERENCES ip_connections(id),failure_threshold INTEGER NOT NULL DEFAULT 3,failure_streak INTEGER NOT NULL DEFAULT 0,failure_ip TEXT,failure_port INTEGER,last_action INTEGER);
+CREATE TABLE IF NOT EXISTS detection_plans(server_id INTEGER PRIMARY KEY REFERENCES servers(id) ON DELETE CASCADE,source_id INTEGER NOT NULL REFERENCES detection_sources(id),nodes TEXT NOT NULL DEFAULT '[]',interval_s INTEGER NOT NULL DEFAULT 600,automatic INTEGER NOT NULL DEFAULT 0,daily_limit INTEGER NOT NULL DEFAULT 1000,next_at INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT '等待检测',checked INTEGER,response_mode TEXT NOT NULL DEFAULT 'none',action_connection_id INTEGER REFERENCES ip_connections(id),failure_threshold INTEGER NOT NULL DEFAULT 3,failure_streak INTEGER NOT NULL DEFAULT 0,failure_ip TEXT,failure_port INTEGER,last_action INTEGER,owner_id INTEGER);
 CREATE TABLE IF NOT EXISTS detection_runs(id INTEGER PRIMARY KEY,server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,source_id INTEGER NOT NULL REFERENCES detection_sources(id),ip TEXT NOT NULL,port INTEGER NOT NULL,nodes TEXT NOT NULL,status TEXT NOT NULL,remote_id TEXT,created INTEGER NOT NULL,updated INTEGER NOT NULL,details TEXT NOT NULL DEFAULT '[]',poll_at INTEGER NOT NULL DEFAULT 0,cost INTEGER NOT NULL DEFAULT 0,scheduled INTEGER NOT NULL DEFAULT 0,action_result TEXT,action_status TEXT);
 CREATE INDEX IF NOT EXISTS detection_pending ON detection_runs(status,poll_at);
 CREATE INDEX IF NOT EXISTS detection_server_latest ON detection_runs(server_id,source_id,id);
@@ -38,6 +38,7 @@ def initialize(connect):
                 'last_action':'INTEGER',
                 'action_enabled':'INTEGER NOT NULL DEFAULT 1',
                 'action_after_run':'INTEGER NOT NULL DEFAULT 0',
+                'owner_id':'INTEGER',
             },
             'detection_runs':{
                 'scheduled':'INTEGER NOT NULL DEFAULT 0',
@@ -396,12 +397,18 @@ def register(app,connect,cipher,auth,body,error,audit):
         with connect() as db:
             if not db.execute('SELECT 1 FROM servers WHERE id=? AND owner_id=?',(sid,g.user['id'])).fetchone():return error('服务器不存在',404)
             sources=[dict(r) for r in db.execute("SELECT id,name,kind,1 AS personal FROM detection_sources WHERE enabled=1 AND kind='boce' AND owner_id=? AND server_id=? ORDER BY name,id",(g.user['id'],sid))]
-            plan=db.execute('SELECT p.source_id,p.nodes,p.interval_s,p.daily_limit,p.automatic,p.response_mode,p.action_enabled,s.owner_id AS source_owner,s.server_id AS source_server FROM detection_plans p JOIN detection_sources s ON s.id=p.source_id WHERE p.server_id=?',(sid,)).fetchone()
+            plan=db.execute('SELECT p.source_id,p.nodes,p.interval_s,p.daily_limit,p.automatic,p.response_mode,p.action_enabled,p.failure_threshold,p.action_connection_id,p.owner_id,p.failure_streak,p.failure_ip,p.failure_port,p.next_at,p.status,p.checked,s.owner_id AS source_owner,s.server_id AS source_server,a.owner_id AS action_owner,a.server_id AS action_server FROM detection_plans p JOIN detection_sources s ON s.id=p.source_id LEFT JOIN ip_connections a ON a.id=p.action_connection_id WHERE p.server_id=?',(sid,)).fetchone()
+            monitor=db.execute('SELECT port,enabled FROM ip_monitors WHERE server_id=?',(sid,)).fetchone()
+            latest=db.execute('SELECT id,ip,port,status,updated,details,action_result,action_status,action_attempts FROM detection_runs WHERE server_id=? AND source_id=? ORDER BY id DESC LIMIT 1',(sid,plan['source_id'])).fetchone() if plan else None
         safe_plan=None
         if plan:
-            personal=plan['source_owner']==g.user['id'] and plan['source_server']==sid
-            safe_plan={'source_id':plan['source_id'] if personal else None,'nodes':json.loads(plan['nodes']) if personal else [],'interval_s':plan['interval_s'] if personal else 600,'daily_limit':plan['daily_limit'] if personal else 1000,'automatic':bool(plan['automatic']) if personal else False,'actions_locked':bool(plan['action_enabled'] and plan['response_mode'] in ('reboot','change_api'))}
-        return jsonify(sources=sources,plan=safe_plan)
+            personal=plan['owner_id']==g.user['id'] and plan['source_owner']==g.user['id'] and plan['source_server']==sid
+            safe_plan={'source_id':plan['source_id'] if personal else None,'nodes':json.loads(plan['nodes']) if personal else [],'interval_s':plan['interval_s'] if personal else 600,'daily_limit':plan['daily_limit'] if personal else 1000,'automatic':bool(plan['automatic']) if personal else False,'actions_locked':bool(not personal and plan['action_enabled'] and plan['response_mode'] in ('reboot','change_api'))}
+            if personal:safe_plan.update(response_mode=plan['response_mode'],action_enabled=bool(plan['action_enabled']),failure_threshold=plan['failure_threshold'],action_connection_id=plan['action_connection_id'] if plan['action_owner']==g.user['id'] and plan['action_server']==sid else None)
+        run=dict(latest) if latest else None
+        if run:run['details']=json.loads(run['details'])
+        status={'run':run,'failure_streak':plan['failure_streak'] if plan else 0,'failure_ip':plan['failure_ip'] if plan else None,'failure_port':plan['failure_port'] if plan else None,'next_at':plan['next_at'] if plan else None,'plan_status':plan['status'] if plan else '尚未配置探测','checked':plan['checked'] if plan else None}
+        return jsonify(sources=sources,plan=safe_plan,monitor=dict(monitor) if monitor else None,status=status)
 
     @app.post('/api/client/servers/<int:sid>/probe-sources/<int:source_id>/nodes')
     @auth()
@@ -445,6 +452,38 @@ def register(app,connect,cipher,auth,body,error,audit):
             audit(db,'客户保存 VPS 专属 BOCE 密钥 #'+str(sid))
         return jsonify(ok=True,source_id=source_id,nodes=nodes,message='BOCE Key 验证成功，已加密保存')
 
+    @app.put('/api/client/servers/<int:sid>/action-config')
+    @auth()
+    def client_save_action_config(sid):
+        if g.user['role']!='client':return error('此功能仅供客户账号使用',403)
+        d=body();mode=d.get('response_mode');enabled=d.get('action_enabled');threshold=d.get('failure_threshold',3);action_id=d.get('action_connection_id') or None
+        if mode not in ('none','reboot','change_api') or type(enabled)is not bool or type(threshold)is not int or not 2<=threshold<=5:return error('自动处理方式、开关或连续失败次数无效')
+        if mode=='change_api' and type(action_id)is not int:return error('请先保存 MoonVM 换 IP API')
+        if mode!='change_api':action_id=None
+        with connect() as db:
+            if not db.execute('SELECT 1 FROM servers WHERE id=? AND owner_id=?',(sid,g.user['id'])).fetchone():return error('服务器不存在',404)
+            plan=db.execute('SELECT p.*,s.owner_id AS source_owner,s.server_id AS source_server,s.enabled AS source_enabled,m.enabled AS monitor_enabled FROM detection_plans p JOIN detection_sources s ON s.id=p.source_id JOIN ip_monitors m ON m.server_id=p.server_id WHERE p.server_id=?',(sid,)).fetchone()
+            if not plan:return error('请先完成 BOCE 探测点配置',409)
+            personal=plan['owner_id']==g.user['id'] and plan['source_owner']==g.user['id'] and plan['source_server']==sid
+            if not personal:return error('此 VPS 正使用管理员配置的探测方案，请联系管理员交接给客户管理',409)
+            if enabled and (not plan['automatic'] or not plan['source_enabled'] or not plan['monitor_enabled']):return error('请先开启定时探测，并确认探测来源和 VPS 监控已启用',409)
+            if enabled and mode=='reboot':
+                node=db.execute('SELECT metrics,seen FROM servers WHERE id=?',(sid,)).fetchone()
+                try:capabilities=json.loads(node['metrics'] or '{}').get('capabilities',[]) if node and node['seen'] and time.time()-node['seen']<=60 else []
+                except (TypeError,ValueError):capabilities=[]
+                if 'reboot' not in capabilities:return error('这台 VPS 尚未上报重启能力；请先升级客户端并等待在线上报',409)
+            if enabled and not db.execute('SELECT 1 FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id WHERE b.server_id=? AND b.automatic=1 AND c.owner_id=? AND c.server_id=? LIMIT 1',(sid,g.user['id'],sid)).fetchone():return error('请先配置并开启至少一条自己的阿里云 DNS 自动解析记录',409)
+            if mode=='change_api':
+                action=db.execute("SELECT config FROM ip_connections WHERE id=? AND kind='change_ip' AND owner_id=? AND server_id=?",(action_id,g.user['id'],sid)).fetchone()
+                if not action:return error('换 IP API 不属于当前客户或 VPS',404)
+                if json.loads(action['config']).get('provider')!='moonvm':return error('客户自动换 IP 当前只支持 MoonVM 固定 API')
+            db.execute('BEGIN IMMEDIATE')
+            last=db.execute('SELECT COALESCE(MAX(id),0) FROM detection_runs WHERE server_id=?',(sid,)).fetchone()[0]
+            db.execute("UPDATE detection_runs SET action_status='cancelled',action_result='客户更新自动处理配置，停止旧动作' WHERE server_id=? AND action_status IN ('queued','issued','submitted','uncertain','verifying')",(sid,))
+            db.execute('UPDATE detection_plans SET response_mode=?,action_connection_id=?,failure_threshold=?,action_enabled=?,action_after_run=?,failure_streak=0,failure_ip=NULL,failure_port=NULL,status=? WHERE server_id=?',(mode,action_id,threshold,int(enabled and mode!='none'),last,'客户更新自动处理配置',sid))
+            audit(db,'客户设置 VPS 自动处理方式为 '+mode+'（开启='+str(bool(enabled and mode!='none'))+'） #'+str(sid))
+        return jsonify(ok=True,response_mode=mode,action_enabled=bool(enabled and mode!='none'),failure_threshold=threshold,message='自动处理设置已保存；仅从下一轮新探测累计失败')
+
     @app.put('/api/client/servers/<int:sid>/probe-config')
     @auth()
     def client_save_probe_config(sid):
@@ -466,16 +505,17 @@ def register(app,connect,cipher,auth,body,error,audit):
                 if any(node not in available for node in ids):return error('探测节点已失效，请刷新节点列表后重新选择')
             except IntegrationError as e:return error(str(e))
             last=db.execute('SELECT COALESCE(MAX(id),0) FROM detection_runs WHERE server_id=?',(sid,)).fetchone()[0]
-            current=db.execute('SELECT source_id,nodes,interval_s,daily_limit,automatic,response_mode,action_enabled FROM detection_plans WHERE server_id=?',(sid,)).fetchone()
-            if current and current['action_enabled'] and current['response_mode'] in ('reboot','change_api'):
+            current=db.execute('SELECT p.source_id,p.nodes,p.interval_s,p.daily_limit,p.automatic,p.response_mode,p.action_enabled,p.owner_id,s.owner_id AS source_owner,s.server_id AS source_server FROM detection_plans p JOIN detection_sources s ON s.id=p.source_id WHERE p.server_id=?',(sid,)).fetchone()
+            customer_plan=bool(current and current['owner_id']==g.user['id'] and current['source_owner']==g.user['id'] and current['source_server']==sid)
+            if current and current['action_enabled'] and current['response_mode'] in ('reboot','change_api') and not customer_plan:
                 same_probe=(current['source_id']==source_id and current['nodes']==json.dumps(ids) and current['interval_s']==interval and current['daily_limit']==limit)
                 # An active admin recovery policy must not be retuned or newly activated by a customer.
                 # The owner may pause scheduled probes, but must preserve the admin-selected probes.
                 if not same_probe or (automatic and not current['automatic']):return error('此 VPS 有管理员设置的自动重启/换 IP 策略；请联系管理员关闭该策略后再修改或开启探测点',409)
             db.execute("UPDATE detection_runs SET action_status='cancelled',action_result='客户更新探测点，停止旧配置关联的自动动作' WHERE server_id=? AND action_status IN ('queued','issued','submitted','uncertain','verifying')",(sid,))
-            db.execute('INSERT INTO detection_plans(server_id,source_id,nodes,interval_s,automatic,daily_limit,next_at,response_mode,action_connection_id,failure_threshold,failure_streak,failure_ip,failure_port,last_action,action_enabled,action_after_run,status,checked) VALUES(?,?,?,?,?,?,?,\'none\',NULL,3,0,NULL,NULL,NULL,0,?,?,NULL) ON CONFLICT(server_id) DO UPDATE SET source_id=excluded.source_id,nodes=excluded.nodes,interval_s=excluded.interval_s,automatic=excluded.automatic,daily_limit=excluded.daily_limit,next_at=MIN(detection_plans.next_at,excluded.next_at),failure_streak=0,failure_ip=NULL,failure_port=NULL,status=\'客户更新探测设置\',checked=NULL',(sid,source_id,json.dumps(ids),interval,int(automatic),limit,int(time.time()),last,'客户配置探测点'))
+            db.execute('INSERT INTO detection_plans(server_id,source_id,nodes,interval_s,automatic,daily_limit,next_at,response_mode,action_connection_id,failure_threshold,failure_streak,failure_ip,failure_port,last_action,action_enabled,action_after_run,status,checked,owner_id) VALUES(?,?,?,?,?,?,?,\'none\',NULL,3,0,NULL,NULL,NULL,0,?,?,NULL,?) ON CONFLICT(server_id) DO UPDATE SET source_id=excluded.source_id,nodes=excluded.nodes,interval_s=excluded.interval_s,automatic=excluded.automatic,daily_limit=excluded.daily_limit,next_at=MIN(detection_plans.next_at,excluded.next_at),failure_streak=0,failure_ip=NULL,failure_port=NULL,owner_id=excluded.owner_id,status=\'客户更新探测设置\',checked=NULL',(sid,source_id,json.dumps(ids),interval,int(automatic),limit,int(time.time()),last,'客户配置探测点',g.user['id']))
             audit(db,'客户配置 VPS 探测点 #'+str(sid))
-        return jsonify(ok=True,automatic=automatic,message='探测配置已保存；客户配置不会更改管理员设置的重启或换 IP 策略')
+        return jsonify(ok=True,automatic=automatic,message='探测配置已保存')
 
     @app.patch('/api/client/servers/<int:sid>/probe-config')
     @auth()
@@ -510,7 +550,7 @@ def register(app,connect,cipher,auth,body,error,audit):
             if enabled and (not plan['automatic'] or not plan['source_enabled'] or not plan['monitor_enabled'] or plan['response_mode'] not in ('reboot','change_api')):return error('请先启用监控、探测来源和定时探测，并配置自动重启或换 IP API')
             if bool(plan['action_enabled'])==enabled:return jsonify(ok=True,enabled=enabled)
             last=db.execute('SELECT COALESCE(MAX(id),0) FROM detection_runs WHERE server_id=?',(sid,)).fetchone()[0]
-            db.execute('UPDATE detection_plans SET action_enabled=?,action_after_run=?,failure_streak=0,failure_ip=NULL,failure_port=NULL WHERE server_id=?',(int(enabled),last,sid))
+            db.execute('UPDATE detection_plans SET action_enabled=?,action_after_run=?,owner_id=NULL,failure_streak=0,failure_ip=NULL,failure_port=NULL WHERE server_id=?',(int(enabled),last,sid))
             # Cancel only reboot commands linked to this automation, never manual commands.
             db.execute("UPDATE commands SET status='cancelled',updated=? WHERE server_id=? AND status IN ('queued','issued') AND id IN (SELECT action_command_id FROM detection_runs WHERE server_id=? AND action_command_id IS NOT NULL)",(int(time.time()),sid,sid))
             db.execute("UPDATE detection_runs SET action_status='cancelled',action_result='自动处理已暂停或重新启用，取消旧任务动作' WHERE server_id=? AND action_status IN ('queued','issued','submitted','uncertain','verifying')",(sid,))
@@ -532,15 +572,16 @@ def register(app,connect,cipher,auth,body,error,audit):
             s=db.execute('SELECT * FROM detection_sources WHERE id=?',(d.get('source_id'),)).fetchone()
             if not s:return error('请选择检测来源')
             if response_mode!='none' and (not s['verified_at'] or time.time()-s['verified_at']>900):return error('启用自动重启或换 IP 前，请先测试探测来源；测试结果 15 分钟内有效')
+            if s['owner_id'] is not None:return error('客户专属探测来源不能用于管理员策略')
             if action_connection_id:
-                action=db.execute('SELECT kind FROM ip_connections WHERE id=?',(action_connection_id,)).fetchone()
-                if not action or action['kind']!='change_ip':return error('请选择有效的换 IP API 连接')
+                action=db.execute('SELECT kind,owner_id FROM ip_connections WHERE id=?',(action_connection_id,)).fetchone()
+                if not action or action['kind']!='change_ip' or action['owner_id'] is not None:return error('请选择管理员的换 IP API 连接')
             ids=sorted(set(map(str,ids))) if s['kind']=='boce' else ['self']
             if not ids:return error('请填写至少一个节点 ID')
             if port is not None:db.execute('UPDATE ip_monitors SET port=? WHERE server_id=?',(port,sid))
             existing=db.execute('SELECT next_at FROM detection_plans WHERE server_id=?',(sid,)).fetchone()
             db.execute("UPDATE detection_runs SET action_status='cancelled',action_result='检测配置已更新，未发送换 IP 请求' WHERE server_id=? AND action_status IN ('queued','issued','submitted','uncertain','verifying')",(sid,))
-            db.execute('INSERT INTO detection_plans(server_id,source_id,nodes,interval_s,automatic,daily_limit,next_at,response_mode,action_connection_id,failure_threshold,failure_streak,failure_ip,failure_port,last_action) VALUES(?,?,?,?,?,?,?,?,?,?,0,NULL,NULL,NULL) ON CONFLICT(server_id) DO UPDATE SET source_id=excluded.source_id,nodes=excluded.nodes,interval_s=excluded.interval_s,automatic=excluded.automatic,daily_limit=excluded.daily_limit,response_mode=excluded.response_mode,action_connection_id=excluded.action_connection_id,failure_threshold=excluded.failure_threshold,failure_streak=0,failure_ip=NULL,failure_port=NULL,status=\'等待新配置检测\',checked=NULL',(sid,s['id'],json.dumps(ids),interval,int(automatic),limit,existing['next_at'] if existing else 0,response_mode,action_connection_id,failure_threshold))
+            db.execute('INSERT INTO detection_plans(server_id,source_id,nodes,interval_s,automatic,daily_limit,next_at,response_mode,action_connection_id,failure_threshold,failure_streak,failure_ip,failure_port,last_action,owner_id) VALUES(?,?,?,?,?,?,?,?,?,?,0,NULL,NULL,NULL,NULL) ON CONFLICT(server_id) DO UPDATE SET source_id=excluded.source_id,nodes=excluded.nodes,interval_s=excluded.interval_s,automatic=excluded.automatic,daily_limit=excluded.daily_limit,response_mode=excluded.response_mode,action_connection_id=excluded.action_connection_id,failure_threshold=excluded.failure_threshold,failure_streak=0,failure_ip=NULL,failure_port=NULL,owner_id=NULL,status=\'等待新配置检测\',checked=NULL',(sid,s['id'],json.dumps(ids),interval,int(automatic),limit,existing['next_at'] if existing else 0,response_mode,action_connection_id,failure_threshold))
             # Old source jobs can finish for history, but must not change the new plan status.
             audit(db,'配置 VPS 检测点 #'+str(sid))
         return jsonify(ok=True)
