@@ -107,7 +107,7 @@ def queue_reboot(db,sid,now):
     try:metrics=json.loads(node['metrics'] or '{}')
     except (TypeError,ValueError):metrics={}
     if 'reboot' not in metrics.get('capabilities',[]):return '未执行自动重启：服务器 agent 不支持重启，请先更新 agent'
-    if db.execute("SELECT 1 FROM commands WHERE server_id=? AND status IN ('queued','issued','accepted') AND created>=?",(sid,now-3600)).fetchone():
+    if db.execute("SELECT 1 FROM commands WHERE server_id=? AND action='reboot' AND status IN ('queued','issued','accepted')",(sid,)).fetchone():
         return '未重复排队：此服务器最近已有重启任务'
     admin=db.execute("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1").fetchone()
     if not admin:return '未执行自动重启：找不到管理员账号'
@@ -135,29 +135,26 @@ def finish(db,run,status,rows):
                 if plan['automatic'] and streak<plan['failure_threshold']:
                     db.execute('UPDATE detection_plans SET next_at=? WHERE server_id=?',(now+10,run['server_id']))
                 if plan['automatic'] and plan['response_mode'] in ('reboot','change_api') and streak>=plan['failure_threshold']:
-                    if plan['response_mode']=='reboot' and plan['last_action'] and now-plan['last_action']<3600:
-                        action_result='已达到失败次数，仍在自动处理冷却期内（1 小时）'
-                    else:
-                        if plan['response_mode']=='reboot':
-                            action_result=queue_reboot(db,run['server_id'],now)
-                            action_status='queued' if action_result.startswith('已排队') else 'skipped'
-                            if action_status=='queued':
-                                command=db.execute("SELECT id FROM commands WHERE server_id=? AND action='reboot' AND status='queued' ORDER BY id DESC LIMIT 1",(run['server_id'],)).fetchone()
-                                db.execute('UPDATE detection_runs SET action_command_id=? WHERE id=?',(command['id'] if command else None,run['id']))
-                        elif plan['action_connection_id']:
-                            waiting=db.execute("SELECT 1 FROM detection_runs WHERE server_id=? AND action_status IN ('queued','issued','submitted','uncertain') LIMIT 1",(run['server_id'],)).fetchone()
-                            if waiting:action_result='已有换 IP 请求进行中，等待新 IP 上报或失败重试'
-                            else:
-                                db.execute("UPDATE detection_runs SET action_status='rejected',action_result='新 IP 国内复检失败，继续换 IP' WHERE server_id=? AND action_status='verifying'",(run['server_id'],))
-                                action_result='换 IP API 已排队；失败将持续重试，成功后进行国内复检'
-                                action_status='queued'
-                        else:
-                            action_result='未执行换 IP：未配置 API 连接'
-                            action_status='skipped'
-                        if action_status:
-                            db.execute('UPDATE detection_runs SET action_status=? WHERE id=?',(action_status,run['id']))
+                    if plan['response_mode']=='reboot':
+                        action_result=queue_reboot(db,run['server_id'],now)
+                        action_status='queued' if action_result.startswith('已排队') else 'skipped'
                         if action_status=='queued':
-                            db.execute('UPDATE detection_plans SET last_action=?,failure_streak=0,failure_ip=NULL,failure_port=NULL WHERE server_id=?',(now,run['server_id']))
+                            command=db.execute("SELECT id FROM commands WHERE server_id=? AND action='reboot' AND status='queued' ORDER BY id DESC LIMIT 1",(run['server_id'],)).fetchone()
+                            db.execute('UPDATE detection_runs SET action_command_id=? WHERE id=?',(command['id'] if command else None,run['id']))
+                    elif plan['action_connection_id']:
+                        waiting=db.execute("SELECT 1 FROM detection_runs WHERE server_id=? AND action_status IN ('queued','issued','submitted','uncertain') LIMIT 1",(run['server_id'],)).fetchone()
+                        if waiting:action_result='已有换 IP 请求进行中，等待新 IP 上报或失败重试'
+                        else:
+                            db.execute("UPDATE detection_runs SET action_status='rejected',action_result='新 IP 国内复检失败，继续换 IP' WHERE server_id=? AND action_status='verifying'",(run['server_id'],))
+                            action_result='换 IP API 已排队；失败将持续重试，成功后进行国内复检'
+                            action_status='queued'
+                    else:
+                        action_result='未执行换 IP：未配置 API 连接'
+                        action_status='skipped'
+                    if action_status:
+                        db.execute('UPDATE detection_runs SET action_status=? WHERE id=?',(action_status,run['id']))
+                    if action_status=='queued':
+                        db.execute('UPDATE detection_plans SET last_action=?,failure_streak=0,failure_ip=NULL,failure_port=NULL WHERE server_id=?',(now,run['server_id']))
             else:
                 streak=0
                 db.execute('UPDATE detection_plans SET failure_streak=0,failure_ip=NULL,failure_port=NULL WHERE server_id=?',(run['server_id'],))

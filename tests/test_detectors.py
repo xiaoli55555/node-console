@@ -358,28 +358,18 @@ class DetectorTest(unittest.TestCase):
    for _ in range(2):db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details) VALUES(1,?,'1.1.1.1',443,?,'passed',?,?,?)",(source,nodes,now,now,good))
    self.assertIsNone(boce_dns_gate(db,1,'1.1.1.1'))
 
- def test_resaving_plan_preserves_reboot_cooldown(self):
-  for mode in ['reboot']:
-   with self.subTest(mode=mode):
-    source=self.source('self')['id'];options={'automatic':True,'response_mode':mode,'failure_threshold':2}
-    if mode=='change_api':
-     with self.connect() as db:options['action_connection_id']=db.execute('INSERT INTO ip_connections(name,kind,config,secret) VALUES(?,?,?,?)',('dry-run','change_ip','{}',self.cipher.encrypt(b'dummy').decode())).lastrowid
-    self.plan(source,**options)
-    last_action=int(time.time())-60
-    with self.connect() as db:db.execute('UPDATE detection_plans SET last_action=? WHERE server_id=1',(last_action,))
-    self.plan(source,**options)
-    with self.connect() as db:self.assertEqual(db.execute('SELECT last_action FROM detection_plans WHERE server_id=1').fetchone()[0],last_action)
-    with patch('detectors.queue_reboot') as reboot,patch('detectors.invoke_change_ip_api') as change:
-     for _ in range(2):
-      with self.connect() as db:
-       rid=db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,scheduled) VALUES(1,?,'8.8.8.8',443,'[\"self\"]','pending',?,?,1)",(source,int(time.time()),int(time.time()))).lastrowid
-       run=dict(db.execute('SELECT * FROM detection_runs WHERE id=?',(rid,)).fetchone())
-       detectors.finish(db,run,'不通',[{'node_id':'self','state':'unreachable'}])
-     detectors.execute_change_ip_actions(self.connect,self.cipher)
-     reboot.assert_not_called();change.assert_not_called()
-    with self.connect() as db:
-     self.assertIn('冷却期',db.execute('SELECT action_result FROM detection_runs WHERE id=?',(rid,)).fetchone()[0])
-     self.assertEqual(db.execute('SELECT COUNT(*) FROM commands').fetchone()[0],0)
+ def test_recent_completed_reboot_has_no_hour_cooldown_but_pending_is_deduplicated(self):
+  source=self.source('self')['id'];self.plan(source,automatic=True,response_mode='reboot',failure_threshold=2)
+  now=int(time.time())
+  with self.connect() as db:
+   db.execute('UPDATE detection_plans SET last_action=?',(now-5,))
+   db.execute("INSERT INTO commands(server_id,user_id,action,status,created,updated) VALUES(1,1,'reboot','completed',?,?)",(now-5,now-1))
+   for _ in range(2):
+    rid=db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,scheduled) VALUES(1,?,'8.8.8.8',443,'[\"self\"]','pending',?,?,1)",(source,now,now)).lastrowid
+    detectors.finish(db,db.execute('SELECT * FROM detection_runs WHERE id=?',(rid,)).fetchone(),'不通',[{'node_id':'self','state':'unreachable'}])
+   self.assertEqual(db.execute("SELECT COUNT(*) FROM commands WHERE status='queued'").fetchone()[0],1)
+   self.assertIn('未重复排队',detectors.queue_reboot(db,1,now))
+   self.assertEqual(db.execute('SELECT COUNT(*) FROM commands').fetchone()[0],2)
 
  def test_queued_change_ip_is_cancelled_after_monitor_port_changes(self):
   source=self.source()['id']
