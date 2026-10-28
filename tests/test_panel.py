@@ -311,6 +311,9 @@ class PanelTest(unittest.TestCase):
         self.admin.post('/api/agent/report',json={'uptime':100},headers=h)
         self.assertEqual(self.alice.post(f'/api/servers/{sid}/reboot',json={'confirm':True},headers=ah).status_code,409)
         self.admin.post('/api/agent/report',json={'uptime':100,'capabilities':['reboot']},headers=h)
+        with server.connect() as db:
+            source=db.execute("INSERT INTO detection_sources(name,kind,secret,enabled) VALUES('test probe','self','',1)").lastrowid
+            db.execute("INSERT INTO detection_plans(server_id,source_id,nodes,interval_s,automatic,next_at,response_mode) VALUES(?,?,?,?,?,?,?)",(sid,source,'[\"self\"]',600,1,int(time.time())+600,'reboot'))
         self.assertEqual(self.bob.post(f'/api/servers/{sid}/reboot',json={'confirm':True},headers=bh).status_code,404)
         self.assertEqual(self.alice.post(f'/api/servers/{sid}/reboot',json={'confirm':True}).status_code,403)
         job=self.alice.post(f'/api/servers/{sid}/reboot',json={'confirm':True},headers=ah)
@@ -324,6 +327,7 @@ class PanelTest(unittest.TestCase):
         self.assertEqual(self.admin.post(f'/api/agent/commands/{cid}/ack',json={},headers=h).status_code,409)
         self.admin.post('/api/agent/report',json={'uptime':5,'capabilities':['reboot']},headers=h)
         self.assertEqual(self.alice.get('/api/servers').json[0]['last_command']['status'],'completed')
+        with server.connect() as db:self.assertLessEqual(db.execute('SELECT next_at FROM detection_plans WHERE server_id=?',(sid,)).fetchone()[0],int(time.time()))
     def test_reboot_revoked_after_reassignment(self):
         r=self.post('/api/servers',{'name':'reassign-test'}).json;sid=r['id'];h={'Authorization':'Bearer '+r['token']}
         uid=self.alice.get('/api/me').json['id']

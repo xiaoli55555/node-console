@@ -603,8 +603,12 @@ def report():
             db.execute('UPDATE metric_points SET udp=NULL WHERE server_id=?',(row['id'],))
         clean=record_network(db,current,clean,int(time.time()))
         previous=json.loads(current['metrics']) if current['metrics'] else {}
-        if clean.get('uptime') is not None and previous.get('uptime') is not None and clean['uptime']<previous['uptime']:
+        reboot_detected=clean.get('uptime') is not None and previous.get('uptime') is not None and clean['uptime']<previous['uptime']
+        if reboot_detected:
             db.execute("UPDATE commands SET status='completed',updated=? WHERE server_id=? AND status='accepted' AND created>=?",(int(time.time()),row['id'],int(time.time())-600))
+            # A post-reboot IP (common on CMHK) should be re-probed immediately;
+            # do not wait out the plan's normal 2+ minute interval.
+            db.execute("UPDATE detection_plans SET next_at=MIN(next_at,?) WHERE server_id=? AND automatic=1 AND response_mode='reboot'",(int(time.time()),row['id']))
         db.execute("UPDATE commands SET status='unconfirmed',updated=? WHERE server_id=? AND status='accepted' AND created<?",(int(time.time()),row['id'],int(time.time())-600))
         # Match the public-IP display: fresh external observations first, then
         # interface addresses. Missing/failed samples never erase IP history.
