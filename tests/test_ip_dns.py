@@ -193,3 +193,22 @@ class IPDNSTest(unittest.TestCase):
     def test_remove_monitor_requires_disable_auto_dns(self):
         self.binding(automatic=True)
         self.assertEqual(self.client.delete('/api/ip-dns/monitors/1',headers=self.headers).status_code,400)
+
+    def test_cloudflare_records_normalize_apex_and_keep_proxied_metadata(self):
+        connection={'kind':'cloudflare','secret':'scoped-token','config':{'zone_id':'a'*32,'zone_name':'example.com'}}
+        response={'success':True,'result':[{'id':'b'*32,'name':'example.com','type':'A','content':'8.8.8.8','ttl':1,'proxied':True},{'id':'c'*32,'name':'edge.example.com','type':'A','content':'1.1.1.1','ttl':300,'proxied':False},{'id':'d'*32,'name':'outside.other','type':'A','content':'9.9.9.9'}],'result_info':{'total_pages':1}}
+        with patch('ip_dns.cloudflare_api',return_value=response) as call:
+            rows=ip_dns.cloudflare_records(connection)
+        self.assertEqual([(r['RR'],r['Value'],r['Proxied']) for r in rows],[('@','8.8.8.8',True),('edge','1.1.1.1',False)])
+        self.assertIn('/zones/'+('a'*32)+'/dns_records?',call.call_args.args[1])
+
+    def test_cloudflare_update_preserves_ttl_proxy_comment_tags_and_settings(self):
+        connection={'kind':'cloudflare','secret':'scoped-token','config':{'zone_id':'a'*32,'zone_name':'example.com'}}
+        record={'id':'b'*32,'name':'edge.example.com','type':'A','content':'8.8.8.8','ttl':1,'proxied':True,'comment':'origin','tags':['managed'],'settings':{'ipv4_only':True}}
+        with patch('ip_dns.cloudflare_api',return_value={'success':True,'result':dict(record,content='9.9.9.9')}) as call:
+            result=ip_dns.update_cloudflare_record(connection,record,'9.9.9.9')
+        self.assertEqual(result['content'],'9.9.9.9')
+        self.assertEqual(call.call_args.args[1],'/zones/'+('a'*32)+'/dns_records/'+('b'*32))
+        self.assertEqual(call.call_args.args[2],'PUT')
+        payload=call.call_args.args[3]
+        self.assertEqual(payload,{'name':'edge.example.com','type':'A','ttl':1,'proxied':True,'comment':'origin','tags':['managed'],'settings':{'ipv4_only':True},'content':'9.9.9.9'})

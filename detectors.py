@@ -472,7 +472,7 @@ def register(app,connect,cipher,auth,body,error,audit):
                 try:capabilities=json.loads(node['metrics'] or '{}').get('capabilities',[]) if node and node['seen'] and time.time()-node['seen']<=60 else []
                 except (TypeError,ValueError):capabilities=[]
                 if 'reboot' not in capabilities:return error('这台 VPS 尚未上报重启能力；请先升级客户端并等待在线上报',409)
-            if enabled and not db.execute('SELECT 1 FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id WHERE b.server_id=? AND b.automatic=1 AND c.owner_id=? AND c.server_id=? LIMIT 1',(sid,g.user['id'],sid)).fetchone():return error('请先配置并开启至少一条自己的阿里云 DNS 自动解析记录',409)
+            if enabled and not db.execute('SELECT 1 FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id WHERE b.server_id=? AND b.automatic=1 AND c.owner_id=? AND c.server_id=? AND c.kind IN (\'alidns\',\'cloudflare\') LIMIT 1',(sid,g.user['id'],sid)).fetchone():return error('请先配置并开启至少一条自己的 DNS 自动解析记录',409)
             if mode=='change_api':
                 action=db.execute("SELECT config FROM ip_connections WHERE id=? AND kind='change_ip' AND owner_id=? AND server_id=?",(action_id,g.user['id'],sid)).fetchone()
                 if not action:return error('换 IP API 不属于当前客户或 VPS',404)

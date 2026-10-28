@@ -364,6 +364,44 @@ class PanelTest(unittest.TestCase):
             plan=db.execute('SELECT owner_id,response_mode,action_enabled,action_connection_id FROM detection_plans WHERE server_id=?',(sid,)).fetchone()
             self.assertEqual(tuple(plan),(None,'none',0,None))
 
+    def test_client_can_bind_cloudflare_record_and_sync_new_ip_without_losing_proxy_settings(self):
+        from unittest.mock import patch, MagicMock
+        node=self.post('/api/servers',{'name':'client-cloudflare'}).json;sid=node['id']
+        uid=self.alice.get('/api/me').json['id'];headers={'X-CSRF-Token':self.tokens['alice']}
+        self.admin.patch(f'/api/servers/{sid}',json={'owner_id':uid},headers={'X-CSRF-Token':self.tokens['admin']})
+        self.admin.post('/api/agent/report',json={'public_ips':['8.8.8.8'],'uptime':100},headers={'Authorization':'Bearer '+node['token']})
+        self.assertEqual(self.alice.patch(f'/api/client/servers/{sid}/monitor',json={'port':443,'enabled':True},headers=headers).status_code,200)
+        zone={'id':'a'*32,'name':'example.com','status':'active'}
+        record={'id':'b'*32,'name':'edge.example.com','type':'A','content':'8.8.8.8','ttl':1,'proxied':True,'comment':'origin','tags':['managed'],'settings':{}}
+        def records(connection):
+            self.assertEqual(connection['secret'],'customer-cloudflare-token')
+            return [{'RecordId':record['id'],'RR':'edge','Type':'A','Line':'default','Value':record['content'],'TTL':record['ttl'],'Status':'ENABLE','Proxied':record['proxied']}]
+        with patch('ip_dns.cloudflare_find_zone',return_value=zone),patch('ip_dns.cloudflare_records',side_effect=records):
+            saved=self.alice.post(f'/api/client/servers/{sid}/dns-connections',json={'provider':'cloudflare','name':'Alice Cloudflare','domain':'example.com','config':{},'secret':'customer-cloudflare-token'},headers=headers)
+            self.assertEqual(saved.status_code,201,saved.json)
+            self.assertNotIn('customer-cloudflare-token',saved.text)
+            binding=self.alice.post(f'/api/client/servers/{sid}/dns-bindings',json={'connection_id':saved.json['connection']['id'],'domain':'example.com','record_id':record['id'],'rr':'edge','line':'default'},headers=headers)
+            self.assertEqual(binding.status_code,200,binding.json)
+        own=self.alice.get(f'/api/client/servers/{sid}/dns-bindings')
+        self.assertEqual(own.json['bindings'][0]['dns_provider'],'cloudflare')
+        self.assertEqual(own.json['connections'][0]['zone_name'],'example.com')
+        self.assertEqual(self.bob.get(f'/api/client/servers/{sid}/dns-bindings').status_code,404)
+        self.assertNotIn('customer-cloudflare-token',self.admin.get('/api/ip-dns').text)
+
+        self.admin.post('/api/agent/report',json={'public_ips':['9.9.9.9'],'uptime':200},headers={'Authorization':'Bearer '+node['token']})
+        record_new=dict(record,content='9.9.9.9')
+        with patch('ip_dns.cloudflare_record',side_effect=[record,record,record_new]),patch('ip_dns.update_cloudflare_record',return_value=record_new) as update,patch('ip_dns.socket.create_connection',return_value=MagicMock()):
+            with server.connect() as db:db.execute('UPDATE dns_bindings SET verify_new_ip=0 WHERE id=?',(binding.json['id'],))
+            result=self.alice.post(f"/api/client/dns-bindings/{binding.json['id']}/check",json={'apply':True},headers=headers)
+            self.assertEqual(result.status_code,200,result.json)
+            args=update.call_args.args
+            self.assertEqual(args[1]['proxied'],True)
+            self.assertEqual(args[1]['ttl'],1)
+            self.assertEqual(args[1]['comment'],'origin')
+            self.assertEqual(args[1]['tags'],['managed'])
+            self.assertEqual(args[2],'9.9.9.9')
+        with server.connect() as db:self.assertEqual(db.execute('SELECT expected_ip FROM dns_bindings WHERE id=?',(binding.json['id'],)).fetchone()[0],'9.9.9.9')
+
     def test_client_can_set_private_boce_key_and_probe_nodes_for_owned_server(self):
         from unittest.mock import patch
         node=self.post('/api/servers',{'name':'client-probe'}).json;sid=node['id']
