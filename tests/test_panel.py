@@ -79,7 +79,7 @@ class PanelTest(unittest.TestCase):
             clock[0]+=1;report(bad_ip)
             ip_dns.check_monitor(server.connect,sid,server.CIPHER)
             detectors.execute_change_ip_actions(server.connect,server.CIPHER)
-            self.assertIn('BOCE',ip_dns.run_binding(server.connect,server.CIPHER,binding['id'],apply=True)['status'])
+            self.assertIn('等待',ip_dns.run_binding(server.connect,server.CIPHER,binding['id'],apply=True)['status'])
             self.assertEqual(dns_writes,[])
             # The first new IP is still blocked: three complete failures trigger another change.
             for n in range(3):
@@ -90,26 +90,23 @@ class PanelTest(unittest.TestCase):
             self.assertEqual(records['mobile-record']['Value'],old_ip)
             clock[0]+=1;report(new_ip)
             monitor=ip_dns.check_monitor(server.connect,sid,server.CIPHER);self.assertEqual(monitor['ip'],new_ip)
+            with server.connect() as db:self.assertLessEqual(db.execute('SELECT next_at FROM detection_plans WHERE server_id=?',(sid,)).fetchone()[0],clock[0])
             detectors.execute_change_ip_actions(server.connect,server.CIPHER)
-            self.assertIn('BOCE',ip_dns.run_binding(server.connect,server.CIPHER,binding['id'],apply=True)['status'])
-            for n in range(2):
-                if n:clock[0]+=10
+            self.assertIn('等待',ip_dns.run_binding(server.connect,server.CIPHER,binding['id'],apply=True)['status'])
+            for n in range(1):
                 report(new_ip);detectors.tick(server.connect,server.CIPHER)
                 clock[0]+=10;detectors.tick(server.connect,server.CIPHER)
-                if n==0:
-                    with server.connect() as db:self.assertEqual(db.execute("SELECT next_at FROM detection_plans WHERE server_id=?",(sid,)).fetchone()[0],clock[0]+10)
-                    self.assertEqual(dns_writes,[])
-                    self.assertIn('BOCE',ip_dns.run_binding(server.connect,server.CIPHER,binding['id'],apply=True)['status'])
-            self.assertEqual(len(created),8)
+                self.assertEqual(dns_writes,[])
+                with server.connect() as db:self.assertIsNone(ip_dns.boce_dns_gate(db,sid,new_ip,port))
+            self.assertEqual(len(created),7)
             # A DNS error must retry DNS only, never change an already verified IP again.
             with self.assertRaises(ip_dns.IntegrationError):ip_dns.run_binding(server.connect,server.CIPHER,binding['id'],apply=True)
             detectors.execute_change_ip_actions(server.connect,server.CIPHER)
             self.assertEqual(moonvm.call_count,3)
             clock[0]+=1;report(new_ip)
-            ip_dns.run_binding(server.connect,server.CIPHER,binding['id'],apply=True)
-            clock[0]+=11;report(new_ip)
             final=ip_dns.run_binding(server.connect,server.CIPHER,binding['id'],apply=True)
             self.assertIn('回读验证',final['status']);self.assertEqual(len(dns_writes),1)
+            clock[0]+=11;report(new_ip)
             detectors.execute_change_ip_actions(server.connect,server.CIPHER)
             tcp.assert_any_call((new_ip,port),timeout=4)
             self.assertEqual(records['mobile-record']['Value'],new_ip)

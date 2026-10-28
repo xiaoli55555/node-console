@@ -79,15 +79,11 @@ class IPDNSTest(unittest.TestCase):
         self.assertIn('解析已更新',result['status'])
         self.assertEqual(self.record['Value'],'8.8.4.4')
         with self.connect() as db:self.assertEqual(db.execute('SELECT verify_new_ip FROM dns_bindings WHERE id=?',(bid,)).fetchone()[0],0)
-    def test_stable_candidate_updates_only_bound_record(self):
+    def test_selected_probe_requires_enabled_automatic_plan(self):
         bid=self.binding()
         result=ip_dns.run_binding(self.connect,self.cipher,bid,True)
-        self.assertIn('60',result['status']);self.assertFalse(any(a=='UpdateDomainRecord' for a,k in self.calls))
-        with self.connect() as db:db.execute('UPDATE dns_bindings SET candidate_since=? WHERE id=?',(int(time.time())-65,bid))
-        with patch('ip_dns.socket.create_connection',return_value=MagicMock()):ip_dns.run_binding(self.connect,self.cipher,bid,True)
-        writes=[k for a,k in self.calls if a=='UpdateDomainRecord'];self.assertEqual(len(writes),1)
-        self.assertEqual(writes[0],{'RecordId':'123','RR':'addf','Type':'A','Value':'8.8.4.4','Line':'cmcc','TTL':600})
-        with self.connect() as db:self.assertEqual(db.execute('SELECT expected_ip FROM dns_bindings').fetchone()[0],'8.8.4.4')
+        self.assertIn('请先配置并开启自动探测',result['status'])
+        self.assertFalse(any(a=='UpdateDomainRecord' for a,k in self.calls))
     def test_old_ip_changed_by_operator_blocks_update(self):
         bid=self.binding();self.record['Value']='1.1.1.1'
         with self.assertRaises(ip_dns.IntegrationError):ip_dns.run_binding(self.connect,self.cipher,bid,True)
@@ -99,7 +95,7 @@ class IPDNSTest(unittest.TestCase):
         with self.connect() as db:db.execute('UPDATE servers SET seen=?,metrics=?',(int(time.time()),json.dumps({'public_ips':['8.8.4.4','1.1.1.1']})))
         with self.assertRaises(ip_dns.IntegrationError):ip_dns.run_binding(self.connect,self.cipher,bid,True)
     def test_port_failure_resets_candidate_no_dns_write(self):
-        bid=self.binding();ip_dns.run_binding(self.connect,self.cipher,bid)
+        bid=self.binding(verify_new_ip=False);ip_dns.run_binding(self.connect,self.cipher,bid)
         with self.connect() as db:db.execute('UPDATE dns_bindings SET candidate_since=1')
         with patch('ip_dns.socket.create_connection',side_effect=OSError):
             with self.assertRaises(ip_dns.IntegrationError):ip_dns.run_binding(self.connect,self.cipher,bid,True)
@@ -172,7 +168,7 @@ class IPDNSTest(unittest.TestCase):
             with self.assertRaises(ip_dns.IntegrationError):ip_dns.request_json('https://example.com')
             connect.assert_not_called()
     def test_recheck_before_write_detects_race(self):
-        bid=self.binding();ip_dns.run_binding(self.connect,self.cipher,bid)
+        bid=self.binding(verify_new_ip=False);ip_dns.run_binding(self.connect,self.cipher,bid)
         with self.connect() as db:db.execute('UPDATE dns_bindings SET candidate_since=1')
         def mutate(*args,**kwargs):self.record['Value']='1.1.1.1';return MagicMock()
         with patch('ip_dns.socket.create_connection',side_effect=mutate):

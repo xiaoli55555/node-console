@@ -228,7 +228,8 @@ def tick(connect,cipher):
     for sid in due:
         try:start_run(connect,cipher,sid,scheduled=True)
         except IntegrationError as e:
-            with connect() as db:db.execute('UPDATE detection_plans SET next_at=?,status=? WHERE server_id=?',(now+60,str(e),sid))
+            retry_after=5 if '已有检测任务进行中' in str(e) else 60
+            with connect() as db:db.execute('UPDATE detection_plans SET next_at=?,status=? WHERE server_id=?',(now+retry_after,str(e),sid))
     execute_change_ip_actions(connect,cipher)
 
 # A successful/uncertain request needs an observation window, not an action cooldown.
