@@ -72,6 +72,13 @@ class IPDNSTest(unittest.TestCase):
         with self.connect() as db:
             rows=db.execute('SELECT record_id,line,expected_ip FROM dns_bindings ORDER BY record_id').fetchall()
             self.assertEqual([tuple(r) for r in rows],[('mobile-2','mobile','8.8.8.8'),('telecom-1','telecom','1.1.1.1')])
+    def test_dns_binding_can_skip_two_round_new_ip_probe(self):
+        bid=self.binding(automatic=True,verify_new_ip=False)
+        with patch('ip_dns.socket.create_connection',return_value=MagicMock()):
+            result=ip_dns.run_binding(self.connect,self.cipher,bid,True)
+        self.assertIn('解析已更新',result['status'])
+        self.assertEqual(self.record['Value'],'8.8.4.4')
+        with self.connect() as db:self.assertEqual(db.execute('SELECT verify_new_ip FROM dns_bindings WHERE id=?',(bid,)).fetchone()[0],0)
     def test_stable_candidate_updates_only_bound_record(self):
         bid=self.binding()
         result=ip_dns.run_binding(self.connect,self.cipher,bid,True)

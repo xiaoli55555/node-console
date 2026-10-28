@@ -262,7 +262,10 @@ def execute_change_ip_actions(connect,cipher):
                 if r['action_status']!='verifying' or r['action_candidate']!=address:
                     db.execute("UPDATE detection_runs SET action_status='verifying',action_candidate=? WHERE id=?",(address,rid))
                     db.execute('UPDATE detection_plans SET next_at=MIN(next_at,?) WHERE server_id=?',(now,r['server_id']))
-                reason=boce_dns_gate(db,r['server_id'],address,r['port'])
+                verify_dns=db.execute('SELECT verify_new_ip FROM dns_bindings WHERE server_id=? AND automatic=1',(r['server_id'],)).fetchall()
+                # If every auto-DNS binding explicitly opts out of the two-round
+                # gate, do not keep the recovery task waiting for probes either.
+                reason=boce_dns_gate(db,r['server_id'],address,r['port']) if not verify_dns or any(b['verify_new_ip'] for b in verify_dns) else None
                 if reason:message='已发现新 IP '+address+'；'+reason
                 else:
                     bindings=db.execute('SELECT expected_ip FROM dns_bindings WHERE server_id=? AND automatic=1',(r['server_id'],)).fetchall()
