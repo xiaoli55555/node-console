@@ -500,13 +500,22 @@ def assign(sid):
         if not current:return error('服务器不存在',404)
         if owner is not None and not db.execute("SELECT id FROM users WHERE id=? AND role='client'",(owner,)).fetchone():return error('客户不存在')
         if current['owner_id']!=owner and current['owner_id'] is not None:
+            # Customer-owned DNS/action credentials must never transfer with a VPS.
+            old_connections=db.execute('SELECT id FROM ip_connections WHERE owner_id=? AND server_id=?',(current['owner_id'],sid)).fetchall()
+            old_connection_ids=[r['id'] for r in old_connections]
+            if old_connection_ids:
+                marks=','.join('?' for _ in old_connection_ids)
+                db.execute('DELETE FROM dns_bindings WHERE server_id=? AND connection_id IN ('+marks+')',(sid,*old_connection_ids))
+                db.execute('UPDATE detection_plans SET action_enabled=0,response_mode=\'none\',action_connection_id=NULL,owner_id=NULL,failure_streak=0,failure_ip=NULL,failure_port=NULL,status=\'客户变更，自动处理已清除\' WHERE server_id=? AND action_connection_id IN ('+marks+')',(sid,*old_connection_ids))
+                db.execute("UPDATE detection_runs SET action_status='cancelled',action_result='服务器归属已变更，旧客户的 DNS / 换 IP 凭证已清除' WHERE server_id=? AND action_status IN ('queued','issued','submitted','uncertain','verifying')",(sid,))
+                db.execute('DELETE FROM ip_connections WHERE id IN ('+marks+')',old_connection_ids)
             private=db.execute('SELECT id FROM detection_sources WHERE owner_id=? AND server_id=?',(current['owner_id'],sid)).fetchall()
             private_ids=[r['id'] for r in private]
             if private_ids:
                 marks=','.join('?' for _ in private_ids)
                 empty_secret=CIPHER.encrypt(b'').decode()
                 db.execute('UPDATE detection_sources SET enabled=0,secret=?,verified_at=NULL WHERE id IN ('+marks+')',(empty_secret,*private_ids))
-                db.execute("UPDATE detection_plans SET automatic=0,action_enabled=0,response_mode='none',action_connection_id=NULL,failure_streak=0,failure_ip=NULL,failure_port=NULL,status='客户变更，等待新探测配置' WHERE server_id=? AND source_id IN ("+marks+")",(sid,*private_ids))
+                db.execute("UPDATE detection_plans SET automatic=0,action_enabled=0,response_mode='none',action_connection_id=NULL,owner_id=NULL,failure_streak=0,failure_ip=NULL,failure_port=NULL,status='客户变更，等待新探测配置' WHERE server_id=? AND source_id IN ("+marks+")",(sid,*private_ids))
                 db.execute("UPDATE detection_runs SET action_status='cancelled',action_result='服务器归属已变更，旧客户的探测 Key 已停用' WHERE server_id=? AND source_id IN ("+marks+") AND action_status IN ('queued','issued','submitted','uncertain','verifying')",(sid,*private_ids))
         db.execute('UPDATE servers SET owner_id=? WHERE id=?',(owner,sid));audit(db,f'服务器 #{sid} 分配给客户 #{owner}')
     return jsonify(ok=True)
