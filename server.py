@@ -752,7 +752,9 @@ def index():
 @app.get('/<path:path>')
 def static(path):
     if '/'+path==admin_path():return index()
-    return send_from_directory(ROOT/'web',path)
+    response=send_from_directory(ROOT/'web',path)
+    response.headers['Cache-Control']='no-store'
+    return response
 
 @app.errorhandler(413)
 def too_large(e): return error('请求内容过大',413)
