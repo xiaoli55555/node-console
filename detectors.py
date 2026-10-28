@@ -6,11 +6,11 @@ import math
 import secrets
 import time
 import urllib.parse
-from flask import jsonify,request
+from flask import g,jsonify,request
 from ip_dns import IntegrationError, request_json, candidate_ip, load_connection, invoke_change_ip_api, boce_dns_gate, ChangeIPUncertain
 
 SCHEMA='''
-CREATE TABLE IF NOT EXISTS detection_sources(id INTEGER PRIMARY KEY,name TEXT NOT NULL,kind TEXT NOT NULL,secret TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,last_seen INTEGER,verified_at INTEGER);
+CREATE TABLE IF NOT EXISTS detection_sources(id INTEGER PRIMARY KEY,name TEXT NOT NULL,kind TEXT NOT NULL,secret TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,last_seen INTEGER,verified_at INTEGER,owner_id INTEGER REFERENCES users(id) ON DELETE CASCADE,server_id INTEGER REFERENCES servers(id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS detection_plans(server_id INTEGER PRIMARY KEY REFERENCES servers(id) ON DELETE CASCADE,source_id INTEGER NOT NULL REFERENCES detection_sources(id),nodes TEXT NOT NULL DEFAULT '[]',interval_s INTEGER NOT NULL DEFAULT 600,automatic INTEGER NOT NULL DEFAULT 0,daily_limit INTEGER NOT NULL DEFAULT 1000,next_at INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT '等待检测',checked INTEGER,response_mode TEXT NOT NULL DEFAULT 'none',action_connection_id INTEGER REFERENCES ip_connections(id),failure_threshold INTEGER NOT NULL DEFAULT 3,failure_streak INTEGER NOT NULL DEFAULT 0,failure_ip TEXT,failure_port INTEGER,last_action INTEGER);
 CREATE TABLE IF NOT EXISTS detection_runs(id INTEGER PRIMARY KEY,server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,source_id INTEGER NOT NULL REFERENCES detection_sources(id),ip TEXT NOT NULL,port INTEGER NOT NULL,nodes TEXT NOT NULL,status TEXT NOT NULL,remote_id TEXT,created INTEGER NOT NULL,updated INTEGER NOT NULL,details TEXT NOT NULL DEFAULT '[]',poll_at INTEGER NOT NULL DEFAULT 0,cost INTEGER NOT NULL DEFAULT 0,scheduled INTEGER NOT NULL DEFAULT 0,action_result TEXT,action_status TEXT);
 CREATE INDEX IF NOT EXISTS detection_pending ON detection_runs(status,poll_at);
@@ -25,6 +25,8 @@ def initialize(connect):
             'detection_sources':{
                 'last_seen':'INTEGER',
                 'verified_at':'INTEGER',
+                'owner_id':'INTEGER REFERENCES users(id) ON DELETE CASCADE',
+                'server_id':'INTEGER REFERENCES servers(id) ON DELETE CASCADE',
             },
             'detection_plans':{
                 'response_mode':"TEXT NOT NULL DEFAULT 'none'",
@@ -386,6 +388,85 @@ def register(app,connect,cipher,auth,body,error,audit):
             if not isinstance(rows,list):raise IntegrationError('节点列表格式异常')
             return jsonify(nodes=[{'id':str(r['id']),'name':str(r.get('node_name',''))[:80],'isp':str(r.get('isp_name',''))[:80]} for r in rows if isinstance(r,dict) and str(r.get('id','')).isdigit()])
         except IntegrationError as e:return error(str(e))
+
+    @app.get('/api/client/servers/<int:sid>/probe-config')
+    @auth()
+    def client_probe_config(sid):
+        if g.user['role']!='client':return error('此功能仅供客户账号使用',403)
+        with connect() as db:
+            if not db.execute('SELECT 1 FROM servers WHERE id=? AND owner_id=?',(sid,g.user['id'])).fetchone():return error('服务器不存在',404)
+            sources=[dict(r) for r in db.execute("SELECT id,name,kind,CASE WHEN owner_id=? THEN 1 ELSE 0 END AS personal FROM detection_sources WHERE enabled=1 AND kind='boce' AND ((owner_id IS NULL AND server_id IS NULL) OR (owner_id=? AND server_id=?)) ORDER BY personal DESC,name,id",(g.user['id'],g.user['id'],sid))]
+            plan=db.execute('SELECT source_id,nodes,interval_s,daily_limit,automatic,response_mode,status,checked,next_at FROM detection_plans WHERE server_id=?',(sid,)).fetchone()
+        safe_plan=dict(plan) if plan else None
+        if safe_plan:safe_plan['nodes']=json.loads(safe_plan['nodes'])
+        return jsonify(sources=sources,plan=safe_plan)
+
+    @app.post('/api/client/servers/<int:sid>/probe-sources/<int:source_id>/nodes')
+    @auth()
+    def client_probe_nodes(sid,source_id):
+        if g.user['role']!='client':return error('此功能仅供客户账号使用',403)
+        with connect() as db:
+            if not db.execute('SELECT 1 FROM servers WHERE id=? AND owner_id=?',(sid,g.user['id'])).fetchone():return error('服务器不存在',404)
+            source=db.execute("SELECT * FROM detection_sources WHERE id=? AND enabled=1 AND kind='boce' AND ((owner_id IS NULL AND server_id IS NULL) OR (owner_id=? AND server_id=?))",(source_id,g.user['id'],sid)).fetchone()
+        if not source:return error('此探测来源不可用',404)
+        try:
+            result=boce(source_secret(source,cipher),'node/list')
+            rows=result.get('data',{}).get('list')
+            if not isinstance(rows,list):raise IntegrationError('节点列表格式异常')
+            nodes=[{'id':str(r['id']),'name':str(r.get('node_name',''))[:80],'isp':str(r.get('isp_name',''))[:80]} for r in rows if isinstance(r,dict) and str(r.get('id','')).isdigit()]
+            return jsonify(nodes=nodes)
+        except IntegrationError as e:return error(str(e))
+
+    @app.post('/api/client/servers/<int:sid>/probe-source')
+    @auth()
+    def client_save_probe_source(sid):
+        if g.user['role']!='client':return error('此功能仅供客户账号使用',403)
+        secret=body().get('secret')
+        if not isinstance(secret,str) or not 8<=len(secret)<=4096:return error('请填写有效的 BOCE API Key')
+        with connect() as db:
+            if not db.execute('SELECT 1 FROM servers WHERE id=? AND owner_id=?',(sid,g.user['id'])).fetchone():return error('服务器不存在',404)
+            if not db.execute('SELECT 1 FROM ip_monitors WHERE server_id=?',(sid,)).fetchone():return error('管理员尚未为此 VPS 开启 IP 监控',409)
+            try:
+                result=boce(secret,'node/list')
+                rows=result.get('data',{}).get('list')
+                if not isinstance(rows,list):raise IntegrationError('BOCE 节点列表格式异常')
+                nodes=[{'id':str(r['id']),'name':str(r.get('node_name',''))[:80],'isp':str(r.get('isp_name',''))[:80]} for r in rows if isinstance(r,dict) and str(r.get('id','')).isdigit()]
+                if not nodes:raise IntegrationError('BOCE API 可连接，但没有可用探测节点')
+            except IntegrationError as e:return error(str(e))
+            old=db.execute("SELECT id FROM detection_sources WHERE owner_id=? AND server_id=? AND kind='boce'",(g.user['id'],sid)).fetchone()
+            encrypted=cipher.encrypt(secret.encode()).decode()
+            if old:
+                source_id=old['id'];db.execute("UPDATE detection_sources SET name='客户自有 BOCE',secret=?,enabled=1,verified_at=?,last_seen=? WHERE id=?",(encrypted,int(time.time()),int(time.time()),source_id))
+            else:
+                source_id=db.execute("INSERT INTO detection_sources(name,kind,secret,enabled,verified_at,last_seen,owner_id,server_id) VALUES('客户自有 BOCE','boce',?,1,?,?,?,?)",(encrypted,int(time.time()),int(time.time()),g.user['id'],sid)).lastrowid
+            audit(db,'客户保存 VPS 专属 BOCE 密钥 #'+str(sid))
+        return jsonify(ok=True,source_id=source_id,nodes=nodes,message='BOCE Key 验证成功，已加密保存')
+
+    @app.put('/api/client/servers/<int:sid>/probe-config')
+    @auth()
+    def client_save_probe_config(sid):
+        if g.user['role']!='client':return error('此功能仅供客户账号使用',403)
+        d=body();ids=d.get('nodes');source_id=d.get('source_id');interval=d.get('interval_s',600);limit=d.get('daily_limit',1000);automatic=d.get('automatic')
+        if type(source_id)is not int or not isinstance(ids,list) or not 1<=len(ids)<=20 or any(not str(x).isdigit() for x in ids) or type(interval)is not int or not 120<=interval<=86400 or type(limit)is not int or not 1<=limit<=100000 or type(automatic)is not bool:return error('请检查探测来源、节点、间隔、每日额度和定时开关')
+        ids=sorted(set(map(str,ids)))
+        if not ids:return error('请至少选择一个探测节点')
+        with connect() as db:
+            if not db.execute('SELECT 1 FROM servers WHERE id=? AND owner_id=?',(sid,g.user['id'])).fetchone():return error('服务器不存在',404)
+            source=db.execute("SELECT * FROM detection_sources WHERE id=? AND enabled=1 AND kind='boce' AND ((owner_id IS NULL AND server_id IS NULL) OR (owner_id=? AND server_id=?))",(source_id,g.user['id'],sid)).fetchone()
+            if not source:return error('此探测来源不可用',404)
+            if not db.execute('SELECT 1 FROM ip_monitors WHERE server_id=?',(sid,)).fetchone():return error('管理员尚未为此 VPS 开启 IP 监控',409)
+            try:
+                result=boce(source_secret(source,cipher),'node/list')
+                rows=result.get('data',{}).get('list')
+                if not isinstance(rows,list):raise IntegrationError('节点列表格式异常')
+                available={str(r.get('id')) for r in rows if isinstance(r,dict) and str(r.get('id','')).isdigit()}
+                if any(node not in available for node in ids):return error('探测节点已失效，请刷新节点列表后重新选择')
+            except IntegrationError as e:return error(str(e))
+            last=db.execute('SELECT COALESCE(MAX(id),0) FROM detection_runs WHERE server_id=?',(sid,)).fetchone()[0]
+            db.execute("UPDATE detection_runs SET action_status='cancelled',action_result='客户更新探测点，停止旧配置关联的自动动作' WHERE server_id=? AND action_status IN ('queued','issued','submitted','uncertain','verifying')",(sid,))
+            db.execute('INSERT INTO detection_plans(server_id,source_id,nodes,interval_s,automatic,daily_limit,next_at,response_mode,action_connection_id,failure_threshold,failure_streak,failure_ip,failure_port,last_action,action_enabled,action_after_run,status,checked) VALUES(?,?,?,?,?,?,?,\'none\',NULL,3,0,NULL,NULL,NULL,0,?,?,NULL) ON CONFLICT(server_id) DO UPDATE SET source_id=excluded.source_id,nodes=excluded.nodes,interval_s=excluded.interval_s,automatic=excluded.automatic,daily_limit=excluded.daily_limit,next_at=MIN(detection_plans.next_at,excluded.next_at),failure_streak=0,failure_ip=NULL,failure_port=NULL,status=\'客户更新探测设置\',checked=NULL',(sid,source_id,json.dumps(ids),interval,int(automatic),limit,int(time.time()),last,'客户配置探测点'))
+            audit(db,'客户配置 VPS 探测点 #'+str(sid))
+        return jsonify(ok=True,automatic=automatic,message='探测配置已保存；客户配置不会更改管理员设置的重启或换 IP 策略')
 
     @app.delete('/api/detection/sources/<int:sid>')
     @auth(admin=True)
