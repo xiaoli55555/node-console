@@ -496,8 +496,18 @@ def assign(sid):
     owner=body().get('owner_id')
     if owner is not None and type(owner) is not int:return error('客户编号无效')
     with connect() as db:
-        if not db.execute('SELECT id FROM servers WHERE id=?',(sid,)).fetchone():return error('服务器不存在',404)
+        current=db.execute('SELECT id,owner_id FROM servers WHERE id=?',(sid,)).fetchone()
+        if not current:return error('服务器不存在',404)
         if owner is not None and not db.execute("SELECT id FROM users WHERE id=? AND role='client'",(owner,)).fetchone():return error('客户不存在')
+        if current['owner_id']!=owner and current['owner_id'] is not None:
+            private=db.execute('SELECT id FROM detection_sources WHERE owner_id=? AND server_id=?',(current['owner_id'],sid)).fetchall()
+            private_ids=[r['id'] for r in private]
+            if private_ids:
+                marks=','.join('?' for _ in private_ids)
+                empty_secret=CIPHER.encrypt(b'').decode()
+                db.execute('UPDATE detection_sources SET enabled=0,secret=?,verified_at=NULL WHERE id IN ('+marks+')',(empty_secret,*private_ids))
+                db.execute("UPDATE detection_plans SET automatic=0,action_enabled=0,response_mode='none',action_connection_id=NULL,failure_streak=0,failure_ip=NULL,failure_port=NULL,status='客户变更，等待新探测配置' WHERE server_id=? AND source_id IN ("+marks+")",(sid,*private_ids))
+                db.execute("UPDATE detection_runs SET action_status='cancelled',action_result='服务器归属已变更，旧客户的探测 Key 已停用' WHERE server_id=? AND source_id IN ("+marks+") AND action_status IN ('queued','issued','submitted','uncertain','verifying')",(sid,*private_ids))
         db.execute('UPDATE servers SET owner_id=? WHERE id=?',(owner,sid));audit(db,f'服务器 #{sid} 分配给客户 #{owner}')
     return jsonify(ok=True)
 
