@@ -7,10 +7,17 @@ assert.ok(statusMatch,'customer probe status renderer exists');
 const ctx=vm.createContext({esc:v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))});
 vm.runInContext(statusMatch[0]+'\n'+match[0],ctx);
 
-test('customer VPS settings expose BOCE, AliDNS, MoonVM, port and recovery controls',()=>{
+test('customer VPS settings expose BOCE, AliDNS, Cloudflare, MoonVM, port and recovery controls',()=>{
  const html=ctx.customerDnsSection({sources:[],plan:{response_mode:'change_api',action_enabled:true},monitor:{port:23456,enabled:true}},[],7,[{id:2,name:'My AliDNS',kind:'alidns',access_key_id:'key-id'},{id:3,name:'MoonVM product 9',kind:'change_ip'}]);
- for(const text of ['clientProbeStatus','clientProbeForm','BOCE API Key','业务 TCP 检测端口','clientActionForm','通过面板重启 VPS','MoonVM 换 IP API','AccessKey ID','AccessKey Secret','验证阿里云并读取记录','保存后开启该线路自动解析'])assert.ok(html.includes(text),text);
+ for(const text of ['clientProbeStatus','clientProbeForm','BOCE API Key','业务 TCP 检测端口','clientActionForm','通过面板重启 VPS','MoonVM 换 IP API','AccessKey ID','AccessKey Secret','Cloudflare DNS','Cloudflare API Token','Zone Read、DNS Read、DNS Write','验证凭据并读取 A 记录','保存后开启这条记录自动解析'])assert.ok(html.includes(text),text);
  assert.match(html,/value="23456"/);
+});
+
+test('customer Cloudflare connection uses a selectable DNS provider and explains proxied records',()=>{
+ const html=ctx.customerDnsSection({sources:[],plan:{},monitor:{port:443,enabled:true}},[{id:8,rr:'edge',domain:'example.com',line:'default',expected_ip:'8.8.8.8',dns_provider:'cloudflare',customer_owned:true}],7,[{id:2,name:'My Cloudflare',kind:'cloudflare',zone_name:'example.com'}]);
+ assert.match(html,/value="cloudflare" selected/);
+ assert.match(html,/已绑定解析记录/);
+ assert.match(html,/Cloudflare DNS/);
 });
 
 test('admin-owned active automation renders locked instructions for customers',()=>{
