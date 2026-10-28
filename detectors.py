@@ -395,10 +395,12 @@ def register(app,connect,cipher,auth,body,error,audit):
         if g.user['role']!='client':return error('此功能仅供客户账号使用',403)
         with connect() as db:
             if not db.execute('SELECT 1 FROM servers WHERE id=? AND owner_id=?',(sid,g.user['id'])).fetchone():return error('服务器不存在',404)
-            sources=[dict(r) for r in db.execute("SELECT id,name,kind,CASE WHEN owner_id=? THEN 1 ELSE 0 END AS personal FROM detection_sources WHERE enabled=1 AND kind='boce' AND ((owner_id IS NULL AND server_id IS NULL) OR (owner_id=? AND server_id=?)) ORDER BY personal DESC,name,id",(g.user['id'],g.user['id'],sid))]
-            plan=db.execute('SELECT source_id,nodes,interval_s,daily_limit,automatic,response_mode,status,checked,next_at FROM detection_plans WHERE server_id=?',(sid,)).fetchone()
-        safe_plan=dict(plan) if plan else None
-        if safe_plan:safe_plan['nodes']=json.loads(safe_plan['nodes'])
+            sources=[dict(r) for r in db.execute("SELECT id,name,kind,1 AS personal FROM detection_sources WHERE enabled=1 AND kind='boce' AND owner_id=? AND server_id=? ORDER BY name,id",(g.user['id'],sid))]
+            plan=db.execute('SELECT p.source_id,p.nodes,p.interval_s,p.daily_limit,p.automatic,p.response_mode,p.action_enabled,s.owner_id AS source_owner,s.server_id AS source_server FROM detection_plans p JOIN detection_sources s ON s.id=p.source_id WHERE p.server_id=?',(sid,)).fetchone()
+        safe_plan=None
+        if plan:
+            personal=plan['source_owner']==g.user['id'] and plan['source_server']==sid
+            safe_plan={'source_id':plan['source_id'] if personal else None,'nodes':json.loads(plan['nodes']) if personal else [],'interval_s':plan['interval_s'] if personal else 600,'daily_limit':plan['daily_limit'] if personal else 1000,'automatic':bool(plan['automatic']) if personal else False,'actions_locked':bool(plan['action_enabled'] and plan['response_mode'] in ('reboot','change_api'))}
         return jsonify(sources=sources,plan=safe_plan)
 
     @app.post('/api/client/servers/<int:sid>/probe-sources/<int:source_id>/nodes')
@@ -407,7 +409,7 @@ def register(app,connect,cipher,auth,body,error,audit):
         if g.user['role']!='client':return error('此功能仅供客户账号使用',403)
         with connect() as db:
             if not db.execute('SELECT 1 FROM servers WHERE id=? AND owner_id=?',(sid,g.user['id'])).fetchone():return error('服务器不存在',404)
-            source=db.execute("SELECT * FROM detection_sources WHERE id=? AND enabled=1 AND kind='boce' AND ((owner_id IS NULL AND server_id IS NULL) OR (owner_id=? AND server_id=?))",(source_id,g.user['id'],sid)).fetchone()
+            source=db.execute("SELECT * FROM detection_sources WHERE id=? AND enabled=1 AND kind='boce' AND owner_id=? AND server_id=?",(source_id,g.user['id'],sid)).fetchone()
         if not source:return error('此探测来源不可用',404)
         try:
             result=boce(source_secret(source,cipher),'node/list')
@@ -433,6 +435,7 @@ def register(app,connect,cipher,auth,body,error,audit):
                 nodes=[{'id':str(r['id']),'name':str(r.get('node_name',''))[:80],'isp':str(r.get('isp_name',''))[:80]} for r in rows if isinstance(r,dict) and str(r.get('id','')).isdigit()]
                 if not nodes:raise IntegrationError('BOCE API 可连接，但没有可用探测节点')
             except IntegrationError as e:return error(str(e))
+            db.execute('BEGIN IMMEDIATE')
             old=db.execute("SELECT id FROM detection_sources WHERE owner_id=? AND server_id=? AND kind='boce'",(g.user['id'],sid)).fetchone()
             encrypted=cipher.encrypt(secret.encode()).decode()
             if old:
@@ -452,7 +455,7 @@ def register(app,connect,cipher,auth,body,error,audit):
         if not ids:return error('请至少选择一个探测节点')
         with connect() as db:
             if not db.execute('SELECT 1 FROM servers WHERE id=? AND owner_id=?',(sid,g.user['id'])).fetchone():return error('服务器不存在',404)
-            source=db.execute("SELECT * FROM detection_sources WHERE id=? AND enabled=1 AND kind='boce' AND ((owner_id IS NULL AND server_id IS NULL) OR (owner_id=? AND server_id=?))",(source_id,g.user['id'],sid)).fetchone()
+            source=db.execute("SELECT * FROM detection_sources WHERE id=? AND enabled=1 AND kind='boce' AND owner_id=? AND server_id=?",(source_id,g.user['id'],sid)).fetchone()
             if not source:return error('此探测来源不可用',404)
             if not db.execute('SELECT 1 FROM ip_monitors WHERE server_id=?',(sid,)).fetchone():return error('管理员尚未为此 VPS 开启 IP 监控',409)
             try:
@@ -463,10 +466,29 @@ def register(app,connect,cipher,auth,body,error,audit):
                 if any(node not in available for node in ids):return error('探测节点已失效，请刷新节点列表后重新选择')
             except IntegrationError as e:return error(str(e))
             last=db.execute('SELECT COALESCE(MAX(id),0) FROM detection_runs WHERE server_id=?',(sid,)).fetchone()[0]
+            current=db.execute('SELECT source_id,nodes,interval_s,daily_limit,automatic,response_mode,action_enabled FROM detection_plans WHERE server_id=?',(sid,)).fetchone()
+            if current and current['action_enabled'] and current['response_mode'] in ('reboot','change_api'):
+                same_probe=(current['source_id']==source_id and current['nodes']==json.dumps(ids) and current['interval_s']==interval and current['daily_limit']==limit)
+                # An active admin recovery policy must not be retuned or newly activated by a customer.
+                # The owner may pause scheduled probes, but must preserve the admin-selected probes.
+                if not same_probe or (automatic and not current['automatic']):return error('此 VPS 有管理员设置的自动重启/换 IP 策略；请联系管理员关闭该策略后再修改或开启探测点',409)
             db.execute("UPDATE detection_runs SET action_status='cancelled',action_result='客户更新探测点，停止旧配置关联的自动动作' WHERE server_id=? AND action_status IN ('queued','issued','submitted','uncertain','verifying')",(sid,))
             db.execute('INSERT INTO detection_plans(server_id,source_id,nodes,interval_s,automatic,daily_limit,next_at,response_mode,action_connection_id,failure_threshold,failure_streak,failure_ip,failure_port,last_action,action_enabled,action_after_run,status,checked) VALUES(?,?,?,?,?,?,?,\'none\',NULL,3,0,NULL,NULL,NULL,0,?,?,NULL) ON CONFLICT(server_id) DO UPDATE SET source_id=excluded.source_id,nodes=excluded.nodes,interval_s=excluded.interval_s,automatic=excluded.automatic,daily_limit=excluded.daily_limit,next_at=MIN(detection_plans.next_at,excluded.next_at),failure_streak=0,failure_ip=NULL,failure_port=NULL,status=\'客户更新探测设置\',checked=NULL',(sid,source_id,json.dumps(ids),interval,int(automatic),limit,int(time.time()),last,'客户配置探测点'))
             audit(db,'客户配置 VPS 探测点 #'+str(sid))
         return jsonify(ok=True,automatic=automatic,message='探测配置已保存；客户配置不会更改管理员设置的重启或换 IP 策略')
+
+    @app.patch('/api/client/servers/<int:sid>/probe-config')
+    @auth()
+    def client_pause_probe_config(sid):
+        if g.user['role']!='client':return error('此功能仅供客户账号使用',403)
+        enabled=body().get('automatic')
+        if enabled is not False:return error('客户只能暂停定时探测；开启请使用探测设置，管理员自动处理策略需由管理员控制',403)
+        with connect() as db:
+            plan=db.execute('SELECT p.server_id,p.automatic FROM detection_plans p JOIN servers s ON s.id=p.server_id WHERE p.server_id=? AND s.owner_id=?',(sid,g.user['id'])).fetchone()
+            if not plan:return error('服务器探测配置不存在',404)
+            db.execute('UPDATE detection_plans SET automatic=0,status=\'客户暂停定时探测\' WHERE server_id=?',(sid,))
+            audit(db,'客户暂停 VPS 定时探测 #'+str(sid))
+        return jsonify(ok=True,automatic=False)
 
     @app.delete('/api/detection/sources/<int:sid>')
     @auth(admin=True)
