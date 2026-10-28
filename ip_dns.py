@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS dns_bindings(
  domain TEXT NOT NULL, record_id TEXT NOT NULL, rr TEXT NOT NULL, line TEXT NOT NULL,
  expected_ip TEXT NOT NULL, port INTEGER NOT NULL, automatic INTEGER NOT NULL DEFAULT 0,
  candidate TEXT, candidate_since INTEGER, status TEXT NOT NULL DEFAULT '等待检查', updated INTEGER,
+ verify_new_ip INTEGER NOT NULL DEFAULT 1,
  UNIQUE(connection_id,record_id));
 CREATE TABLE IF NOT EXISTS ip_monitors(
  server_id INTEGER PRIMARY KEY REFERENCES servers(id) ON DELETE CASCADE,
@@ -178,7 +179,10 @@ def alidns(connection,action,**kwargs):
     return data
 
 def init_schema(connect):
-    with connect() as db:db.executescript(SCHEMA)
+    with connect() as db:
+        db.executescript(SCHEMA)
+        columns={r['name'] for r in db.execute('PRAGMA table_info(dns_bindings)')}
+        if 'verify_new_ip' not in columns:db.execute('ALTER TABLE dns_bindings ADD COLUMN verify_new_ip INTEGER NOT NULL DEFAULT 1')
 
 def load_connection(db,cipher,cid):
     row=db.execute('SELECT * FROM ip_connections WHERE id=?',(cid,)).fetchone()
@@ -262,9 +266,9 @@ def run_binding(connect,cipher,bid,apply=False):
                     if b['candidate']!=new_ip:
                         db.execute('UPDATE dns_bindings SET candidate=?,candidate_since=? WHERE id=?',(new_ip,now,bid))
                         b['candidate_since']=now
-                    probe_reason=boce_dns_gate(db,b['server_id'],new_ip,b['port']) if apply else None
+                    probe_reason=boce_dns_gate(db,b['server_id'],new_ip,b['port']) if apply and b['verify_new_ip'] else None
                     has_plan=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='detection_plans'").fetchone() and db.execute('SELECT 1 FROM detection_plans WHERE server_id=?',(b['server_id'],)).fetchone()
-                    stable_seconds=10 if has_plan and not probe_reason else 60
+                    stable_seconds=0 if not b['verify_new_ip'] else (10 if has_plan and not probe_reason else 60)
                     if apply and not probe_reason and now-(b['candidate_since'] or now)>=stable_seconds:
                         try:
                             with socket.create_connection((new_ip,b['port']),timeout=4):pass
@@ -442,7 +446,8 @@ def register(app,connect,cipher,auth,body,error,audit):
             domain=d.get('domain','').strip().lower();rr=d.get('rr','').strip();line=d.get('line','').strip();rid=str(d.get('record_id','')).strip()
             if not re.fullmatch(r'[a-z0-9.-]{3,253}',domain) or not rr or len(rr)>253 or not line or len(line)>100 or not rid or len(rid)>100:raise IntegrationError('请完整填写主域名、主机记录、线路代码和 RecordId')
             ip=public_v4(d.get('expected_ip'));port=d.get('port',443)
-            if type(port)is not int or not 1<=port<=65535 or type(d.get('automatic',False))is not bool:raise IntegrationError('端口或自动开关格式无效')
+            verify_new_ip=d.get('verify_new_ip',True)
+            if type(port)is not int or not 1<=port<=65535 or type(d.get('automatic',False))is not bool or type(verify_new_ip)is not bool:raise IntegrationError('端口或自动开关格式无效')
             with connect() as db:
                 if not db.execute('SELECT 1 FROM servers WHERE id=?',(d.get('server_id'),)).fetchone():raise IntegrationError('请选择服务器')
                 if not db.execute('SELECT 1 FROM ip_monitors WHERE server_id=?',(d.get('server_id'),)).fetchone():raise IntegrationError('请先将此 VPS 加入监控')
@@ -455,11 +460,11 @@ def register(app,connect,cipher,auth,body,error,audit):
                 found=next((r for r in data.get('DomainRecords',{}).get('Record',[]) if str(r.get('RecordId'))==rid),None)
                 if not found:raise IntegrationError('主域名下未找到该 RecordId（接口最多检查前 100 条匹配记录）')
                 validate_record(found,{'record_id':rid,'rr':rr,'line':line,'expected_ip':ip})
-                values=(d['server_id'],c['id'],source,domain,rid,rr,line,ip,port,int(d.get('automatic',False)))
+                values=(d['server_id'],c['id'],source,domain,rid,rr,line,ip,port,int(d.get('automatic',False)),int(verify_new_ip))
                 if d.get('id'):
-                    if not db.execute('UPDATE dns_bindings SET server_id=?,connection_id=?,source_id=?,domain=?,record_id=?,rr=?,line=?,expected_ip=?,port=?,automatic=?,candidate=NULL,candidate_since=NULL,status=\'等待检查\' WHERE id=?',values+(d['id'],)).rowcount:raise IntegrationError('绑定不存在')
+                    if not db.execute('UPDATE dns_bindings SET server_id=?,connection_id=?,source_id=?,domain=?,record_id=?,rr=?,line=?,expected_ip=?,port=?,automatic=?,verify_new_ip=?,candidate=NULL,candidate_since=NULL,status=\'等待检查\' WHERE id=?',values+(d['id'],)).rowcount:raise IntegrationError('绑定不存在')
                     bid=d['id']
-                else:bid=db.execute('INSERT INTO dns_bindings(server_id,connection_id,source_id,domain,record_id,rr,line,expected_ip,port,automatic) VALUES(?,?,?,?,?,?,?,?,?,?)',values).lastrowid
+                else:bid=db.execute('INSERT INTO dns_bindings(server_id,connection_id,source_id,domain,record_id,rr,line,expected_ip,port,automatic,verify_new_ip) VALUES(?,?,?,?,?,?,?,?,?,?,?)',values).lastrowid
                 audit(db,'保存 DNS 绑定 #'+str(bid))
             return jsonify(ok=True,id=bid)
         except sqlite3.IntegrityError:return error('解析记录已绑定或连接配置已失效')
