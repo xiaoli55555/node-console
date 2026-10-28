@@ -359,7 +359,7 @@ def register(app,connect,cipher,auth,body,error,audit):
             if enabled:
                 plan=db.execute('SELECT p.automatic,s.enabled AS source_enabled,m.enabled AS monitor_enabled FROM detection_plans p JOIN detection_sources s ON s.id=p.source_id JOIN ip_monitors m ON m.server_id=p.server_id WHERE p.server_id=?',(binding['server_id'],)).fetchone()
                 if not plan or not plan['automatic'] or not plan['source_enabled'] or not plan['monitor_enabled']:
-                    return error('管理员尚未启用此服务器的自动探测，暂时不能开启自动解析',409)
+                    return error('请先在本 VPS 的探测设置中启用定时探测，并确认监控和探测来源可用',409)
             db.execute('UPDATE dns_bindings SET automatic=?,verify_new_ip=1 WHERE id=?',(int(enabled),bid))
             audit(db,('客户开启' if enabled else '客户暂停')+'服务器 #'+str(binding['server_id'])+' DNS 自动解析 #'+str(bid))
         return jsonify(ok=True,automatic=enabled,verify_new_ip=True)

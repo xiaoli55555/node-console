@@ -323,6 +323,41 @@ class PanelTest(unittest.TestCase):
             self.assertEqual(tuple(row),(1,1))
         self.assertEqual(self.bob.patch(toggle,json={'automatic':False},headers={'X-CSRF-Token':self.tokens['bob']}).status_code,404)
 
+    def test_client_can_set_private_boce_key_and_probe_nodes_for_owned_server(self):
+        from unittest.mock import patch
+        node=self.post('/api/servers',{'name':'client-probe'}).json;sid=node['id']
+        uid=self.alice.get('/api/me').json['id'];headers={'X-CSRF-Token':self.tokens['alice']}
+        self.admin.patch('/api/servers/'+str(sid),json={'owner_id':uid},headers={'X-CSRF-Token':self.tokens['admin']})
+        with server.connect() as db:
+            db.execute('INSERT INTO ip_monitors(server_id,port,enabled) VALUES(?,443,1)',(sid,))
+            shared=db.execute("INSERT INTO detection_sources(name,kind,secret,enabled) VALUES('shared probe','boce',?,1)",(server.CIPHER.encrypt(b'shared-secret').decode(),)).lastrowid
+            db.execute("INSERT INTO detection_plans(server_id,source_id,nodes,interval_s,automatic,daily_limit,response_mode,action_enabled) VALUES(?,?,?,600,1,300,'reboot',1)",(sid,shared,'[\"13\"]'))
+        own='/api/client/servers/'+str(sid)+'/probe-config'
+        result=self.alice.get(own)
+        self.assertEqual(result.status_code,200)
+        self.assertNotIn('secret',result.text);self.assertNotIn('shared-secret',result.text)
+        self.assertEqual({x['id'] for x in result.json['sources']},{shared})
+        self.assertEqual(self.bob.get(own).status_code,404)
+        nodes=[{'id':13,'node_name':'上海电信','isp_name':'电信'},{'id':27,'node_name':'广州联通','isp_name':'联通'}]
+        with patch('detectors.boce',return_value={'data':{'list':nodes}}) as boce:
+            saved=self.alice.post(f'/api/client/servers/{sid}/probe-source',json={'secret':'client-private-boce-key'},headers=headers)
+            self.assertEqual(saved.status_code,200,saved.json)
+            self.assertEqual([x['id'] for x in saved.json['nodes']],['13','27'])
+            self.assertEqual(boce.call_args.args[0],'client-private-boce-key')
+            self.assertNotIn('client-private-boce-key',saved.text)
+            source_id=saved.json['source_id']
+            response=self.alice.put(own,json={'source_id':source_id,'nodes':['13','27'],'interval_s':240,'daily_limit':500,'automatic':False,'response_mode':'change_api'},headers=headers)
+            self.assertEqual(response.status_code,200,response.json)
+        with server.connect() as db:
+            source=db.execute('SELECT owner_id,server_id,secret FROM detection_sources WHERE id=?',(source_id,)).fetchone()
+            self.assertEqual((source['owner_id'],source['server_id']),(uid,sid))
+            self.assertNotEqual(source['secret'],'client-private-boce-key')
+            plan=db.execute('SELECT source_id,nodes,interval_s,daily_limit,automatic,response_mode,action_enabled FROM detection_plans WHERE server_id=?',(sid,)).fetchone()
+            self.assertEqual((plan['source_id'],plan['nodes'],plan['interval_s'],plan['daily_limit'],plan['automatic'],plan['response_mode'],plan['action_enabled']),(source_id,'["13", "27"]',240,500,0,'reboot',1))
+        self.assertEqual(self.bob.post(f'/api/client/servers/{sid}/probe-sources/{source_id}/nodes',json={},headers={'X-CSRF-Token':self.tokens['bob']}).status_code,404)
+        with patch('detectors.boce',return_value={'data':{'list':nodes}}):
+            self.assertEqual(self.alice.put(own,json={'source_id':shared,'nodes':['999'],'interval_s':240,'daily_limit':500},headers=headers).status_code,400)
+
     def test_reboot_permissions_one_time_delivery_and_completion(self):
         r=self.post('/api/servers',{'name':'reboot-test'}).json;sid=r['id'];h={'Authorization':'Bearer '+r['token']}
         uid=self.alice.get('/api/me').json['id']
