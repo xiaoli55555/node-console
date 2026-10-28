@@ -21,7 +21,9 @@ from flask import g, jsonify
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS ip_connections(
  id INTEGER PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL,
- config TEXT NOT NULL, secret TEXT NOT NULL);
+ config TEXT NOT NULL, secret TEXT NOT NULL,
+ owner_id INTEGER,
+ server_id INTEGER REFERENCES servers(id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS dns_bindings(
  id INTEGER PRIMARY KEY, server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
  connection_id INTEGER NOT NULL REFERENCES ip_connections(id), source_id INTEGER REFERENCES ip_connections(id),
@@ -181,6 +183,9 @@ def alidns(connection,action,**kwargs):
 def init_schema(connect):
     with connect() as db:
         db.executescript(SCHEMA)
+        columns={r['name'] for r in db.execute('PRAGMA table_info(ip_connections)')}
+        if 'owner_id' not in columns:db.execute('ALTER TABLE ip_connections ADD COLUMN owner_id INTEGER')
+        if 'server_id' not in columns:db.execute('ALTER TABLE ip_connections ADD COLUMN server_id INTEGER REFERENCES servers(id) ON DELETE CASCADE')
         columns={r['name'] for r in db.execute('PRAGMA table_info(dns_bindings)')}
         if 'verify_new_ip' not in columns:db.execute('ALTER TABLE dns_bindings ADD COLUMN verify_new_ip INTEGER NOT NULL DEFAULT 1')
 
@@ -331,8 +336,8 @@ def register(app,connect,cipher,auth,body,error,audit):
     @auth(admin=True)
     def overview():
         with connect() as db:
-            return jsonify(connections=[safe_config(r) for r in db.execute('SELECT * FROM ip_connections')],
-                bindings=[dict(r) for r in db.execute('SELECT * FROM dns_bindings')],
+            return jsonify(connections=[safe_config(r) for r in db.execute('SELECT * FROM ip_connections WHERE owner_id IS NULL')],
+                bindings=[dict(r) for r in db.execute('SELECT b.* FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id WHERE c.owner_id IS NULL')],
                 events=[dict(r) for r in db.execute('SELECT * FROM dns_events ORDER BY id DESC LIMIT 50')],
                 servers=[dict(r) for r in db.execute('SELECT id,name FROM servers')],
                 monitors=[dict(r) for r in db.execute('SELECT ip_monitors.*,servers.name,servers.seen FROM ip_monitors JOIN servers ON servers.id=ip_monitors.server_id')])
@@ -344,8 +349,170 @@ def register(app,connect,cipher,auth,body,error,audit):
         with connect() as db:
             server=db.execute('SELECT id FROM servers WHERE id=? AND owner_id=?',(sid,g.user['id'])).fetchone()
             if not server:return error('服务器不存在',404)
-            rows=db.execute('SELECT id,domain,rr,line,expected_ip,candidate,port,automatic,verify_new_ip,status,updated FROM dns_bindings WHERE server_id=? ORDER BY id',(sid,)).fetchall()
-        return jsonify(bindings=[dict(r) for r in rows])
+            rows=db.execute('SELECT b.id,b.connection_id,b.domain,b.rr,b.line,b.expected_ip,b.candidate,b.port,b.automatic,b.verify_new_ip,b.status,b.updated,c.name AS connection_name,CASE WHEN c.owner_id=? AND c.server_id=b.server_id THEN 1 ELSE 0 END AS customer_owned FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id WHERE b.server_id=? ORDER BY b.id',(g.user['id'],sid)).fetchall()
+            connections=[dict(r) for r in db.execute("SELECT id,name,kind,json_extract(config,'$.provider') AS provider,json_extract(config,'$.access_key_id') AS access_key_id FROM ip_connections WHERE owner_id=? AND server_id=? AND kind IN ('alidns','change_ip') ORDER BY id",(g.user['id'],sid))]
+        return jsonify(bindings=[dict(r) for r in rows],connections=connections)
+
+    def client_server(db,sid):
+        if g.user['role']!='client':return None
+        return db.execute('SELECT id,name FROM servers WHERE id=? AND owner_id=?',(sid,g.user['id'])).fetchone()
+
+    def client_dns_connection(db,sid,cid):
+        return db.execute("SELECT * FROM ip_connections WHERE id=? AND kind='alidns' AND owner_id=? AND server_id=?",(cid,g.user['id'],sid)).fetchone()
+
+    @app.patch('/api/client/servers/<int:sid>/monitor')
+    @auth()
+    def client_update_monitor(sid):
+        if g.user['role']!='client':return error('此功能仅供客户账号使用',403)
+        d=body();port=d.get('port');enabled=d.get('enabled',True)
+        if type(port)is not int or not 1<=port<=65535 or type(enabled)is not bool:return error('请填写有效的 TCP 检测端口并选择监控开关')
+        with connect() as db:
+            if not client_server(db,sid):return error('服务器不存在',404)
+            current=db.execute('SELECT p.action_enabled,p.response_mode,p.owner_id,s.owner_id AS source_owner,s.server_id FROM detection_plans p JOIN detection_sources s ON s.id=p.source_id WHERE p.server_id=?',(sid,)).fetchone()
+            if current and current['action_enabled'] and current['response_mode'] in ('reboot','change_api') and (current['owner_id']!=g.user['id'] or current['source_owner']!=g.user['id'] or current['server_id']!=sid):return error('管理员自动处理策略正在运行，不能修改检测端口；请联系管理员',409)
+            db.execute('INSERT INTO ip_monitors(server_id,port,enabled,source_id) VALUES(?,?,?,NULL) ON CONFLICT(server_id) DO UPDATE SET port=excluded.port,enabled=excluded.enabled,source_id=NULL',(sid,port,int(enabled)))
+            db.execute('UPDATE dns_bindings SET port=?,automatic=CASE WHEN ? THEN automatic ELSE 0 END WHERE server_id=?',(port,int(enabled),sid))
+            audit(db,'客户配置 VPS 检测端口 / 监控开关 #'+str(sid))
+        return jsonify(ok=True,port=port,enabled=enabled)
+
+    def dns_records(connection,domain):
+        import re
+        if not isinstance(domain,str) or not re.fullmatch(r'(?i)[a-z0-9.-]{3,253}',domain.strip()):raise IntegrationError('请填写有效的主域名')
+        data=alidns(connection,'DescribeDomainRecords',DomainName=domain.strip().lower(),PageSize=100)
+        records=data.get('DomainRecords',{}).get('Record',[])
+        if not isinstance(records,list):raise IntegrationError('阿里云解析记录格式异常')
+        return [{'RecordId':str(r.get('RecordId','')),'RR':str(r.get('RR','')),'Type':str(r.get('Type','')),'Line':str(r.get('Line','')),'Value':str(r.get('Value','')),'TTL':r.get('TTL'),'Status':str(r.get('Status',''))} for r in records if isinstance(r,dict)]
+
+    @app.post('/api/client/servers/<int:sid>/dns-connections')
+    @auth()
+    def client_save_dns_connection(sid):
+        d=body();name=d.get('name','阿里云 DNS');config=d.get('config') or {};secret=d.get('secret','');domain=d.get('domain','')
+        if not isinstance(config,dict):return error('阿里云 API 配置格式无效')
+        key=config.get('access_key_id','')
+        if not isinstance(name,str) or not 1<=len(name.strip())<=80 or not isinstance(key,str) or not key.strip() or len(key)>128 or not isinstance(secret,str) or len(secret)>4096:return error('请填写连接名称和有效 AccessKey ID / Secret')
+        try:
+            with connect() as db:
+                if not client_server(db,sid):return error('服务器不存在',404)
+                if not db.execute('SELECT 1 FROM ip_monitors WHERE server_id=?',(sid,)).fetchone():return error('服务器监控尚未初始化，请先在探测设置里保存检测端口',409)
+                existing=db.execute("SELECT id FROM ip_connections WHERE kind='alidns' AND owner_id=? AND server_id=?",(g.user['id'],sid)).fetchone()
+                if not secret and existing:
+                    previous=load_connection(db,cipher,existing['id']);secret=previous['secret']
+                if not secret or len(secret)<8:return error('请填写 AccessKey Secret')
+                candidate={'id':existing['id'] if existing else 0,'name':name.strip(),'kind':'alidns','config':{'access_key_id':key.strip()},'secret':secret}
+                records=dns_records(candidate,domain)
+                encrypted=cipher.encrypt(secret.encode()).decode()
+                if existing:
+                    cid=existing['id'];db.execute('UPDATE ip_connections SET name=?,config=?,secret=? WHERE id=?',(name.strip(),json.dumps(candidate['config']),encrypted,cid))
+                else:
+                    cid=db.execute("INSERT INTO ip_connections(name,kind,config,secret,owner_id,server_id) VALUES(?,'alidns',?,?,?,?)",(name.strip(),json.dumps(candidate['config']),encrypted,g.user['id'],sid)).lastrowid
+                audit(db,'客户保存 VPS 专属阿里云 DNS 连接 #'+str(sid))
+            return jsonify(ok=True,connection={'id':cid,'name':name.strip(),'kind':'alidns'},records=records),201
+        except IntegrationError as e:return error('阿里云验证失败：'+str(e))
+
+    @app.post('/api/client/servers/<int:sid>/change-ip-api')
+    @auth()
+    def client_save_change_ip_api(sid):
+        if g.user['role']!='client':return error('此功能仅供客户账号使用',403)
+        d=body();url=d.get('url','')
+        if not isinstance(url,str):return error('请粘贴完整的 MoonVM 换 IP API 链接')
+        try:
+            product,secret=parse_moonvm_url(url.strip())
+            with connect() as db:
+                if not client_server(db,sid):return error('服务器不存在',404)
+                old=db.execute("SELECT id FROM ip_connections WHERE kind='change_ip' AND owner_id=? AND server_id=?",(g.user['id'],sid)).fetchone()
+                encrypted=cipher.encrypt(secret.encode()).decode()
+                if old:
+                    cid=old['id'];db.execute("UPDATE ip_connections SET name=?,config=?,secret=? WHERE id=?",('MoonVM 产品 '+product,json.dumps({'provider':'moonvm','product':product}),encrypted,cid))
+                else:
+                    cid=db.execute("INSERT INTO ip_connections(name,kind,config,secret,owner_id,server_id) VALUES(?,'change_ip',?,?,?,?)",('MoonVM 产品 '+product,json.dumps({'provider':'moonvm','product':product}),encrypted,g.user['id'],sid)).lastrowid
+                audit(db,'客户保存 VPS 专属 MoonVM 换 IP API #'+str(sid))
+            return jsonify(ok=True,connection={'id':cid,'name':'MoonVM 产品 '+product,'kind':'change_ip','provider':'moonvm'}),201
+        except IntegrationError as e:return error(str(e))
+
+    @app.delete('/api/client/servers/<int:sid>/dns-connections/<int:cid>')
+    @auth()
+    def client_delete_dns_connection(sid,cid):
+        with connect() as db:
+            if not client_server(db,sid):return error('服务器不存在',404)
+            row=db.execute('SELECT id FROM ip_connections WHERE id=? AND kind IN (\'alidns\',\'change_ip\') AND owner_id=? AND server_id=?',(cid,g.user['id'],sid)).fetchone()
+            if not row:return error('连接不存在',404)
+            if db.execute('SELECT 1 FROM dns_bindings WHERE connection_id=? LIMIT 1',(cid,)).fetchone():return error('仍有 DNS 记录使用此连接，请先删除 DNS 绑定',409)
+            db.execute('UPDATE detection_plans SET action_enabled=0,response_mode=\'none\',action_connection_id=NULL WHERE server_id=? AND action_connection_id=?',(sid,cid))
+            db.execute('DELETE FROM ip_connections WHERE id=?',(cid,));audit(db,'客户删除 VPS 专属 API 连接 #'+str(cid))
+        return jsonify(ok=True)
+
+    @app.post('/api/client/servers/<int:sid>/dns-connections/<int:cid>/records')
+    @auth()
+    def client_read_dns_records(sid,cid):
+        try:
+            with connect() as db:
+                if not client_server(db,sid):return error('服务器不存在',404)
+                row=client_dns_connection(db,sid,cid)
+                if not row:return error('阿里云连接不存在',404)
+                connection=dict(row);connection['config']=json.loads(row['config']);connection['secret']=cipher.decrypt(row['secret'].encode()).decode()
+            return jsonify(records=dns_records(connection,body().get('domain','')))
+        except IntegrationError as e:return error(str(e))
+
+    @app.post('/api/client/servers/<int:sid>/dns-bindings')
+    @auth()
+    def client_save_dns_binding(sid):
+        import re,sqlite3
+        d=body()
+        try:
+            domain=d.get('domain','');rr=d.get('rr','');line=d.get('line','')
+            if not all(isinstance(x,str) for x in (domain,rr,line)):raise IntegrationError('主域名、主机记录和线路格式无效')
+            domain=domain.strip().lower();rr=rr.strip();line=line.strip();rid=str(d.get('record_id','')).strip();cid=d.get('connection_id')
+            if not re.fullmatch(r'(?i)[a-z0-9.-]{3,253}',domain) or not rr or len(rr)>253 or not line or len(line)>100 or not rid or len(rid)>100 or type(cid)is not int:raise IntegrationError('请完整选择主域名、记录、线路和阿里云连接')
+            with connect() as db:
+                server=client_server(db,sid)
+                if not server:return error('服务器不存在',404)
+                monitor=db.execute('SELECT port,enabled FROM ip_monitors WHERE server_id=?',(sid,)).fetchone()
+                if not monitor:return error('请先保存 VPS 检测端口',409)
+                c=client_dns_connection(db,sid,cid)
+                if not c:raise IntegrationError('阿里云连接不属于当前客户或 VPS')
+                connection=dict(c);connection['config']=json.loads(c['config']);connection['secret']=cipher.decrypt(c['secret'].encode()).decode()
+                found=next((r for r in dns_records(connection,domain) if r['RecordId']==rid),None)
+                if not found:raise IntegrationError('阿里云主域名下未找到所选 RecordId')
+                if found['Type']!='A' or found['Status']!='ENABLE' or (found['RR'],found['Line'])!=(rr,line):raise IntegrationError('解析记录类型、线路或状态已改变，请重新读取')
+                ip=public_v4(found['Value'])
+                duplicate=db.execute('SELECT id FROM dns_bindings WHERE server_id=? AND record_id=?'+(' AND id<>?' if d.get('id') else ''),(sid,rid,d['id']) if d.get('id') else (sid,rid)).fetchone()
+                if duplicate:raise IntegrationError('此阿里云 RecordId 已绑定到这台 VPS，不能重复绑定')
+                current=db.execute('SELECT metrics,seen FROM servers WHERE id=?',(sid,)).fetchone()
+                if not current or not current['seen'] or time.time()-current['seen']>90:raise IntegrationError('VPS 上报已过期，暂时无法核对解析 IP')
+                metrics=json.loads(current['metrics'] or '{}');addresses=set(metrics.get('public_ips') or [])
+                if ip not in addresses:
+                    egress=set(metrics.get('egress_ips') or []);checked=int(metrics.get('egress_checked') or 0)
+                    if ip not in egress or time.time()-checked>180:raise IntegrationError('所选解析当前 IP 与该 VPS 新鲜上报的公网 IP 不一致，已阻止绑定')
+                vals=(sid,cid,domain,rid,rr,line,ip,monitor['port'])
+                existing=d.get('id')
+                if existing:
+                    changed=db.execute('UPDATE dns_bindings SET server_id=?,connection_id=?,source_id=NULL,domain=?,record_id=?,rr=?,line=?,expected_ip=?,port=?,automatic=0,verify_new_ip=1,candidate=NULL,candidate_since=NULL,status=\'等待检查\' WHERE id=? AND server_id=? AND id IN (SELECT b.id FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id WHERE c.owner_id=? AND c.server_id=?)',vals+(existing,sid,g.user['id'],sid)).rowcount
+                    if not changed:raise IntegrationError('解析绑定不属于当前客户')
+                    bid=existing
+                else:
+                    bid=db.execute('INSERT INTO dns_bindings(server_id,connection_id,domain,record_id,rr,line,expected_ip,port,automatic,verify_new_ip) VALUES(?,?,?,?,?,?,?,?,0,1)',vals).lastrowid
+                audit(db,'客户保存 VPS 专属 DNS 绑定 #'+str(bid))
+            return jsonify(ok=True,id=bid)
+        except sqlite3.IntegrityError:return error('该阿里云线路记录已绑定，请检查是否重复')
+        except IntegrationError as e:return error(str(e))
+
+    @app.delete('/api/client/dns-bindings/<int:bid>')
+    @auth()
+    def client_delete_dns_binding(bid):
+        with connect() as db:
+            row=db.execute('SELECT b.server_id FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id WHERE b.id=? AND c.owner_id=? AND c.server_id=b.server_id AND b.server_id IN (SELECT id FROM servers WHERE owner_id=?)',(bid,g.user['id'],g.user['id'])).fetchone()
+            if not row:return error('解析绑定不存在',404)
+            db.execute('DELETE FROM dns_bindings WHERE id=?',(bid,));audit(db,'客户删除 DNS 绑定 #'+str(bid))
+        return jsonify(ok=True)
+
+    @app.post('/api/client/dns-bindings/<int:bid>/check')
+    @auth()
+    def client_check_dns_binding(bid):
+        with connect() as db:
+            owned=db.execute('SELECT 1 FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id WHERE b.id=? AND c.owner_id=? AND c.server_id=b.server_id AND b.server_id IN (SELECT id FROM servers WHERE owner_id=?)',(bid,g.user['id'],g.user['id'])).fetchone()
+            if not owned:return error('解析绑定不存在',404)
+        try:return jsonify(run_binding(connect,cipher,bid,body().get('apply') is True))
+        except IntegrationError as e:return error(str(e))
 
     @app.patch('/api/client/dns-bindings/<int:bid>')
     @auth()
@@ -447,12 +614,13 @@ def register(app,connect,cipher,auth,body,error,audit):
                 cid=d.get('id')
                 if cid:
                     old=load_connection(db,cipher,cid)
+                    if old.get('owner_id') is not None:return error('客户专属 API 连接不可由管理员 API 修改')
                     if old['kind']!=kind:raise IntegrationError('不能更改已有连接类型')
                     if not secret and old['config']!=config:raise IntegrationError('修改接口地址或账号时，请重新填写密钥')
                     secret=secret or old['secret']
                 if kind=='alidns' and not secret:raise IntegrationError('请填写 AccessKey Secret')
                 encrypted=cipher.encrypt(secret.encode()).decode()
-                if cid:db.execute('UPDATE ip_connections SET name=?,config=?,secret=? WHERE id=?',(name,json.dumps(config),encrypted,cid))
+                if cid:db.execute('UPDATE ip_connections SET name=?,config=?,secret=? WHERE id=? AND owner_id IS NULL',(name,json.dumps(config),encrypted,cid))
                 else:cid=db.execute('INSERT INTO ip_connections(name,kind,config,secret) VALUES(?,?,?,?)',(name,kind,json.dumps(config),encrypted)).lastrowid
                 audit(db,'保存 IP/DNS API 连接 #'+str(cid))
             return jsonify(ok=True,id=cid)
@@ -462,7 +630,9 @@ def register(app,connect,cipher,auth,body,error,audit):
     @auth(admin=True)
     def test_connection(cid):
         try:
-            with connect() as db:c=load_connection(db,cipher,cid)
+            with connect() as db:
+                c=load_connection(db,cipher,cid)
+                if c.get('owner_id') is not None:raise IntegrationError('客户专属 API 连接不可由管理员 API 操作')
             if c['kind']=='alidns':
                 domain=body().get('domain','').strip()
                 if not domain:raise IntegrationError('请填写要测试的主域名')
@@ -490,7 +660,7 @@ def register(app,connect,cipher,auth,body,error,audit):
                 if not db.execute('SELECT 1 FROM servers WHERE id=?',(d.get('server_id'),)).fetchone():raise IntegrationError('请选择服务器')
                 if not db.execute('SELECT 1 FROM ip_monitors WHERE server_id=?',(d.get('server_id'),)).fetchone():raise IntegrationError('请先将此 VPS 加入监控')
                 c=load_connection(db,cipher,d.get('connection_id'))
-                if c['kind']!='alidns':raise IntegrationError('请选择阿里云连接')
+                if c['kind']!='alidns' or c.get('owner_id') is not None:raise IntegrationError('请选择管理员的阿里云连接')
                 source=d.get('source_id') or None
                 if source and load_connection(db,cipher,source)['kind']!='provider':raise IntegrationError('IP 来源类型错误')
                 # Domain-scoped lookup proves the RecordId belongs to the requested domain.
@@ -515,7 +685,10 @@ def register(app,connect,cipher,auth,body,error,audit):
         if kind not in ('connections','bindings'):return error('类型无效')
         try:
             with connect() as db:
-                db.execute('DELETE FROM '+('ip_connections' if kind=='connections' else 'dns_bindings')+' WHERE id=?',(ident,));audit(db,'删除 IP/DNS '+kind+' #'+str(ident))
+                if kind=='connections':deleted=db.execute('DELETE FROM ip_connections WHERE id=? AND owner_id IS NULL',(ident,)).rowcount
+                else:deleted=db.execute('DELETE FROM dns_bindings WHERE id=? AND id IN (SELECT b.id FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id WHERE c.owner_id IS NULL)',(ident,)).rowcount
+                if not deleted:return error('连接或绑定不存在，或不属于管理员配置')
+                audit(db,'删除 IP/DNS '+kind+' #'+str(ident))
             return jsonify(ok=True)
         except sqlite3.IntegrityError:return error('该连接仍被解析绑定使用，请先删除绑定')
 
