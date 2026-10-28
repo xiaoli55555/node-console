@@ -329,14 +329,12 @@ class DetectorTest(unittest.TestCase):
    self.assertEqual(api.call_count,1)
   with self.connect() as db:self.assertEqual(db.execute('SELECT action_status FROM detection_runs WHERE id=?',(rid,)).fetchone()[0],'verifying')
 
- def test_dns_requires_two_fresh_complete_boce_results_for_new_ip(self):
+ def test_dns_requires_one_fresh_complete_probe_result_for_new_ip(self):
   source=self.source()['id'];self.plan(source)
   from ip_dns import boce_dns_gate
   rows=[{'node_id':str(i),'state':'reachable'} for i in [1,2]]
   def insert(details,ip='1.1.1.1',port=443,stamp=None):
    with self.connect() as db:db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details) VALUES(1,?,?,?,?,'complete',?,?,?)",(source,ip,port,json.dumps(['1','2']),int(time.time()),stamp or int(time.time()),json.dumps(details)))
-  with self.connect() as db:self.assertIsNotNone(boce_dns_gate(db,1,'1.1.1.1'))
-  insert(rows)
   with self.connect() as db:self.assertIsNotNone(boce_dns_gate(db,1,'1.1.1.1'))
   insert(rows)
   with self.connect() as db:self.assertIsNone(boce_dns_gate(db,1,'1.1.1.1'))
@@ -353,9 +351,9 @@ class DetectorTest(unittest.TestCase):
   now=int(time.time());nodes=json.dumps(['1','2']);good=json.dumps([{'node_id':str(i),'state':'reachable'} for i in [1,2]])
   with self.connect() as db:
    db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,action_status,action_attempts,action_attempted) VALUES(1,?,'8.8.8.8',443,?,'failed',?,?,'verifying',2,?)",(source,nodes,now-30,now,now-5))
-   for _ in range(2):db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details) VALUES(1,?,'1.1.1.1',443,?,'passed',?,?,?)",(source,nodes,now-10,now,good))
+   db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details) VALUES(1,?,'1.1.1.1',443,?,'passed',?,?,?)",(source,nodes,now-10,now,good))
    self.assertIsNotNone(boce_dns_gate(db,1,'1.1.1.1'))
-   for _ in range(2):db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details) VALUES(1,?,'1.1.1.1',443,?,'passed',?,?,?)",(source,nodes,now,now,good))
+   db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details) VALUES(1,?,'1.1.1.1',443,?,'passed',?,?,?)",(source,nodes,now,now,good))
    self.assertIsNone(boce_dns_gate(db,1,'1.1.1.1'))
 
  def test_recent_completed_reboot_has_no_hour_cooldown_but_pending_is_deduplicated(self):

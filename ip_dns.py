@@ -227,20 +227,22 @@ def candidate_ip(db,binding,cipher):
     if len(egress)>1:raise IntegrationError('出口 IP 检测到多个公网 IPv4，无法确定目标地址')
     raise IntegrationError('未取得网卡公网 IPv4，也没有新鲜且唯一的出口公网 IPv4')
 
-def boce_dns_gate(db,sid,address,port=None):
+def boce_dns_gate(db,sid,address,port=None,require_plan=False,min_created=None):
     """Return a blocking reason, or None. No BOCE requests are made here."""
-    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='detection_plans'").fetchone():return None
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='detection_plans'").fetchone():return '请先配置并开启自动探测，才能验证新 IP' if require_plan else None
     plan=db.execute('SELECT p.*,s.kind,s.enabled AS source_enabled,m.port AS monitor_port FROM detection_plans p JOIN detection_sources s ON s.id=p.source_id JOIN ip_monitors m ON m.server_id=p.server_id WHERE p.server_id=?',(sid,)).fetchone()
-    if not plan:return None
+    if not plan:return '请先配置并开启自动探测，才能验证新 IP' if require_plan else None
+    if require_plan and not plan['automatic']:return '新 IP 国内探测未启动：请开启定时探测'
     if not plan['source_enabled']:return '等待新 IP 的 BOCE 国内复检：探测来源已暂停'
     target_port=plan['monitor_port']
-    rows=db.execute("SELECT * FROM detection_runs WHERE server_id=? AND status NOT IN ('creating','pending','queued','issued') ORDER BY id DESC LIMIT 2",(sid,)).fetchall()
-    if len(rows)<2:return '等待新 IP 的 BOCE 国内复检连续两轮通过'
+    rows=db.execute("SELECT * FROM detection_runs WHERE server_id=? AND status NOT IN ('creating','pending','queued','issued') ORDER BY id DESC LIMIT 1",(sid,)).fetchall()
+    if not rows:return '等待新 IP 的一次国内探测通过'
     now=int(time.time())
     recovery=db.execute("SELECT id,action_attempted FROM detection_runs WHERE server_id=? AND ip!=? AND action_attempts>0 AND action_status IN ('queued','issued','submitted','uncertain','verifying') ORDER BY id DESC LIMIT 1",(sid,address)).fetchone()
     for run in rows:
-        if recovery and (run['id']<=recovery['id'] or run['created']<(recovery['action_attempted'] or 0)):return '等待本次换 IP 后重新进行两轮 BOCE 国内复检，旧结果不可复用'
-        if run['source_id']!=plan['source_id'] or run['nodes']!=plan['nodes'] or run['ip']!=address or run['port']!=target_port or now-run['updated']>max(300,plan['interval_s']*3):return '等待新 IP 和当前端口的 BOCE 国内复检连续两轮通过'
+        if min_created is not None and run['created']<min_created:return '等待发现新 IP 后发起的一次全节点探测，旧结果不可复用'
+        if recovery and (run['id']<=recovery['id'] or run['created']<(recovery['action_attempted'] or 0)):return '等待本次换 IP 后重新探测一次，旧结果不可复用'
+        if run['source_id']!=plan['source_id'] or run['nodes']!=plan['nodes'] or run['ip']!=address or run['port']!=target_port or now-run['updated']>max(300,plan['interval_s']*3):return '等待新 IP 和当前端口的一次国内探测通过'
         try:details=json.loads(run['details']);nodes=json.loads(plan['nodes'])
         except (ValueError,TypeError):return '等待有效的 BOCE 国内复检结果'
         if not isinstance(details,list) or not isinstance(nodes,list) or not details or any(not isinstance(x,dict) for x in details) or len(details)!=len(nodes) or set(str(x.get('node_id')) for x in details)!=set(map(str,nodes)) or any(x.get('state')!='reachable' for x in details):return '新 IP 尚未通过全部所选 BOCE 国内节点，暂不更新 DNS'
@@ -249,6 +251,7 @@ def boce_dns_gate(db,sid,address,port=None):
 def run_binding(connect,cipher,bid,apply=False):
     # The process lock serializes workers AND admin-triggered updates across gunicorn processes.
     import fcntl
+    probe_passed=False
     with connect() as db:db_path=db.execute('PRAGMA database_list').fetchone()[2]
     with open(str(Path(db_path).with_suffix('.dns.lock')),'a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX)
@@ -266,9 +269,10 @@ def run_binding(connect,cipher,bid,apply=False):
                     if b['candidate']!=new_ip:
                         db.execute('UPDATE dns_bindings SET candidate=?,candidate_since=? WHERE id=?',(new_ip,now,bid))
                         b['candidate_since']=now
-                    probe_reason=boce_dns_gate(db,b['server_id'],new_ip,b['port']) if apply and b['verify_new_ip'] else None
+                    probe_reason=boce_dns_gate(db,b['server_id'],new_ip,b['port'],require_plan=True,min_created=b['candidate_since']) if apply and b['verify_new_ip'] else None
+                    probe_passed=bool(apply and b['verify_new_ip'] and not probe_reason)
                     has_plan=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='detection_plans'").fetchone() and db.execute('SELECT 1 FROM detection_plans WHERE server_id=?',(b['server_id'],)).fetchone()
-                    stable_seconds=0 if not b['verify_new_ip'] else (10 if has_plan and not probe_reason else 60)
+                    stable_seconds=0 if (not b['verify_new_ip'] or (has_plan and not probe_reason)) else 60
                     if apply and not probe_reason and now-(b['candidate_since'] or now)>=stable_seconds:
                         try:
                             with socket.create_connection((new_ip,b['port']),timeout=4):pass
@@ -289,7 +293,11 @@ def run_binding(connect,cipher,bid,apply=False):
                 return {'ok':True,'candidate':new_ip,'status':status}
         except IntegrationError as e:
             with connect() as db:
-                db.execute('UPDATE dns_bindings SET status=?,updated=?,candidate=NULL,candidate_since=NULL WHERE id=?',(str(e),int(time.time()),bid))
+                if probe_passed:
+                    # Once this IP passed its one required probe, transient DNS
+                    # or TCP failures should retry the same verified candidate.
+                    db.execute('UPDATE dns_bindings SET status=?,updated=? WHERE id=?',(str(e),int(time.time()),bid))
+                else:db.execute('UPDATE dns_bindings SET status=?,updated=?,candidate=NULL,candidate_since=NULL WHERE id=?',(str(e),int(time.time()),bid))
                 db.execute('INSERT INTO dns_events(binding_id,message,created) VALUES(?,?,?)',(bid,str(e),int(time.time())))
             raise
 
@@ -308,7 +316,10 @@ def check_monitor(connect,sid,cipher=None):
         except IntegrationError as e:status=str(e)
         previous=m['current_ip'] if current and m['current_ip'] and current!=m['current_ip'] else m['previous_ip']
         if current and m['current_ip'] and current!=m['current_ip']:
-            db.execute('INSERT INTO dns_events(binding_id,message,created) VALUES(NULL,?,?)',('VPS #'+str(sid)+' IP 变化：'+m['current_ip']+' → '+current,int(time.time())))
+            observed=int(time.time())
+            db.execute('INSERT INTO dns_events(binding_id,message,created) VALUES(NULL,?,?)',('VPS #'+str(sid)+' IP 变化：'+m['current_ip']+' → '+current,observed))
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='detection_plans'").fetchone():
+                db.execute('UPDATE detection_plans SET next_at=MIN(next_at,?) WHERE server_id=? AND automatic=1',(observed,sid))
         db.execute('UPDATE ip_monitors SET current_ip=?,previous_ip=?,status=?,checked=? WHERE server_id=?',(current or m['current_ip'],previous,status,int(time.time()),sid))
         return {'ok':True,'ip':current,'previous_ip':previous,'status':status}
 
