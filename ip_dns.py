@@ -63,7 +63,7 @@ def endpoint(url):
     if port!=443:raise IntegrationError('API 连接仅支持 HTTPS 443 端口')
     return p
 
-def request_json(url, headers=None, payload=None):
+def request_json(url, headers=None, payload=None, method=None):
     """Resolve once, reject non-public addresses, pin TLS socket; never follow redirects."""
     p=endpoint(url)
     try:
@@ -76,7 +76,7 @@ def request_json(url, headers=None, payload=None):
         except Exception:raw.close();raise
         try:
             path=urllib.parse.urlunsplit(('', '', p.path or '/', p.query, ''))
-            conn.request('POST' if payload is not None else 'GET',path,body=payload,headers=headers or {})
+            conn.request(method or ('POST' if payload is not None else 'GET'),path,body=payload,headers=headers or {})
             response=conn.getresponse()
             if not 200<=response.status<300:raise IntegrationError('上游接口返回 HTTP '+str(response.status))
             data=response.read(262145)
@@ -180,6 +180,78 @@ def alidns(connection,action,**kwargs):
     if 'Code' in data:raise IntegrationError('阿里云 API 失败：'+str(data['Code'])[:100])
     return data
 
+def cloudflare_api(token,path,method='GET',payload=None):
+    headers={'Accept':'application/json','Authorization':'Bearer '+token}
+    body=None
+    if payload is not None:
+        headers['Content-Type']='application/json'
+        body=json.dumps(payload,ensure_ascii=False,separators=(',',':'))
+    data=request_json('https://api.cloudflare.com/client/v4'+path,headers,body,method=method)
+    if not isinstance(data,dict) or data.get('success') is not True:
+        errors=data.get('errors',[]) if isinstance(data,dict) else []
+        detail='；'.join(str(x.get('message',''))[:120] for x in errors if isinstance(x,dict))
+        raise IntegrationError('Cloudflare API 失败'+('：'+detail if detail else '，请检查 Token 权限和 Zone 配置'))
+    return data
+
+def cloudflare_find_zone(token,domain):
+    domain=str(domain or '').strip().lower().rstrip('.')
+    if not re.fullmatch(r'(?i)(?=.{3,253}$)[a-z0-9.-]+',domain):raise IntegrationError('请填写有效的 Cloudflare Zone 主域名')
+    query=urllib.parse.urlencode({'name':domain,'status':'active','per_page':50})
+    result=cloudflare_api(token,'/zones?'+query)['result']
+    matches=[z for z in result if isinstance(z,dict) and z.get('name','').lower()==domain and z.get('status')=='active'] if isinstance(result,list) else []
+    if len(matches)!=1:raise IntegrationError('Token 下未找到唯一的已激活 Cloudflare Zone；请确认 Zone 主域名及 Zone Read 权限')
+    return matches[0]
+
+def cloudflare_records(connection):
+    zone=connection['config'].get('zone_id','')
+    zone_name=connection['config'].get('zone_name','').lower()
+    if not re.fullmatch(r'[a-f0-9]{32}',zone):raise IntegrationError('Cloudflare Zone ID 配置无效，请重新验证')
+    all_records=[]
+    for page in range(1,6):
+        path='/zones/'+zone+'/dns_records?'+urllib.parse.urlencode({'type':'A','page':page,'per_page':100})
+        data=cloudflare_api(connection['secret'],path)
+        rows=data.get('result')
+        if not isinstance(rows,list):raise IntegrationError('Cloudflare DNS 记录响应格式异常')
+        all_records.extend(rows)
+        info=data.get('result_info') or {}
+        if page>=int(info.get('total_pages') or 1) or len(rows)<100:break
+    records=[]
+    suffix='.'+zone_name
+    for r in all_records:
+        if not isinstance(r,dict) or r.get('type')!='A' or not isinstance(r.get('name'),str):continue
+        full=r['name'].lower().rstrip('.')
+        if full!=zone_name and not full.endswith(suffix):continue
+        rr='@' if full==zone_name else full[:-len(suffix)]
+        try:address=public_v4(r.get('content'))
+        except IntegrationError:continue
+        records.append({'RecordId':r.get('id',''),'RR':rr,'Type':'A','Line':'default','Value':address,'TTL':r.get('ttl'),'Status':'ENABLE','Proxied':bool(r.get('proxied',False)),'Name':full})
+    return records
+
+def cloudflare_record(connection,record_id):
+    zone=connection['config'].get('zone_id','')
+    if not re.fullmatch(r'[a-f0-9]{32}',zone) or not re.fullmatch(r'[a-f0-9]{32}',str(record_id)):raise IntegrationError('Cloudflare Zone 或 DNS Record ID 格式无效')
+    data=cloudflare_api(connection['secret'],'/zones/'+zone+'/dns_records/'+str(record_id))
+    record=data.get('result')
+    if not isinstance(record,dict):raise IntegrationError('Cloudflare DNS 记录不存在')
+    return record
+
+def validate_cloudflare_record(record,binding,connection):
+    zone_name=connection['config'].get('zone_name','').lower()
+    rr=binding['rr']
+    expected_name=zone_name if rr in ('','@') else rr.lower()+'.'+zone_name
+    if str(record.get('id',''))!=str(binding['record_id']) or record.get('type')!='A' or str(record.get('name','')).lower().rstrip('.')!=expected_name:
+        raise IntegrationError('Cloudflare DNS 记录身份已变化，已停止修改')
+    if record.get('content')!=binding['expected_ip']:
+        raise IntegrationError('Cloudflare DNS 记录值已被其他操作修改，请核对并重新保存绑定')
+
+def update_cloudflare_record(connection,record,new_ip):
+    payload={key:record[key] for key in ('name','type','ttl','proxied','comment','tags','settings','private_routing') if key in record}
+    payload['content']=new_ip
+    data=cloudflare_api(connection['secret'],'/zones/'+connection['config']['zone_id']+'/dns_records/'+record['id'],'PUT',payload)
+    updated=data.get('result')
+    if not isinstance(updated,dict):raise IntegrationError('Cloudflare 更新 DNS 后未返回记录')
+    return updated
+
 def init_schema(connect):
     with connect() as db:
         db.executescript(SCHEMA)
@@ -200,6 +272,18 @@ def validate_record(record,binding):
         if str(record.get(key,''))!=str(value):raise IntegrationError('解析记录身份或线路已变化，已停止修改')
     if record.get('Status')!='ENABLE':raise IntegrationError('解析记录未启用，已停止修改')
     if record.get('Value')!=binding['expected_ip']:raise IntegrationError('记录值已被其他操作修改，请核对并重新保存绑定')
+
+def get_dns_record(connection,binding):
+    if connection['kind']=='cloudflare':return cloudflare_record(connection,binding['record_id'])
+    return alidns(connection,'DescribeDomainRecordInfo',RecordId=binding['record_id'])
+
+def validate_dns_record(record,binding,connection):
+    if connection['kind']=='cloudflare':return validate_cloudflare_record(record,binding,connection)
+    return validate_record(record,binding)
+
+def update_dns_record(connection,binding,record,new_ip):
+    if connection['kind']=='cloudflare':return update_cloudflare_record(connection,record,new_ip)
+    return alidns(connection,'UpdateDomainRecord',RecordId=binding['record_id'],RR=binding['rr'],Type='A',Value=new_ip,Line=binding['line'],TTL=record['TTL'])
 
 def candidate_ip(db,binding,cipher):
     if binding['source_id']:
@@ -265,8 +349,8 @@ def run_binding(connect,cipher,bid,apply=False):
                 row=db.execute('SELECT * FROM dns_bindings WHERE id=?',(bid,)).fetchone()
                 if not row:raise IntegrationError('绑定不存在')
                 b=dict(row);connection=load_connection(db,cipher,b['connection_id'])
-                record=alidns(connection,'DescribeDomainRecordInfo',RecordId=b['record_id'])
-                validate_record(record,b)
+                record=get_dns_record(connection,b)
+                validate_dns_record(record,b,connection)
                 new_ip=candidate_ip(db,b,cipher);now=int(time.time())
                 changed=new_ip!=b['expected_ip']
                 if not changed:status='IP 未变化，解析一致'
@@ -283,11 +367,10 @@ def run_binding(connect,cipher,bid,apply=False):
                             with socket.create_connection((new_ip,b['port']),timeout=4):pass
                         except OSError:raise IntegrationError('新 IP 业务 TCP 端口不可达，暂停同步')
                         # Re-read immediately before writing, preserving TTL/line/weight behavior.
-                        record=alidns(connection,'DescribeDomainRecordInfo',RecordId=b['record_id']);validate_record(record,b)
-                        args={'RecordId':b['record_id'],'RR':b['rr'],'Type':'A','Value':new_ip,'Line':b['line'],'TTL':record['TTL']}
-                        alidns(connection,'UpdateDomainRecord',**args)
-                        verify=alidns(connection,'DescribeDomainRecordInfo',RecordId=b['record_id'])
-                        check=dict(b,expected_ip=new_ip);validate_record(verify,check)
+                        record=get_dns_record(connection,b);validate_dns_record(record,b,connection)
+                        update_dns_record(connection,b,record,new_ip)
+                        verify=get_dns_record(connection,b)
+                        check=dict(b,expected_ip=new_ip);validate_dns_record(verify,check,connection)
                         db.execute('UPDATE dns_bindings SET expected_ip=?,candidate=NULL,candidate_since=NULL WHERE id=?',(new_ip,bid))
                         status=b['expected_ip']+' → '+new_ip+'；解析已更新并回读验证（客户端缓存仍需等待 TTL）'
                     else:status=probe_reason or (b['expected_ip']+' → '+new_ip+'；旧解析核对通过，需新 IP 稳定至少 '+str(stable_seconds)+' 秒再同步')
@@ -349,8 +432,8 @@ def register(app,connect,cipher,auth,body,error,audit):
         with connect() as db:
             server=db.execute('SELECT id FROM servers WHERE id=? AND owner_id=?',(sid,g.user['id'])).fetchone()
             if not server:return error('服务器不存在',404)
-            rows=db.execute('SELECT b.id,b.connection_id,b.domain,b.rr,b.line,b.expected_ip,b.candidate,b.port,b.automatic,b.verify_new_ip,b.status,b.updated,c.name AS connection_name,CASE WHEN c.owner_id=? AND c.server_id=b.server_id THEN 1 ELSE 0 END AS customer_owned FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id WHERE b.server_id=? ORDER BY b.id',(g.user['id'],sid)).fetchall()
-            connections=[dict(r) for r in db.execute("SELECT id,name,kind,json_extract(config,'$.provider') AS provider,json_extract(config,'$.access_key_id') AS access_key_id FROM ip_connections WHERE owner_id=? AND server_id=? AND kind IN ('alidns','change_ip') ORDER BY id",(g.user['id'],sid))]
+            rows=db.execute('SELECT b.id,b.connection_id,b.domain,b.rr,b.line,b.expected_ip,b.candidate,b.port,b.automatic,b.verify_new_ip,b.status,b.updated,c.name AS connection_name,c.kind AS dns_provider,CASE WHEN c.owner_id=? AND c.server_id=b.server_id THEN 1 ELSE 0 END AS customer_owned FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id WHERE b.server_id=? ORDER BY b.id',(g.user['id'],sid)).fetchall()
+            connections=[dict(r) for r in db.execute("SELECT id,name,kind,json_extract(config,'$.provider') AS provider,json_extract(config,'$.access_key_id') AS access_key_id,json_extract(config,'$.zone_name') AS zone_name FROM ip_connections WHERE owner_id=? AND server_id=? AND kind IN ('alidns','cloudflare','change_ip') ORDER BY id",(g.user['id'],sid))]
         return jsonify(bindings=[dict(r) for r in rows],connections=connections)
 
     def client_server(db,sid):
@@ -358,7 +441,7 @@ def register(app,connect,cipher,auth,body,error,audit):
         return db.execute('SELECT id,name FROM servers WHERE id=? AND owner_id=?',(sid,g.user['id'])).fetchone()
 
     def client_dns_connection(db,sid,cid):
-        return db.execute("SELECT * FROM ip_connections WHERE id=? AND kind='alidns' AND owner_id=? AND server_id=?",(cid,g.user['id'],sid)).fetchone()
+        return db.execute("SELECT * FROM ip_connections WHERE id=? AND kind IN ('alidns','cloudflare') AND owner_id=? AND server_id=?",(cid,g.user['id'],sid)).fetchone()
 
     @app.patch('/api/client/servers/<int:sid>/monitor')
     @auth()
@@ -378,6 +461,9 @@ def register(app,connect,cipher,auth,body,error,audit):
     def dns_records(connection,domain):
         import re
         if not isinstance(domain,str) or not re.fullmatch(r'(?i)[a-z0-9.-]{3,253}',domain.strip()):raise IntegrationError('请填写有效的主域名')
+        if connection['kind']=='cloudflare':
+            if domain.strip().lower().rstrip('.')!=connection['config'].get('zone_name','').lower():raise IntegrationError('主域名必须与此 Cloudflare 连接验证的 Zone 一致')
+            return cloudflare_records(connection)
         data=alidns(connection,'DescribeDomainRecords',DomainName=domain.strip().lower(),PageSize=100)
         records=data.get('DomainRecords',{}).get('Record',[])
         if not isinstance(records,list):raise IntegrationError('阿里云解析记录格式异常')
@@ -386,28 +472,35 @@ def register(app,connect,cipher,auth,body,error,audit):
     @app.post('/api/client/servers/<int:sid>/dns-connections')
     @auth()
     def client_save_dns_connection(sid):
-        d=body();name=d.get('name','阿里云 DNS');config=d.get('config') or {};secret=d.get('secret','');domain=d.get('domain','')
-        if not isinstance(config,dict):return error('阿里云 API 配置格式无效')
+        d=body();kind=d.get('provider','alidns');name=d.get('name','阿里云 DNS' if kind=='alidns' else 'Cloudflare DNS');config=d.get('config') or {};secret=d.get('secret','');domain=d.get('domain','')
+        if kind not in ('alidns','cloudflare'):return error('DNS 服务商无效')
+        if not isinstance(config,dict):return error('DNS API 配置格式无效')
         key=config.get('access_key_id','')
-        if not isinstance(name,str) or not 1<=len(name.strip())<=80 or not isinstance(key,str) or not key.strip() or len(key)>128 or not isinstance(secret,str) or len(secret)>4096:return error('请填写连接名称和有效 AccessKey ID / Secret')
+        if not isinstance(name,str) or not 1<=len(name.strip())<=80 or not isinstance(secret,str) or len(secret)>4096:return error('请填写连接名称和有效 DNS 密钥')
         try:
             with connect() as db:
                 if not client_server(db,sid):return error('服务器不存在',404)
                 if not db.execute('SELECT 1 FROM ip_monitors WHERE server_id=?',(sid,)).fetchone():return error('服务器监控尚未初始化，请先在探测设置里保存检测端口',409)
-                existing=db.execute("SELECT id FROM ip_connections WHERE kind='alidns' AND owner_id=? AND server_id=?",(g.user['id'],sid)).fetchone()
+                existing=db.execute('SELECT id FROM ip_connections WHERE kind=? AND owner_id=? AND server_id=?',(kind,g.user['id'],sid)).fetchone()
                 if not secret and existing:
                     previous=load_connection(db,cipher,existing['id']);secret=previous['secret']
-                if not secret or len(secret)<8:return error('请填写 AccessKey Secret')
-                candidate={'id':existing['id'] if existing else 0,'name':name.strip(),'kind':'alidns','config':{'access_key_id':key.strip()},'secret':secret}
+                if not secret or len(secret)<8:return error('请填写 AccessKey Secret' if kind=='alidns' else '请填写 Cloudflare API Token')
+                if kind=='alidns':
+                    if not isinstance(key,str) or not key.strip() or len(key)>128:return error('请填写有效 AccessKey ID')
+                    connection_config={'access_key_id':key.strip()}
+                else:
+                    zone=cloudflare_find_zone(secret,domain)
+                    connection_config={'zone_id':zone['id'],'zone_name':zone['name'].lower()}
+                candidate={'id':existing['id'] if existing else 0,'name':name.strip(),'kind':kind,'config':connection_config,'secret':secret}
                 records=dns_records(candidate,domain)
                 encrypted=cipher.encrypt(secret.encode()).decode()
                 if existing:
                     cid=existing['id'];db.execute('UPDATE ip_connections SET name=?,config=?,secret=? WHERE id=?',(name.strip(),json.dumps(candidate['config']),encrypted,cid))
                 else:
-                    cid=db.execute("INSERT INTO ip_connections(name,kind,config,secret,owner_id,server_id) VALUES(?,'alidns',?,?,?,?)",(name.strip(),json.dumps(candidate['config']),encrypted,g.user['id'],sid)).lastrowid
-                audit(db,'客户保存 VPS 专属阿里云 DNS 连接 #'+str(sid))
-            return jsonify(ok=True,connection={'id':cid,'name':name.strip(),'kind':'alidns'},records=records),201
-        except IntegrationError as e:return error('阿里云验证失败：'+str(e))
+                    cid=db.execute('INSERT INTO ip_connections(name,kind,config,secret,owner_id,server_id) VALUES(?,?,?,?,?,?)',(name.strip(),kind,json.dumps(candidate['config']),encrypted,g.user['id'],sid)).lastrowid
+                audit(db,'客户保存 VPS 专属 '+('阿里云' if kind=='alidns' else 'Cloudflare')+' DNS 连接 #'+str(sid))
+            return jsonify(ok=True,connection={'id':cid,'name':name.strip(),'kind':kind,'zone_name':connection_config.get('zone_name')},records=records),201
+        except IntegrationError as e:return error(('阿里云' if kind=='alidns' else 'Cloudflare')+' 验证失败：'+str(e))
 
     @app.post('/api/client/servers/<int:sid>/change-ip-api')
     @auth()
@@ -434,7 +527,7 @@ def register(app,connect,cipher,auth,body,error,audit):
     def client_delete_dns_connection(sid,cid):
         with connect() as db:
             if not client_server(db,sid):return error('服务器不存在',404)
-            row=db.execute('SELECT id FROM ip_connections WHERE id=? AND kind IN (\'alidns\',\'change_ip\') AND owner_id=? AND server_id=?',(cid,g.user['id'],sid)).fetchone()
+            row=db.execute('SELECT id FROM ip_connections WHERE id=? AND kind IN (\'alidns\',\'cloudflare\',\'change_ip\') AND owner_id=? AND server_id=?',(cid,g.user['id'],sid)).fetchone()
             if not row:return error('连接不存在',404)
             if db.execute('SELECT 1 FROM dns_bindings WHERE connection_id=? LIMIT 1',(cid,)).fetchone():return error('仍有 DNS 记录使用此连接，请先删除 DNS 绑定',409)
             db.execute('UPDATE detection_plans SET action_enabled=0,response_mode=\'none\',action_connection_id=NULL WHERE server_id=? AND action_connection_id=?',(sid,cid))
@@ -448,9 +541,9 @@ def register(app,connect,cipher,auth,body,error,audit):
             with connect() as db:
                 if not client_server(db,sid):return error('服务器不存在',404)
                 row=client_dns_connection(db,sid,cid)
-                if not row:return error('阿里云连接不存在',404)
+                if not row:return error('DNS 连接不存在',404)
                 connection=dict(row);connection['config']=json.loads(row['config']);connection['secret']=cipher.decrypt(row['secret'].encode()).decode()
-            return jsonify(records=dns_records(connection,body().get('domain','')))
+                return jsonify(records=dns_records(connection,body().get('domain','')))
         except IntegrationError as e:return error(str(e))
 
     @app.post('/api/client/servers/<int:sid>/dns-bindings')
@@ -462,21 +555,21 @@ def register(app,connect,cipher,auth,body,error,audit):
             domain=d.get('domain','');rr=d.get('rr','');line=d.get('line','')
             if not all(isinstance(x,str) for x in (domain,rr,line)):raise IntegrationError('主域名、主机记录和线路格式无效')
             domain=domain.strip().lower();rr=rr.strip();line=line.strip();rid=str(d.get('record_id','')).strip();cid=d.get('connection_id')
-            if not re.fullmatch(r'(?i)[a-z0-9.-]{3,253}',domain) or not rr or len(rr)>253 or not line or len(line)>100 or not rid or len(rid)>100 or type(cid)is not int:raise IntegrationError('请完整选择主域名、记录、线路和阿里云连接')
+            if not re.fullmatch(r'(?i)[a-z0-9.-]{3,253}',domain) or not rr or len(rr)>253 or not line or len(line)>100 or not rid or len(rid)>100 or type(cid)is not int:raise IntegrationError('请完整选择主域名、记录、线路和 DNS 连接')
             with connect() as db:
                 server=client_server(db,sid)
                 if not server:return error('服务器不存在',404)
                 monitor=db.execute('SELECT port,enabled FROM ip_monitors WHERE server_id=?',(sid,)).fetchone()
                 if not monitor:return error('请先保存 VPS 检测端口',409)
                 c=client_dns_connection(db,sid,cid)
-                if not c:raise IntegrationError('阿里云连接不属于当前客户或 VPS')
+                if not c:raise IntegrationError('DNS 连接不属于当前客户或 VPS')
                 connection=dict(c);connection['config']=json.loads(c['config']);connection['secret']=cipher.decrypt(c['secret'].encode()).decode()
-                found=next((r for r in dns_records(connection,domain) if r['RecordId']==rid),None)
-                if not found:raise IntegrationError('阿里云主域名下未找到所选 RecordId')
+                found=next((r for r in dns_records(connection,domain) if str(r['RecordId'])==rid),None)
+                if not found:raise IntegrationError('DNS 主域名下未找到所选记录')
                 if found['Type']!='A' or found['Status']!='ENABLE' or (found['RR'],found['Line'])!=(rr,line):raise IntegrationError('解析记录类型、线路或状态已改变，请重新读取')
                 ip=public_v4(found['Value'])
                 duplicate=db.execute('SELECT id FROM dns_bindings WHERE server_id=? AND record_id=?'+(' AND id<>?' if d.get('id') else ''),(sid,rid,d['id']) if d.get('id') else (sid,rid)).fetchone()
-                if duplicate:raise IntegrationError('此阿里云 RecordId 已绑定到这台 VPS，不能重复绑定')
+                if duplicate:raise IntegrationError('此 DNS 记录已绑定到这台 VPS，不能重复绑定')
                 current=db.execute('SELECT metrics,seen FROM servers WHERE id=?',(sid,)).fetchone()
                 if not current or not current['seen'] or time.time()-current['seen']>90:raise IntegrationError('VPS 上报已过期，暂时无法核对解析 IP')
                 metrics=json.loads(current['metrics'] or '{}');addresses=set(metrics.get('public_ips') or [])
@@ -493,7 +586,7 @@ def register(app,connect,cipher,auth,body,error,audit):
                     bid=db.execute('INSERT INTO dns_bindings(server_id,connection_id,domain,record_id,rr,line,expected_ip,port,automatic,verify_new_ip) VALUES(?,?,?,?,?,?,?,?,0,1)',vals).lastrowid
                 audit(db,'客户保存 VPS 专属 DNS 绑定 #'+str(bid))
             return jsonify(ok=True,id=bid)
-        except sqlite3.IntegrityError:return error('该阿里云线路记录已绑定，请检查是否重复')
+        except sqlite3.IntegrityError:return error('该 DNS 记录已绑定，请检查是否重复')
         except IntegrationError as e:return error(str(e))
 
     @app.delete('/api/client/dns-bindings/<int:bid>')
@@ -576,11 +669,19 @@ def register(app,connect,cipher,auth,body,error,audit):
         d=body()
         try:
             kind=d.get('kind');name=d.get('name','').strip();config=d.get('config',{});secret=d.get('secret','')
-            if kind not in ('alidns','provider','change_ip') or not 1<=len(name)<=80 or not isinstance(config,dict) or not isinstance(secret,str) or len(secret)>4096:raise IntegrationError('API 配置格式无效')
+            if kind not in ('alidns','cloudflare','provider','change_ip') or not 1<=len(name)<=80 or not isinstance(config,dict) or not isinstance(secret,str) or len(secret)>4096:raise IntegrationError('API 配置格式无效')
             if kind=='alidns':
                 key=config.get('access_key_id','').strip()
                 if not key or len(key)>128:raise IntegrationError('请填写 AccessKey ID')
                 config={'access_key_id':key}
+            elif kind=='cloudflare':
+                zone_name=config.get('zone_name','').strip().lower().rstrip('.')
+                if not secret and d.get('id'):
+                    with connect() as db:secret=load_connection(db,cipher,d['id'])['secret']
+                if not secret:raise IntegrationError('请填写 Cloudflare API Token')
+                zone=cloudflare_find_zone(secret,zone_name)
+                config={'zone_id':zone['id'],'zone_name':zone['name'].lower()}
+                cloudflare_records({'config':config,'secret':secret})
             elif kind=='provider':
                 url=config.get('url','');endpoint(url)
                 header=config.get('header','Authorization');prefix=config.get('prefix','Bearer ');path=config.get('ip_path','data.ip')
@@ -618,7 +719,7 @@ def register(app,connect,cipher,auth,body,error,audit):
                     if old['kind']!=kind:raise IntegrationError('不能更改已有连接类型')
                     if not secret and old['config']!=config:raise IntegrationError('修改接口地址或账号时，请重新填写密钥')
                     secret=secret or old['secret']
-                if kind=='alidns' and not secret:raise IntegrationError('请填写 AccessKey Secret')
+                if kind in ('alidns','cloudflare') and not secret:raise IntegrationError('请填写 '+('AccessKey Secret' if kind=='alidns' else 'Cloudflare API Token'))
                 encrypted=cipher.encrypt(secret.encode()).decode()
                 if cid:db.execute('UPDATE ip_connections SET name=?,config=?,secret=? WHERE id=? AND owner_id IS NULL',(name,json.dumps(config),encrypted,cid))
                 else:cid=db.execute('INSERT INTO ip_connections(name,kind,config,secret) VALUES(?,?,?,?)',(name,kind,json.dumps(config),encrypted)).lastrowid
@@ -640,6 +741,10 @@ def register(app,connect,cipher,auth,body,error,audit):
                 records=data.get('DomainRecords',{}).get('Record',[])
                 # Return enough identity information for explicit bindings; never return credentials.
                 return jsonify(ok=True,records=[{k:r.get(k) for k in ('RecordId','RR','Type','Line','Value','TTL','Status')} for r in records],total=data.get('TotalCount'),page_size=100)
+            if c['kind']=='cloudflare':
+                domain=(body().get('domain') or c['config'].get('zone_name','')).strip().lower()
+                records=dns_records(c,domain)
+                return jsonify(ok=True,records=records,total=len(records),page_size=500)
             if c['kind']=='provider':return jsonify(ok=True,ip=provider_ip(c))
             if c['config'].get('provider')=='moonvm':return jsonify(ok=True,test_supported=False,message='MoonVM API 已保存；为避免真的更换 IP，面板不会发送测试请求。')
             return jsonify(ok=True,test_supported=False,message='为避免误触发换 IP，不会发送测试请求；已验证 HTTPS 地址和请求 JSON 格式。')
@@ -660,14 +765,19 @@ def register(app,connect,cipher,auth,body,error,audit):
                 if not db.execute('SELECT 1 FROM servers WHERE id=?',(d.get('server_id'),)).fetchone():raise IntegrationError('请选择服务器')
                 if not db.execute('SELECT 1 FROM ip_monitors WHERE server_id=?',(d.get('server_id'),)).fetchone():raise IntegrationError('请先将此 VPS 加入监控')
                 c=load_connection(db,cipher,d.get('connection_id'))
-                if c['kind']!='alidns' or c.get('owner_id') is not None:raise IntegrationError('请选择管理员的阿里云连接')
+                if c['kind'] not in ('alidns','cloudflare') or c.get('owner_id') is not None:raise IntegrationError('请选择管理员的 DNS 连接')
                 source=d.get('source_id') or None
                 if source and load_connection(db,cipher,source)['kind']!='provider':raise IntegrationError('IP 来源类型错误')
                 # Domain-scoped lookup proves the RecordId belongs to the requested domain.
-                data=alidns(c,'DescribeDomainRecords',DomainName=domain,RRKeyWord=rr,PageSize=100)
-                found=next((r for r in data.get('DomainRecords',{}).get('Record',[]) if str(r.get('RecordId'))==rid),None)
-                if not found:raise IntegrationError('主域名下未找到该 RecordId（接口最多检查前 100 条匹配记录）')
-                validate_record(found,{'record_id':rid,'rr':rr,'line':line,'expected_ip':ip})
+                if c['kind']=='cloudflare':
+                    found=next((r for r in cloudflare_records(c) if str(r.get('RecordId'))==rid),None)
+                    if not found:raise IntegrationError('Cloudflare Zone 下未找到该 DNS Record ID')
+                    if found['RR']!=rr or found['Line']!=line or found['Type']!='A' or found['Status']!='ENABLE' or found['Value']!=ip:raise IntegrationError('Cloudflare 记录身份或当前 IP 与表单不一致')
+                else:
+                    data=alidns(c,'DescribeDomainRecords',DomainName=domain,RRKeyWord=rr,PageSize=100)
+                    found=next((r for r in data.get('DomainRecords',{}).get('Record',[]) if str(r.get('RecordId'))==rid),None)
+                    if not found:raise IntegrationError('主域名下未找到该 RecordId（接口最多检查前 100 条匹配记录）')
+                    validate_record(found,{'record_id':rid,'rr':rr,'line':line,'expected_ip':ip})
                 values=(d['server_id'],c['id'],source,domain,rid,rr,line,ip,port,int(d.get('automatic',False)),int(verify_new_ip))
                 if d.get('id'):
                     if not db.execute('UPDATE dns_bindings SET server_id=?,connection_id=?,source_id=?,domain=?,record_id=?,rr=?,line=?,expected_ip=?,port=?,automatic=?,verify_new_ip=?,candidate=NULL,candidate_since=NULL,status=\'等待检查\' WHERE id=?',values+(d['id'],)).rowcount:raise IntegrationError('绑定不存在')
