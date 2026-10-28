@@ -323,6 +323,47 @@ class PanelTest(unittest.TestCase):
             self.assertEqual(tuple(row),(1,1))
         self.assertEqual(self.bob.patch(toggle,json={'automatic':False},headers={'X-CSRF-Token':self.tokens['bob']}).status_code,404)
 
+    def test_client_can_configure_private_alidns_moonvm_and_automatic_action(self):
+        from unittest.mock import patch
+        node=self.post('/api/servers',{'name':'client-full-auto'}).json;sid=node['id']
+        uid=self.alice.get('/api/me').json['id'];ah={'X-CSRF-Token':self.tokens['alice']}
+        self.admin.patch(f'/api/servers/{sid}',json={'owner_id':uid},headers={'X-CSRF-Token':self.tokens['admin']})
+        self.admin.post('/api/agent/report',json={'public_ips':['8.8.8.8'],'uptime':100},headers={'Authorization':'Bearer '+node['token']})
+        monitor=self.alice.patch(f'/api/client/servers/{sid}/monitor',json={'port':23456,'enabled':True},headers=ah)
+        self.assertEqual(monitor.status_code,200,monitor.json)
+        with patch('detectors.boce',return_value={'data':{'list':[{'id':13,'node_name':'上海电信','isp_name':'电信'}]}}):
+            saved=self.alice.post(f'/api/client/servers/{sid}/probe-source',json={'secret':'client-boce-private-key'},headers=ah)
+            self.assertEqual(saved.status_code,200,saved.json)
+            configured=self.alice.put(f'/api/client/servers/{sid}/probe-config',json={'source_id':saved.json['source_id'],'nodes':['13'],'interval_s':120,'daily_limit':100,'automatic':True},headers=ah)
+            self.assertEqual(configured.status_code,200,configured.json)
+        record={'RecordId':'record-client-1','RR':'edge','Line':'cmcc','Type':'A','Value':'8.8.8.8','TTL':600,'Status':'ENABLE'}
+        with patch('ip_dns.alidns',return_value={'DomainRecords':{'Record':[record]},'TotalCount':1}):
+            ali=self.alice.post(f'/api/client/servers/{sid}/dns-connections',json={'name':'Alice AliDNS','config':{'access_key_id':'client-access-key-id'},'secret':'client-access-key-secret','domain':'example.com'},headers=ah)
+            self.assertEqual(ali.status_code,201,ali.json)
+            self.assertNotIn('client-access-key-secret',ali.text)
+            binding=self.alice.post(f'/api/client/servers/{sid}/dns-bindings',json={'connection_id':ali.json['connection']['id'],'domain':'example.com','record_id':'record-client-1','rr':'edge','line':'cmcc'},headers=ah)
+            self.assertEqual(binding.status_code,200,binding.json)
+        enabled=self.alice.patch(f"/api/client/dns-bindings/{binding.json['id']}",json={'automatic':True},headers=ah)
+        self.assertEqual(enabled.status_code,200,enabled.json)
+        moon='https://store.moonvm.com/ddns.php?product=13688&flag=changeip&iptoken=client-token-12345678'
+        action=self.alice.post(f'/api/client/servers/{sid}/change-ip-api',json={'url':moon},headers=ah)
+        self.assertEqual(action.status_code,201,action.json)
+        self.assertNotIn('client-token-12345678',action.text)
+        result=self.alice.put(f'/api/client/servers/{sid}/action-config',json={'response_mode':'change_api','action_connection_id':action.json['connection']['id'],'action_enabled':True,'failure_threshold':3},headers=ah)
+        self.assertEqual(result.status_code,200,result.json)
+        with server.connect() as db:
+            plan=db.execute('SELECT p.response_mode,p.action_enabled,p.action_connection_id,c.owner_id,c.server_id FROM detection_plans p JOIN ip_connections c ON c.id=p.action_connection_id WHERE p.server_id=?',(sid,)).fetchone()
+            self.assertEqual((plan['response_mode'],plan['action_enabled'],plan['owner_id'],plan['server_id']),('change_api',1,uid,sid))
+            self.assertNotEqual(db.execute('SELECT secret FROM ip_connections WHERE id=?',(ali.json['connection']['id'],)).fetchone()['secret'],'client-access-key-secret')
+        self.assertEqual(self.bob.get(f'/api/client/servers/{sid}/dns-bindings').status_code,404)
+        self.assertNotIn('client-access-key-id',self.admin.get('/api/ip-dns').text)
+        self.assertEqual(self.admin.patch(f'/api/servers/{sid}',json={'owner_id':self.bob.get('/api/me').json['id']},headers={'X-CSRF-Token':self.tokens['admin']}).status_code,200)
+        with server.connect() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM ip_connections WHERE owner_id=? AND server_id=?',(uid,sid)).fetchone()[0],0)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM dns_bindings WHERE server_id=?',(sid,)).fetchone()[0],0)
+            plan=db.execute('SELECT owner_id,response_mode,action_enabled,action_connection_id FROM detection_plans WHERE server_id=?',(sid,)).fetchone()
+            self.assertEqual(tuple(plan),(None,'none',0,None))
+
     def test_client_can_set_private_boce_key_and_probe_nodes_for_owned_server(self):
         from unittest.mock import patch
         node=self.post('/api/servers',{'name':'client-probe'}).json;sid=node['id']
@@ -363,7 +404,7 @@ class PanelTest(unittest.TestCase):
         self.assertEqual(self.bob.post(f'/api/client/servers/{sid}/probe-sources/{source_id}/nodes',json={},headers={'X-CSRF-Token':self.tokens['bob']}).status_code,404)
         with patch('detectors.boce',return_value={'data':{'list':nodes}}):
             self.assertEqual(self.alice.put(own,json={'source_id':shared,'nodes':['999'],'interval_s':240,'daily_limit':500,'automatic':False},headers=headers).status_code,404)
-            with server.connect() as db:db.execute("UPDATE detection_plans SET automatic=0,action_enabled=1,response_mode='reboot' WHERE server_id=?",(sid,))
+            with server.connect() as db:db.execute("UPDATE detection_plans SET automatic=0,action_enabled=1,response_mode='reboot',owner_id=NULL WHERE server_id=?",(sid,))
             safe=self.alice.get(own).json['plan']
             self.assertTrue(safe['actions_locked']);self.assertNotIn('response_mode',safe);self.assertNotIn('action_enabled',safe)
             blocked=self.alice.put(own,json={'source_id':source_id,'nodes':['13','27'],'interval_s':240,'daily_limit':500,'automatic':True},headers=headers)
