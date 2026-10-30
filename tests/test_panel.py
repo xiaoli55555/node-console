@@ -476,6 +476,8 @@ class PanelTest(unittest.TestCase):
         record={'RecordId':'record-1','RR':'edge','Line':'default','Type':'A','Value':ips[0],'TTL':60,'Status':'ENABLE'}
         def report(i,tcp=25):
             sid,token=nodes[i]
+            # The other healthy agent continues its regular five-second heartbeat.
+            with server.connect() as db:db.execute('UPDATE servers SET seen=? WHERE id=?',(clock[0],nodes[1-i][0]))
             return self.admin.post('/api/agent/report',json={'public_ips':[],'egress_ips':[ips[i]],'egress_checked':clock[0],'connections_sampled':clock[0],'tcp':tcp,'udp':0,'uptime':clock[0],'rx_bytes':0,'tx_bytes':0},headers={'Authorization':'Bearer '+token})
         with patch('time.time',side_effect=lambda:clock[0]),patch('rotation.get_dns_record',side_effect=lambda *_:dict(record)),patch('rotation.update_dns_record',side_effect=lambda _c,_b,_r,new:(record.update(Value=new) or dict(record))),patch('rotation.socket.create_connection',return_value=MagicMock()),patch('rotation.invoke_change_ip_api',return_value='换 IP 已受理') as change:
             self.assertEqual(report(0).status_code,200);self.assertEqual(report(1).status_code,200)
@@ -483,9 +485,15 @@ class PanelTest(unittest.TestCase):
                 for i,(sid,_) in enumerate(nodes):
                     source=db.execute('SELECT source_id FROM detection_plans WHERE server_id=?',(sid,)).fetchone()[0]
                     db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details) VALUES(?,?,?,?,'[\"13\"]','所选检测点 TCP 可达',?,?,?)",(sid,source,ips[i],port,clock[0]-10,clock[0],json.dumps([{'node_id':'13','state':'reachable'}])))
+            with server.connect() as db:db.execute("UPDATE detection_plans SET response_mode='none',action_connection_id=NULL WHERE server_id=?",(nodes[1][0],))
+            with server.connect() as db:db.execute('UPDATE dns_bindings SET automatic=1 WHERE id=?',(binding_id,))
+            preflight=self.alice.post(f'/api/client/servers/{nodes[0][0]}/rotation/readiness',json={'other_server_id':nodes[1][0],'binding_id':binding_id},headers=headers)
+            self.assertEqual(preflight.status_code,200,preflight.json);self.assertTrue(preflight.json['ok'],preflight.json)
+            self.assertEqual(change.call_count,0);self.assertEqual(record['Value'],ips[0])
             config=self.alice.put(f'/api/client/servers/{nodes[0][0]}/rotation',json={'other_server_id':nodes[1][0],'binding_id':binding_id,'interval_s':7200,'connection_threshold':80,'enabled':True},headers=headers)
             self.assertEqual(config.status_code,200,config.json)
             self.assertEqual(config.json['rotation']['active_server_id'],nodes[0][0])
+            self.assertEqual(config.json['rotation']['next_switch_at'],clock[0]+7200-120)
             self.assertEqual(self.bob.get(f'/api/client/servers/{nodes[0][0]}/rotation').status_code,404)
             self.assertEqual(self.alice.patch(f'/api/client/dns-bindings/{binding_id}',json={'automatic':True},headers=headers).status_code,409)
             with server.connect() as db:db.execute('UPDATE vps_rotations SET next_switch_at=? WHERE binding_id=?',(clock[0]-1,binding_id))
@@ -529,6 +537,18 @@ class PanelTest(unittest.TestCase):
                 self.assertEqual(row['phase'],'waiting_ip')
                 self.assertEqual(row['emergency'],1)
             self.assertEqual(change.call_count,2)
+            # Offline is not censorship: fail over using the bound DNS old value, but do not call change-IP.
+            self.assertEqual(report(1,tcp=20).status_code,200)
+            with server.connect() as db:
+                source=db.execute('SELECT source_id FROM detection_plans WHERE server_id=?',(nodes[1][0],)).fetchone()[0]
+                db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details) VALUES(?,?,?,?,'[\"13\"]','TCP 可达',?,?,?)",(nodes[1][0],source,ips[1],port,clock[0],clock[0],json.dumps([{'node_id':'13','state':'reachable'}])))
+                db.execute("UPDATE vps_rotations SET phase='active',emergency=0,drain_server_id=NULL")
+                db.execute('UPDATE servers SET seen=? WHERE id=?',(clock[0]-91,nodes[0][0]))
+            rotation.tick(server.connect,server.CIPHER)
+            with server.connect() as db:
+                row=db.execute('SELECT * FROM vps_rotations').fetchone()
+                self.assertEqual(row['active_server_id'],nodes[1][0]);self.assertEqual(row['emergency'],0)
+            self.assertEqual(record['Value'],ips[1]);self.assertEqual(change.call_count,2)
             reassigned=self.admin.patch(f'/api/servers/{nodes[1][0]}',json={'owner_id':self.bob.get('/api/me').json['id']},headers={'X-CSRF-Token':self.tokens['admin']})
             self.assertEqual(reassigned.status_code,200,reassigned.json)
             with server.connect() as db:self.assertEqual(db.execute('SELECT COUNT(*) FROM vps_rotations').fetchone()[0],0)
