@@ -476,6 +476,8 @@ class PanelTest(unittest.TestCase):
         record={'RecordId':'record-1','RR':'edge','Line':'default','Type':'A','Value':ips[0],'TTL':60,'Status':'ENABLE'}
         def report(i,tcp=25):
             sid,token=nodes[i]
+            # The other healthy agent continues its regular five-second heartbeat.
+            with server.connect() as db:db.execute('UPDATE servers SET seen=? WHERE id=?',(clock[0],nodes[1-i][0]))
             return self.admin.post('/api/agent/report',json={'public_ips':[],'egress_ips':[ips[i]],'egress_checked':clock[0],'connections_sampled':clock[0],'tcp':tcp,'udp':0,'uptime':clock[0],'rx_bytes':0,'tx_bytes':0},headers={'Authorization':'Bearer '+token})
         with patch('time.time',side_effect=lambda:clock[0]),patch('rotation.get_dns_record',side_effect=lambda *_:dict(record)),patch('rotation.update_dns_record',side_effect=lambda _c,_b,_r,new:(record.update(Value=new) or dict(record))),patch('rotation.socket.create_connection',return_value=MagicMock()),patch('rotation.invoke_change_ip_api',return_value='换 IP 已受理') as change:
             self.assertEqual(report(0).status_code,200);self.assertEqual(report(1).status_code,200)
