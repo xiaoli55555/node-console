@@ -8,7 +8,7 @@ class ReportsTest(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.path=Path(self.tmp.name)/'db'
         with self.connect() as db:
-            db.executescript('CREATE TABLE vps_rotations(id INTEGER,enabled INTEGER,phase TEXT,status TEXT,active_server_id INTEGER,next_switch_at INTEGER,updated INTEGER);INSERT INTO vps_rotations VALUES(1,1,"active","ready",3,2000,900);CREATE TABLE rotation_report_samples(id INTEGER PRIMARY KEY,rotation_id INTEGER,created INTEGER,payload TEXT);CREATE TABLE vps_rotation_events(rotation_id INTEGER,server_id INTEGER,message TEXT,created INTEGER);')
+            db.executescript('CREATE TABLE vps_rotations(id INTEGER,enabled INTEGER,phase TEXT,status TEXT,active_server_id INTEGER,next_switch_at INTEGER,updated INTEGER);INSERT INTO vps_rotations VALUES(1,1,"active","ready",3,2000,900);CREATE TABLE rotation_report_samples(id INTEGER PRIMARY KEY,rotation_id INTEGER,created INTEGER,payload TEXT);CREATE TABLE vps_rotation_events(id INTEGER PRIMARY KEY,rotation_id INTEGER,server_id INTEGER,message TEXT,created INTEGER);')
     def connect(self):
         db=sqlite3.connect(self.path);db.row_factory=sqlite3.Row;return db
     def tearDown(self):self.tmp.cleanup()
