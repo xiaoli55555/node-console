@@ -52,3 +52,12 @@ test('domain-list permission failure permits manually entering an authorized dom
  ctx.bindAdminRotationDNSPicker({bindings:[]},fields,()=>{});await fields.dns_connection_id.onchange();assert.match(elements.rotationDnsPickerStatus.textContent,/手动输入/);
  fields.rotation_domain.value='example.com';fields.rotation_domain.oninput();await elements.loadRotationDnsRecords.onclick();assert.match(elements.rotationDnsPickerStatus.textContent,/0 条/);assert.equal(elements.chooseRotationDnsRecord.disabled,true);
 });
+
+test('rotation status distinguishes pause recovery overdue and escapes history',()=>{
+ const r={enabled:1,phase:'active',next_switch_at:1,active_name:'<A>',status:'<pending>'};
+ assert.match(ctx.rotationLiveMarkup(r),/已到计划时间/);assert.match(ctx.rotationLiveMarkup(r),/&lt;pending&gt;/);
+ assert.match(ctx.rotationLiveMarkup({...r,enabled:0}),/已暂停/);
+ assert.match(ctx.rotationLiveMarkup({...r,phase:'waiting_ip'}),/等待新 IP/);
+ assert.match(ctx.rotationHistoryMarkup({events:[{message:'<bad>',created:1,server_id:2}]}),/&lt;bad&gt;/);
+ assert.match(ctx.rotationHistoryMarkup({}),/暂无轮换记录/);
+});
