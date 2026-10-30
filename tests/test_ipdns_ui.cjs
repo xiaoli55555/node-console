@@ -12,3 +12,16 @@ test('pending and unconfigured monitor states do not claim reachability',()=>{as
 test('BOCE card distinguishes reachable, failed and partial carrier results',()=>{const render=states=>ctx.monitorDetectionMarkup({source_kind:'boce',source_name:'BOCE',source_enabled:true,run:{status:'完成',ip:'8.8.8.8',port:443,details:states.map(state=>({state,name:'节点'}))}},{});assert.match(render(['reachable','reachable']),/BOCE 国内探测：国内可达/);assert.match(render(['unreachable','unreachable']),/国内不通（疑似被墙）/);assert.match(render(['reachable','unreachable']),/部分线路不通/);});
 
 test('each configured machine exposes its own action switch',()=>{const render=enabled=>ctx.monitorDetectionMarkup({server_id:7,source_kind:'boce',source_name:'BOCE',response_mode:'change_api',action_enabled:enabled,source_enabled:true},{});assert.match(render(false),/data-action-toggle="7"/);assert.match(render(false),/aria-checked="false"/);assert.match(render(false),/已暂停 · 点击开启/);assert.match(render(true),/已开启 · 点击暂停/);});
+
+test('admin rotation insights expose scoped token generation, copy and revoke',()=>{
+ const html=ctx.adminRotationInsightsMarkup([{rotation_id:4,servers:[1,2],ip_lifetimes:{observed_episodes:0,censored:0},dns:{trials:0,trials_without_observations:0,observed_stable:{p95_s:null}},recovery:{completed:{p95_s:null}},recommendation:{ready:false,reasons:['<pending>']}}],[{id:1,name:'<node>'},{id:2,name:'B'}]);
+ for(const name of ['data-admin-analysis-generate="4"','data-admin-analysis-copy="4"','data-admin-analysis-revoke="4"','无需切换客户账号'])assert.ok(html.includes(name),name);
+ assert.match(html,/&lt;node&gt;/);assert.match(html,/&lt;pending&gt;/);assert.doesNotMatch(html,/<node>/);
+ assert.match(ctx.adminRotationInsightsMarkup([],[]),/尚无轮换任务/);
+});
+
+test('admin rotation manager renders creation and complete lifecycle controls',()=>{
+ const html=ctx.adminRotationsMarkup({rotations:[{id:5,primary_name:'<A>',other_name:'B',owner_role:'admin',enabled:1,active_name:'B',interval_s:3000,lead_s:120,offline_after_s:15,status:'ready'}]});
+ for(const text of ['创建双 VPS 轮换','data-rotation-edit="5"','data-rotation-toggle="5"','data-rotation-delete="5"','后台计划'])assert.ok(html.includes(text),text);
+ assert.match(html,/&lt;A&gt;/);assert.match(ctx.adminRotationsMarkup({rotations:[]}),/尚无轮换任务/);
+});

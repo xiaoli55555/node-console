@@ -494,6 +494,16 @@ class PanelTest(unittest.TestCase):
             self.assertEqual(config.status_code,200,config.json)
             self.assertEqual(config.json['rotation']['active_server_id'],nodes[0][0])
             self.assertEqual(config.json['rotation']['next_switch_at'],clock[0]+7200-120)
+            admin_list=self.admin.get('/api/admin/rotations')
+            self.assertEqual(admin_list.status_code,200,admin_list.json)
+            self.assertEqual(admin_list.json['rotations'][0]['owner_role'],'client')
+            self.assertEqual(self.bob.get('/api/admin/rotations').status_code,403)
+            preflight_admin=self.post(f'/api/admin/servers/{nodes[0][0]}/rotation/readiness',{'other_server_id':nodes[1][0],'binding_id':binding_id})
+            self.assertTrue(preflight_admin.json['ok'],preflight_admin.json)
+            admin_edit=self.admin.put(f'/api/admin/servers/{nodes[0][0]}/rotation',json={'other_server_id':nodes[1][0],'binding_id':binding_id,'interval_s':7200,'lead_s':120,'connection_threshold':80,'enabled':True},headers={'X-CSRF-Token':self.tokens['admin']})
+            self.assertEqual(admin_edit.status_code,200,admin_edit.json)
+            self.assertEqual(admin_edit.json['rotation']['owner_id'],uid)
+
             self.assertEqual(self.bob.get(f'/api/client/servers/{nodes[0][0]}/rotation').status_code,404)
             self.assertEqual(self.alice.patch(f'/api/client/dns-bindings/{binding_id}',json={'automatic':True},headers=headers).status_code,409)
             with server.connect() as db:db.execute('UPDATE vps_rotations SET next_switch_at=? WHERE binding_id=?',(clock[0]-1,binding_id))
@@ -575,6 +585,40 @@ class PanelTest(unittest.TestCase):
             self.assertEqual(remote.post(scoped['path'],json={},headers=analysis_headers).status_code,405)
             self.alice.delete(f'/api/client/servers/{nodes[0][0]}/rotation/analysis-token',headers=headers)
             self.assertEqual(remote.get(scoped['path'],headers=analysis_headers).status_code,401)
+            admin_token_path=f"/api/admin/rotation-insights/{stats.json['rotation_id']}/analysis-token"
+            self.assertEqual(self.alice.post(admin_token_path,json={},headers=headers).status_code,403)
+            self.assertEqual(self.admin.post(admin_token_path,json={}).status_code,403)
+            admin_token=self.post(admin_token_path).json
+            admin_bearer={'Authorization':'Bearer '+admin_token['token']}
+            self.assertEqual(remote.get(admin_token['path'],headers=admin_bearer).status_code,200)
+            replacement=self.post(admin_token_path).json
+            self.assertEqual(remote.get(admin_token['path'],headers=admin_bearer).status_code,401)
+            self.assertEqual(remote.get(replacement['path'],headers={'Authorization':'Bearer '+replacement['token']}).status_code,200)
+            self.admin.delete(admin_token_path,headers={'X-CSRF-Token':self.tokens['admin']})
+            self.assertEqual(remote.get(replacement['path'],headers={'Authorization':'Bearer '+replacement['token']}).status_code,401)
+            # Admin-only creation uses background BOCE/API/DNS, not customer credentials.
+            with server.connect() as db:db.execute("UPDATE vps_rotations SET enabled=0,phase='active'")
+            admin_headers={'X-CSRF-Token':self.tokens['admin']}
+            deleted=self.admin.delete(f'/api/admin/servers/{nodes[0][0]}/rotation',headers=admin_headers)
+            self.assertEqual(deleted.status_code,200,deleted.json)
+            self.assertEqual(report(0).status_code,200);self.assertEqual(report(1).status_code,200)
+            with server.connect() as db:
+                for sid,_ in nodes:
+                    action=db.execute("SELECT id FROM ip_connections WHERE server_id=? AND kind='change_ip'",(sid,)).fetchone()[0]
+                    db.execute('UPDATE detection_plans SET owner_id=NULL,action_connection_id=? WHERE server_id=?',(action,sid))
+                db.execute('UPDATE detection_sources SET owner_id=NULL,server_id=NULL')
+                db.execute('UPDATE ip_connections SET owner_id=NULL,server_id=NULL')
+                db.execute('UPDATE dns_bindings SET expected_ip=? WHERE id=?',(ips[0],binding_id))
+            record['Value']=ips[0]
+            admin_config={'other_server_id':nodes[1][0],'binding_id':binding_id,'interval_s':3000,'lead_s':120,'connection_threshold':80,'offline_after_s':15,'enabled':True}
+            result=self.admin.put(f'/api/admin/servers/{nodes[0][0]}/rotation',json=admin_config,headers=admin_headers)
+            self.assertEqual(result.status_code,200,result.json)
+            self.assertEqual(result.json['rotation']['owner_id'],self.admin.get('/api/me').json['id'])
+            blocked=self.alice.put(f'/api/client/servers/{nodes[0][0]}/rotation',json=dict(admin_config,enabled=False),headers=headers)
+            self.assertEqual(blocked.status_code,403,blocked.json)
+            with server.connect() as db:db.execute('UPDATE vps_rotations SET next_switch_at=?',(clock[0]-1,))
+            rotation.tick(server.connect,server.CIPHER)
+            with server.connect() as db:self.assertEqual(db.execute('SELECT active_server_id FROM vps_rotations').fetchone()[0],nodes[1][0])
             reassigned=self.admin.patch(f'/api/servers/{nodes[1][0]}',json={'owner_id':self.bob.get('/api/me').json['id']},headers={'X-CSRF-Token':self.tokens['admin']})
             self.assertEqual(reassigned.status_code,200,reassigned.json)
             with server.connect() as db:self.assertEqual(db.execute('SELECT COUNT(*) FROM vps_rotations').fetchone()[0],0)

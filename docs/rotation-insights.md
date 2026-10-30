@@ -1,6 +1,6 @@
 # 轮换实测与只读分析接口
 
-更新后，在客户「自动换 IP 服务 → 主 VPS → 双 VPS 定时轮换」中选择「查看统计与建议」。管理员的 IP/DNS 页面也有「轮换统计与优化建议」。
+更新后，在客户「自动换 IP 服务 → 主 VPS → 双 VPS 定时轮换」中选择「查看统计与建议」。管理员可从「IP 监控与解析 → 轮换统计与优化建议」打开汇总，在每组轮换下直接生成、复制或撤销只读分析接口，无需切换客户账号。
 
 ## 已收集与未收集的数据
 
@@ -32,6 +32,8 @@
 | `POST /api/client/servers/{sid}/rotation/observers` | 创建观察节点；JSON 为 label、region、isp |
 | `DELETE /api/client/servers/{sid}/rotation/observers/{oid}` | 停用该轮换的观察节点 |
 | `GET /api/admin/rotation-insights` | 管理员查看轮换统计汇总 |
+| `POST /api/admin/rotation-insights/{rid}/analysis-token` | 管理员生成该组专用只读令牌 |
+| `DELETE /api/admin/rotation-insights/{rid}/analysis-token` | 管理员撤销该组令牌 |
 
 外部分析只允许：
 
@@ -45,3 +47,7 @@ Authorization: Bearer <只读分析令牌>
 观察节点使用另一种令牌，只允许 `GET /api/rotation-observer/jobs` 和 `POST /api/rotation-observer/results`。观察令牌不能读取分析接口，分析令牌不能提交观察结果；观察结果也不参与生产控制。
 
 数据采集由面板 worker 与已部署观察节点持续执行；统计读取时自动按最新数据重新计算。外部 AI 不会因此自动获得永久运行能力或自动修改权限。需要在实际站点生成只读令牌并配置外部调用方后，才能按需或定时拉取分析。
+
+## 后台管理轮换
+
+管理员侧栏新增「双 VPS 轮换」，也可在「IP 监控与解析」点击「双 VPS 轮换管理」。支持创建、配置预检、编辑周期/提前量/无心跳阈值/连接阈值、启停、删除。新建后台计划使用后台 DNS 绑定及后台检测计划指定的换 IP API，不自动选择共享 API，以免错换机器。已有客户计划可以在后台管理，但原归属和凭证范围保持不变；客户不能修改管理员创建的计划。未暂停或仍在恢复的计划不能直接删除。
