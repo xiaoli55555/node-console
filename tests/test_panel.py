@@ -575,6 +575,17 @@ class PanelTest(unittest.TestCase):
             self.assertEqual(remote.post(scoped['path'],json={},headers=analysis_headers).status_code,405)
             self.alice.delete(f'/api/client/servers/{nodes[0][0]}/rotation/analysis-token',headers=headers)
             self.assertEqual(remote.get(scoped['path'],headers=analysis_headers).status_code,401)
+            admin_token_path=f"/api/admin/rotation-insights/{stats.json['rotation_id']}/analysis-token"
+            self.assertEqual(self.alice.post(admin_token_path,json={},headers=headers).status_code,403)
+            self.assertEqual(self.admin.post(admin_token_path,json={}).status_code,403)
+            admin_token=self.post(admin_token_path).json
+            admin_bearer={'Authorization':'Bearer '+admin_token['token']}
+            self.assertEqual(remote.get(admin_token['path'],headers=admin_bearer).status_code,200)
+            replacement=self.post(admin_token_path).json
+            self.assertEqual(remote.get(admin_token['path'],headers=admin_bearer).status_code,401)
+            self.assertEqual(remote.get(replacement['path'],headers={'Authorization':'Bearer '+replacement['token']}).status_code,200)
+            self.admin.delete(admin_token_path,headers={'X-CSRF-Token':self.tokens['admin']})
+            self.assertEqual(remote.get(replacement['path'],headers={'Authorization':'Bearer '+replacement['token']}).status_code,401)
             reassigned=self.admin.patch(f'/api/servers/{nodes[1][0]}',json={'owner_id':self.bob.get('/api/me').json['id']},headers={'X-CSRF-Token':self.tokens['admin']})
             self.assertEqual(reassigned.status_code,200,reassigned.json)
             with server.connect() as db:self.assertEqual(db.execute('SELECT COUNT(*) FROM vps_rotations').fetchone()[0],0)
