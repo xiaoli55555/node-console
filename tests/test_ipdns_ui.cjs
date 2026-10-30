@@ -25,3 +25,30 @@ test('admin rotation manager renders creation and complete lifecycle controls',(
  for(const text of ['创建双 VPS 轮换','data-rotation-edit="5"','data-rotation-toggle="5"','data-rotation-delete="5"','后台计划'])assert.ok(html.includes(text),text);
  assert.match(html,/&lt;A&gt;/);assert.match(ctx.adminRotationsMarkup({rotations:[]}),/尚无轮换任务/);
 });
+
+test('rotation DNS picker lists record identity and carrier lines separately',()=>{
+ const html=ctx.adminRotationRecordOptions([{RecordId:'a',RR:'@',Line:'cmcc',Value:'8.8.8.8'},{RecordId:'b',RR:'edge',Line:'telecom',Value:'1.1.1.1'}],'example.com');
+ assert.match(html,/example.com · 移动（cmcc） · 8.8.8.8 · #a/);
+ assert.match(html,/edge.example.com · 电信（telecom） · 1.1.1.1 · #b/);
+ const escaped=ctx.adminRotationRecordOptions([{RecordId:'<id>',RR:'<rr>',Line:'<line>',Value:'<ip>'}],'example.com');
+ assert.doesNotMatch(escaped,/<rr>/);assert.match(escaped,/&lt;rr&gt;/);
+});
+
+test('admin DNS picker runs connection, domain, record and local-binding flow',async()=>{
+ const fields={dns_connection_id:{value:'3'},rotation_domain:{value:''},rotation_record:{value:''},binding_id:{value:''},primary_server_id:{value:'7'}};
+ const elements={loadRotationDnsRecords:{},chooseRotationDnsRecord:{},rotationDnsPickerStatus:{},rotationDnsDomains:{}};
+ ctx.$=id=>elements[id];const calls=[];ctx.api=async(path,method,body)=>{calls.push({path,method,body});if(path.endsWith('/domains'))return {domains:['example.com']};if(path.endsWith('/records'))return {domain:'example.com',records:[{RecordId:'r1',RR:'edge',Line:'cmcc',Value:'8.8.8.8'}]};return {binding:{id:12,server_id:7,rr:'edge',domain:'example.com',line:'cmcc',expected_ip:'8.8.8.8',credential_owner:null},message:'仅保存面板绑定'};};
+ const data={bindings:[]};let refreshed=0;ctx.bindAdminRotationDNSPicker(data,fields,()=>refreshed++);
+ await fields.dns_connection_id.onchange();assert.equal(fields.rotation_domain.value,'example.com');assert.match(fields.rotation_record.innerHTML,/cmcc/);
+ fields.rotation_record.value='0';fields.rotation_record.onchange();assert.equal(elements.chooseRotationDnsRecord.disabled,false);
+ await elements.chooseRotationDnsRecord.onclick();assert.equal(fields.binding_id.value,'12');assert.equal(refreshed,1);assert.equal(data.bindings.length,1);
+ assert.equal(calls[2].path,'admin/servers/7/rotation/dns-binding');assert.equal(calls[2].body.record_id,'r1');
+});
+
+test('domain-list permission failure permits manually entering an authorized domain',async()=>{
+ const fields={dns_connection_id:{value:'3'},rotation_domain:{value:''},rotation_record:{value:''},binding_id:{value:''},primary_server_id:{value:'7'}};
+ const elements={loadRotationDnsRecords:{},chooseRotationDnsRecord:{},rotationDnsPickerStatus:{},rotationDnsDomains:{}};
+ ctx.$=id=>elements[id];ctx.api=async path=>{if(path.endsWith('/domains'))throw Error('denied');return {domain:'example.com',records:[]};};
+ ctx.bindAdminRotationDNSPicker({bindings:[]},fields,()=>{});await fields.dns_connection_id.onchange();assert.match(elements.rotationDnsPickerStatus.textContent,/手动输入/);
+ fields.rotation_domain.value='example.com';fields.rotation_domain.oninput();await elements.loadRotationDnsRecords.onclick();assert.match(elements.rotationDnsPickerStatus.textContent,/0 条/);assert.equal(elements.chooseRotationDnsRecord.disabled,true);
+});

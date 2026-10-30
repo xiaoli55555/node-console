@@ -610,6 +610,30 @@ class PanelTest(unittest.TestCase):
                 db.execute('UPDATE ip_connections SET owner_id=NULL,server_id=NULL')
                 db.execute('UPDATE dns_bindings SET expected_ip=? WHERE id=?',(ips[0],binding_id))
             record['Value']=ips[0]
+            import rotation_dns
+            another=dict(record,RecordId='record-other-line',Line='telecom',Value=ips[1])
+            def picker_dns(connection,action,**params):
+                if action=='DescribeDomains':return {'Domains':{'Domain':[{'DomainName':'example.com'}]},'TotalCount':1}
+                if action=='DescribeDomainRecords':return {'DomainRecords':{'Record':[dict(record),another]},'TotalCount':2}
+                if action=='DescribeDomainRecordInfo':return dict(record) if params['RecordId']=='record-1' else dict(another)
+                raise AssertionError('DNS picker must not write provider records')
+            with server.connect() as db:
+                cid=db.execute('SELECT connection_id FROM dns_bindings WHERE id=?',(binding_id,)).fetchone()[0]
+                db.execute('DELETE FROM dns_bindings WHERE id=?',(binding_id,))
+            with patch('rotation_dns.dns.alidns',side_effect=picker_dns):
+                domain_result=self.admin.get(f'/api/admin/rotation-dns/{cid}/domains')
+                self.assertEqual(domain_result.json['domains'],['example.com'])
+                listing=self.post(f'/api/admin/rotation-dns/{cid}/records',{'domain':'example.com'})
+                self.assertEqual([r['Line'] for r in listing.json['records']],['default','telecom'])
+                self.assertEqual(self.alice.get(f'/api/admin/rotation-dns/{cid}/domains').status_code,403)
+                pick_path=f'/api/admin/servers/{nodes[0][0]}/rotation/dns-binding'
+                bad=self.post(pick_path,{'connection_id':cid,'domain':'example.com','record_id':'record-other-line'})
+                self.assertEqual(bad.status_code,409,bad.json)
+                chosen=self.post(pick_path,{'connection_id':cid,'domain':'example.com','record_id':'record-1'})
+                self.assertEqual(chosen.status_code,200,chosen.json);binding_id=chosen.json['binding']['id']
+                again=self.post(pick_path,{'connection_id':cid,'domain':'example.com','record_id':'record-1'})
+                self.assertEqual(again.json['binding']['id'],binding_id)
+                self.assertEqual(record['Value'],ips[0]);self.assertEqual(another['Value'],ips[1])
             admin_config={'other_server_id':nodes[1][0],'binding_id':binding_id,'interval_s':3000,'lead_s':120,'connection_threshold':80,'offline_after_s':15,'enabled':True}
             result=self.admin.put(f'/api/admin/servers/{nodes[0][0]}/rotation',json=admin_config,headers=admin_headers)
             self.assertEqual(result.status_code,200,result.json)
