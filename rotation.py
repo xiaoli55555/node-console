@@ -8,7 +8,7 @@ from pathlib import Path
 from flask import g, jsonify
 from rotation_insights import record_switch, record_progress
 
-from detectors import boce_dns_gate
+from detectors import boce_dns_gate, queue_reboot
 from ip_dns import (
     ChangeIPUncertain, IntegrationError, candidate_ip, get_dns_record,
     invoke_change_ip_api, load_connection, public_v4, update_dns_record,
@@ -90,14 +90,24 @@ def _validated_plan(db,sid,uid):
     admin=_admin_user(db,uid)
     if not plan or not plan['source_enabled'] or not plan['automatic'] or not plan['monitor_enabled']:
         raise IntegrationError('两台 VPS 都必须开启检测计划和 IP 监控')
+    if plan['response_mode']=='reboot':
+        if admin:
+            if plan['source_owner'] is not None or plan['owner_id'] not in (None,uid):raise IntegrationError('管理员轮换需使用后台检测来源')
+        elif plan['owner_id']!=uid or plan['source_owner']!=uid or plan['source_server']!=sid:
+            raise IntegrationError('请使用该客户、该 VPS 专属的探测计划')
+        node=db.execute('SELECT metrics FROM servers WHERE id=?',(sid,)).fetchone()
+        try:capabilities=json.loads(node['metrics'] or '{}').get('capabilities',[])
+        except (TypeError,ValueError):capabilities=[]
+        if 'reboot' not in capabilities:raise IntegrationError('此 VPS 的 agent 不支持重启，请先升级 agent')
+        return dict(plan,action_connection_id=None,rotation_action='reboot')
     if admin:
         if plan['source_owner'] is not None or plan['owner_id'] not in (None,uid):raise IntegrationError('管理员轮换需使用后台检测来源，不能混用客户密钥')
         action=db.execute("SELECT id,kind,owner_id,server_id FROM ip_connections WHERE id=? AND kind='change_ip' AND owner_id IS NULL",(plan['action_connection_id'],)).fetchone()
-        if not action:raise IntegrationError('请在后台检测点配置中，为每台 VPS 的检测计划指定换 IP API')
+        if not action:raise IntegrationError('请在后台检测点配置中，为每台 VPS 的检测计划选择重启或指定换 IP API')
     else:
         if plan['owner_id']!=uid or plan['source_owner']!=uid or plan['source_server']!=sid:raise IntegrationError('请使用该客户、该 VPS 专属的探测计划')
         action=db.execute("SELECT id,kind,owner_id,server_id FROM ip_connections WHERE kind='change_ip' AND owner_id=? AND server_id=? ORDER BY CASE WHEN id=? THEN 0 ELSE 1 END,id DESC LIMIT 1",(uid,sid,plan['action_connection_id'] or -1)).fetchone()
-        if not action:raise IntegrationError('请分别为两台 VPS 保存专属换 IP API')
+        if not action:raise IntegrationError('请为该 VPS 选择重启方式或保存专属换 IP API')
     return dict(plan,action_connection_id=action['id'])
 
 def _client_rotation(app,connect,cipher,auth,body,error,audit):
@@ -170,7 +180,7 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
                     _validated_plan(db,target,effective_uid);snap=_server_snapshot(db,target,now,cipher)
                     reason=boce_dns_gate(db,target,snap['ip'],snap['port'],require_plan=True)
                     if reason:raise IntegrationError(reason)
-                    checks.append({'name':'VPS #'+str(target),'ok':True,'message':'IP、TCP 上报、BOCE 和专属换 IP API 已就绪'})
+                    checks.append({'name':'VPS #'+str(target),'ok':True,'message':'IP、TCP 上报、BOCE 和换 IP 动作（重启 / API）已就绪'})
                 except IntegrationError as e:checks.append({'name':'VPS #'+str(target),'ok':False,'message':str(e)})
             binding=db.execute('SELECT b.*,c.owner_id AS credential_owner FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id WHERE b.id=? AND b.server_id=?',(bid,sid)).fetchone()
             try:
@@ -340,8 +350,13 @@ def _run_rotation(connect,cipher,rid,now):
             if pending:
                 db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('连接数已达标，但旧 VPS 另有换 IP 任务处理中；等待其完成',now,rid));return
             plan=_validated_plan(db,old,r['owner_id'])
-            if not plan or not plan['action_connection_id']:
+            if not plan or (plan.get('rotation_action')!='reboot' and not plan['action_connection_id']):
                 db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('旧机连接已降至阈值，但未配置换 IP API',now,rid));return
+            if plan.get('rotation_action')=='reboot':
+                message=queue_reboot(db,old,now)
+                if not message.startswith('已排队'):
+                    db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',(message,now,rid));return
+                db.execute("UPDATE vps_rotations SET phase='waiting_ip',action_started=?,action_attempts=action_attempts+1,status=?,updated=? WHERE id=?",(now,message+'；等待重启后的新 IP',now,rid));return
             try:action=load_connection(db,cipher,plan['action_connection_id'])
             except IntegrationError as e:db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',(str(e),now,rid));return
             server=db.execute('SELECT name FROM servers WHERE id=?',(old,)).fetchone()
@@ -358,6 +373,10 @@ def _run_rotation(connect,cipher,rid,now):
             except IntegrationError as e:
                 db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',(str(e),now,rid));return
             plan=_validated_plan(db,old,r['owner_id'])
+            if plan.get('rotation_action')=='reboot':
+                # Never repeatedly reboot a machine that has not obtained a new IP.
+                # Keep the healthy active VPS serving while the operator investigates.
+                db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('重启后尚未观察到新 IP；保留当前解析，等待上报或人工检查，不重复重启',now,rid));return
             action=load_connection(db,cipher,plan['action_connection_id']) if plan and plan['action_connection_id'] else None
             server=db.execute('SELECT name FROM servers WHERE id=?',(old,)).fetchone()
             if not action:db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('等待有效的旧 VPS 换 IP API',now,rid));return

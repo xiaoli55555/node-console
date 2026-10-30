@@ -77,3 +77,12 @@ class RotationConditions(unittest.TestCase):
             self.assertTrue(rotation._offline(db,1,1000,15))
             self.assertFalse(rotation._offline(db,1,1000,20))
             self.assertFalse(rotation._offline(db,2,1000,15))
+
+    def test_reboot_wait_does_not_call_api_or_repeat_reboot(self):
+        with self.connect() as db:db.execute("UPDATE vps_rotations SET phase='waiting_ip',drain_server_id=2,old_ip='8.8.8.8',action_started=800,next_switch_at=2000")
+        with patch('rotation._failed_ip',return_value=False),patch('rotation._fresh_ip',return_value=('8.8.8.8',443,{})),patch('rotation._validated_plan',return_value={'rotation_action':'reboot','action_connection_id':None}),patch('rotation.queue_reboot') as reboot,patch('rotation.invoke_change_ip_api') as api:
+            rotation._run_rotation(self.connect,None,1,1000)
+            rotation._run_rotation(self.connect,None,1,1010)
+            reboot.assert_not_called();api.assert_not_called()
+        self.assertEqual(self.row()['phase'],'waiting_ip')
+        self.assertIn('不重复重启',self.row()['status'])
