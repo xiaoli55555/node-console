@@ -108,6 +108,7 @@ async function loadUsers(){customers=await api('users');$('userRows').innerHTML=
 $('userForm').onsubmit=async e=>{e.preventDefault();try{const credentials=Object.fromEntries(new FormData(e.target));await api('users','POST',credentials);e.target.reset();$('customerPassword').type='password';$('passwordHint').textContent='可手动填写，或生成 20 位随机密码。';await loadUsers();notice('客户已创建')}catch(e){notice(e.message)}};
 $('passwordForm').onsubmit=async e=>{e.preventDefault();try{await api('password','POST',Object.fromEntries(new FormData(e.target)));e.target.reset();signout();$('loginError').textContent='密码已修改，请重新登录'}catch(e){notice(e.message)}};
 $('closeModal').onclick=()=>$('modal').close();
+$('adminRotationMenu').onclick=()=>{if(me?.role==='admin')loadAdminRotations();};
 function modal(html){stopNetworkMonitor();ipHistoryView++;$('modalBody').innerHTML=html;if(!$('modal').open)$('modal').showModal()}
 $('addServer').onclick=()=>{modal('<h2>添加服务器</h2><p>创建后生成独立采集密钥，仅显示一次。</p><form id="serverForm"><label>服务器名称<input name="name" maxlength="64" required placeholder="例如 HK-01"></label><button class="primary">创建并获取接入方式</button><p id="formError"></p></form>');$('serverForm').onsubmit=async e=>{e.preventDefault();try{const r=await api('servers','POST',Object.fromEntries(new FormData(e.target)));enrollment(r.token,r.ticket);await loadServers()}catch(e){$('formError').textContent=e.message}}};
 function shellQuote(text){return "'"+String(text).replace(/'/g,"'\"'\"'")+"'";}
