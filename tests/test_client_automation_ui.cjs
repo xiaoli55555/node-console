@@ -11,6 +11,16 @@ test('customer VPS settings expose BOCE, AliDNS, Cloudflare, MoonVM, port and re
  const html=ctx.customerDnsSection({sources:[],plan:{response_mode:'change_api',action_enabled:true},monitor:{port:23456,enabled:true}},[],7,[{id:2,name:'My AliDNS',kind:'alidns',access_key_id:'key-id'},{id:3,name:'MoonVM product 9',kind:'change_ip'}]);
  for(const text of ['clientProbeStatus','clientProbeForm','BOCE API Key','业务 TCP 检测端口','clientActionForm','通过面板重启 VPS','MoonVM 换 IP API','AccessKey ID','AccessKey Secret','Cloudflare DNS','Cloudflare API Token','Zone Read、DNS Read、DNS Write','验证凭据并读取 A 记录','保存后开启这条记录自动解析'])assert.ok(html.includes(text),text);
  assert.match(html,/value="23456"/);
+ assert.match(html,/option value="personal" selected>客户自有 BOCE（使用自己的 Key）/);
+ assert.match(html,/验证并保存 Key/);
+ assert.match(html,/客户自有 BOCE 并验证 Key 后加载节点/);
+});
+
+test('customers with a saved personal BOCE source can still choose to replace or revalidate their own key',()=>{
+ const html=ctx.customerDnsSection({sources:[{id:19,name:'客户自有 BOCE',personal:true}],plan:{source_id:19},monitor:{port:443,enabled:true}},[],7,[]);
+ assert.match(html,/option value="personal" >客户自有 BOCE（使用自己的 Key）/);
+ assert.match(html,/option value="19" selected>客户自有 BOCE/);
+ assert.match(html,/已保存个人 Key；留空不修改/);
 });
 
 test('customer Cloudflare connection uses a selectable DNS provider and explains proxied records',()=>{
