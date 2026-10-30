@@ -56,7 +56,12 @@ def initialize(connect):
 
         if 'offline_after_s' not in {r[1] for r in db.execute('PRAGMA table_info(vps_rotations)')}:db.execute('ALTER TABLE vps_rotations ADD COLUMN offline_after_s INTEGER NOT NULL DEFAULT 15')
 
+def _admin_user(db,uid):
+    row=db.execute('SELECT role FROM users WHERE id=?',(uid,)).fetchone()
+    return bool(row and row['role']=='admin')
+
 def _owned_server(db,sid,uid):
+    if _admin_user(db,uid):return db.execute('SELECT id,name,metrics,seen FROM servers WHERE id=?',(sid,)).fetchone()
     return db.execute('SELECT id,name,metrics,seen FROM servers WHERE id=? AND owner_id=?',(sid,uid)).fetchone()
 
 def _rotation_json(db,row):
@@ -82,17 +87,23 @@ def _server_snapshot(db,sid,now,cipher):
 
 def _validated_plan(db,sid,uid):
     plan=db.execute('SELECT p.*,s.owner_id AS source_owner,s.server_id AS source_server,s.enabled AS source_enabled,m.enabled AS monitor_enabled,m.port AS monitor_port FROM detection_plans p JOIN detection_sources s ON s.id=p.source_id JOIN ip_monitors m ON m.server_id=p.server_id WHERE p.server_id=?',(sid,)).fetchone()
-    if not plan or plan['owner_id']!=uid or plan['source_owner']!=uid or plan['source_server']!=sid or not plan['source_enabled'] or not plan['automatic'] or not plan['monitor_enabled']:
-        raise IntegrationError('两台 VPS 都要配置并开启各自的 BOCE 定时探测和 IP 监控')
-    action=db.execute("SELECT id,kind,owner_id,server_id FROM ip_connections WHERE kind='change_ip' AND owner_id=? AND server_id=? ORDER BY CASE WHEN id=? THEN 0 ELSE 1 END,id DESC LIMIT 1",(uid,sid,plan['action_connection_id'] or -1)).fetchone()
-    if not action or action['kind']!='change_ip' or action['owner_id']!=uid or action['server_id']!=sid:
-        raise IntegrationError('换 IP API 必须是当前客户为对应 VPS 保存的专属连接')
+    admin=_admin_user(db,uid)
+    if not plan or not plan['source_enabled'] or not plan['automatic'] or not plan['monitor_enabled']:
+        raise IntegrationError('两台 VPS 都必须开启检测计划和 IP 监控')
+    if admin:
+        if plan['source_owner'] is not None or plan['owner_id'] not in (None,uid):raise IntegrationError('管理员轮换需使用后台检测来源，不能混用客户密钥')
+        action=db.execute("SELECT id,kind,owner_id,server_id FROM ip_connections WHERE id=? AND kind='change_ip' AND owner_id IS NULL",(plan['action_connection_id'],)).fetchone()
+        if not action:raise IntegrationError('请在后台检测点配置中，为每台 VPS 的检测计划指定换 IP API')
+    else:
+        if plan['owner_id']!=uid or plan['source_owner']!=uid or plan['source_server']!=sid:raise IntegrationError('请使用该客户、该 VPS 专属的探测计划')
+        action=db.execute("SELECT id,kind,owner_id,server_id FROM ip_connections WHERE kind='change_ip' AND owner_id=? AND server_id=? ORDER BY CASE WHEN id=? THEN 0 ELSE 1 END,id DESC LIMIT 1",(uid,sid,plan['action_connection_id'] or -1)).fetchone()
+        if not action:raise IntegrationError('请分别为两台 VPS 保存专属换 IP API')
     return dict(plan,action_connection_id=action['id'])
 
 def _client_rotation(app,connect,cipher,auth,body,error,audit):
     @auth()
     def get_rotation(sid):
-        if g.user['role']!='client':return error('此功能仅供客户账号使用',403)
+        if g.user['role'] not in ('admin','client'):return error('无权管理轮换',403)
         with connect() as db:
             if not _owned_server(db,sid,g.user['id']):return error('服务器不存在',404)
             rotation=db.execute('SELECT * FROM vps_rotations WHERE owner_id=? AND (primary_server_id=? OR other_server_id=?) ORDER BY id LIMIT 1',(g.user['id'],sid,sid)).fetchone()
@@ -101,7 +112,7 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
 
     @auth()
     def save_rotation(sid):
-        if g.user['role']!='client':return error('此功能仅供客户账号使用',403)
+        if g.user['role'] not in ('admin','client'):return error('无权管理轮换',403)
         d=body();other=d.get('other_server_id');binding_id=d.get('binding_id');interval=d.get('interval_s',7200);threshold=d.get('connection_threshold',80);enabled=d.get('enabled');offline_after=d.get('offline_after_s',15);lead=d.get('lead_s',min(120,interval//4) if type(interval)is int else 0)
         if type(other)is not int or other==sid or type(binding_id)is not int or type(interval)is not int or not 60<=interval<=604800 or type(threshold)is not int or not 1<=threshold<=10000 or type(offline_after)is not int or not 10<=offline_after<=120 or type(lead)is not int or not 0<=lead<interval or type(enabled)is not bool:return error('请检查备用 VPS、DNS 记录、轮换间隔、连接数阈值和开关')
         now=int(time.time())
@@ -112,6 +123,8 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
                 existing=db.execute('SELECT * FROM vps_rotations WHERE primary_server_id=? OR other_server_id=? OR binding_id=?',(sid,sid,binding_id)).fetchall()
                 if len(existing)>1:return error('VPS 或 DNS 记录已用于其他轮换任务',409)
                 rotation=existing[0] if existing else None
+                if rotation and g.user['role']!='admin' and rotation['owner_id']!=g.user['id']:return error('轮换计划不属于当前客户',403)
+                effective_uid=rotation['owner_id'] if rotation else g.user['id']
                 if rotation and (rotation['primary_server_id']!=sid or rotation['other_server_id']!=other or rotation['binding_id']!=binding_id):return error('已有轮换任务绑定了不同的 VPS 或 DNS 记录；请先暂停原任务',409)
                 if rotation and rotation['phase']!='active' and (rotation['other_server_id']!=other or rotation['binding_id']!=binding_id):return error('正在排空旧 VPS 或等待换 IP 完成，暂不能更换轮换对象',409)
                 if rotation and not enabled:
@@ -121,9 +134,10 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
                 conflicts=db.execute('SELECT id FROM vps_rotations WHERE enabled=1 AND (primary_server_id IN (?,?) OR other_server_id IN (?,?)) AND id<>?',(sid,other,sid,other,rotation['id'] if rotation else -1)).fetchone()
                 if enabled and conflicts:return error('其中一台 VPS 已参加其他启用中的轮换任务',409)
                 binding=db.execute('SELECT b.*,c.kind,c.owner_id AS connection_owner,c.server_id AS connection_server FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id WHERE b.id=?',(binding_id,)).fetchone()
-                if not binding or binding['server_id']!=sid or binding['connection_owner']!=g.user['id'] or binding['connection_server']!=sid:return error('请为当前 VPS 选择一条自己的 DNS 记录',404)
-                _validated_plan(db,sid,g.user['id']);_validated_plan(db,other,g.user['id'])
-                if _validated_plan(db,sid,g.user['id'])['monitor_port']!=binding['port']:return error('DNS 记录端口和主 VPS 监控端口不一致，请重新保存检测端口',409)
+                binding_owner=None if _admin_user(db,effective_uid) else effective_uid
+                if not binding or binding['server_id']!=sid or binding['connection_owner']!=binding_owner or (binding_owner is not None and binding['connection_server']!=sid):return error('DNS 绑定与该轮换的管理员/客户配置范围不一致',404)
+                _validated_plan(db,sid,effective_uid);_validated_plan(db,other,effective_uid)
+                if _validated_plan(db,sid,effective_uid)['monitor_port']!=binding['port']:return error('DNS 记录端口和主 VPS 监控端口不一致，请重新保存检测端口',409)
                 a=_server_snapshot(db,sid,now,cipher);b=_server_snapshot(db,other,now,cipher)
                 if a['port']!=b['port'] or a['port']!=binding['port']:return error('两台 VPS 的业务 TCP 检测端口必须相同')
                 if a['ip']==b['ip']:return error('两台 VPS 当前公网 IP 相同，不能进行轮换')
@@ -145,20 +159,22 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
 
     @auth()
     def readiness(sid):
-        if g.user['role']!='client':return error('此功能仅供客户账号使用',403)
+        if g.user['role'] not in ('admin','client'):return error('无权管理轮换',403)
         d=body();other=d.get('other_server_id');bid=d.get('binding_id');checks=[];now=int(time.time());recommended=120
         with connect() as db:
             if type(other)is not int or not _owned_server(db,sid,g.user['id']) or not _owned_server(db,other,g.user['id']):return error('请选择两台自己的 VPS',404)
+            existing=db.execute('SELECT owner_id FROM vps_rotations WHERE primary_server_id=?',(sid,)).fetchone()
+            effective_uid=existing['owner_id'] if existing and g.user['role']=='admin' else g.user['id']
             for target in (sid,other):
                 try:
-                    _validated_plan(db,target,g.user['id']);snap=_server_snapshot(db,target,now,cipher)
+                    _validated_plan(db,target,effective_uid);snap=_server_snapshot(db,target,now,cipher)
                     reason=boce_dns_gate(db,target,snap['ip'],snap['port'],require_plan=True)
                     if reason:raise IntegrationError(reason)
                     checks.append({'name':'VPS #'+str(target),'ok':True,'message':'IP、TCP 上报、BOCE 和专属换 IP API 已就绪'})
                 except IntegrationError as e:checks.append({'name':'VPS #'+str(target),'ok':False,'message':str(e)})
             binding=db.execute('SELECT b.*,c.owner_id AS credential_owner FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id WHERE b.id=? AND b.server_id=?',(bid,sid)).fetchone()
             try:
-                if not binding or binding['credential_owner']!=g.user['id']:raise IntegrationError('请选择主 VPS 自有 DNS 绑定')
+                if not binding or binding['credential_owner']!=(None if _admin_user(db,effective_uid) else effective_uid):raise IntegrationError('请选择主 VPS 自有 DNS 绑定')
                 conn=load_connection(db,cipher,binding['connection_id']);record=get_dns_record(conn,binding);validate_dns_record(record,binding,conn)
                 ttl=int(record.get('ttl',record.get('TTL',300)) or 300);ttl=300 if ttl<=1 else ttl;recommended=ttl+60
                 checks.append({'name':'DNS 记录','ok':True,'message':'记录身份与当前值核对通过；启用后接管单机自动解析，本次未修改 DNS；建议提前至少 '+str(recommended)+' 秒'})
@@ -171,16 +187,25 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
 
     @auth()
     def delete_rotation(sid):
-        if g.user['role']!='client':return error('此功能仅供客户账号使用',403)
+        if g.user['role'] not in ('admin','client'):return error('无权管理轮换',403)
         with connect() as db:
             if not _owned_server(db,sid,g.user['id']):return error('服务器不存在',404)
-            rotation=db.execute('SELECT * FROM vps_rotations WHERE primary_server_id=? AND owner_id=?',(sid,g.user['id'])).fetchone()
+            rotation=db.execute('SELECT * FROM vps_rotations WHERE primary_server_id=? AND (? OR owner_id=?)',(sid,int(g.user['role']=='admin'),g.user['id'])).fetchone()
             if not rotation:return error('轮换计划不存在',404)
             if rotation['enabled'] or rotation['phase']!='active':return error('请先暂停轮换；正在排空或换 IP 的流程完成后才能删除',409)
             db.execute('DELETE FROM vps_rotations WHERE id=?',(rotation['id'],));audit(db,'删除双 VPS 轮换计划 #'+str(rotation['id']))
         return jsonify(ok=True)
     delete_rotation.__name__='client_delete_vps_rotation'
     app.add_url_rule('/api/client/servers/<int:sid>/rotation','client_delete_vps_rotation',delete_rotation,methods=['DELETE'])
+    @app.get('/api/admin/rotations')
+    @auth(admin=True)
+    def admin_rotations():
+        with connect() as db:
+            return jsonify(rotations=[dict(_rotation_json(db,r),owner_role=db.execute('SELECT role FROM users WHERE id=?',(r['owner_id'],)).fetchone()['role']) for r in db.execute('SELECT * FROM vps_rotations ORDER BY id DESC')],servers=[dict(x) for x in db.execute('SELECT id,name FROM servers')],bindings=[dict(x) for x in db.execute('SELECT b.id,b.server_id,b.domain,b.rr,b.line,b.expected_ip,c.owner_id AS credential_owner FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id')])
+    app.add_url_rule('/api/admin/servers/<int:sid>/rotation','admin_save_rotation',auth(admin=True)(save_rotation.__wrapped__),methods=['PUT'])
+    app.add_url_rule('/api/admin/servers/<int:sid>/rotation/readiness','admin_rotation_readiness',auth(admin=True)(readiness.__wrapped__),methods=['POST'])
+    app.add_url_rule('/api/admin/servers/<int:sid>/rotation','admin_delete_rotation',auth(admin=True)(delete_rotation.__wrapped__),methods=['DELETE'])
+
 
 def _event(db,rid,sid,message,now):
     db.execute('INSERT INTO vps_rotation_events(rotation_id,server_id,message,created) VALUES(?,?,?,?)',(rid,sid,message,now))
