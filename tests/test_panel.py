@@ -549,6 +549,32 @@ class PanelTest(unittest.TestCase):
                 row=db.execute('SELECT * FROM vps_rotations').fetchone()
                 self.assertEqual(row['active_server_id'],nodes[1][0]);self.assertEqual(row['emergency'],0)
             self.assertEqual(record['Value'],ips[1]);self.assertEqual(change.call_count,2)
+            # Telemetry tokens are scoped: observer can report only DNS; analyst can only read statistics.
+            self.assertEqual(self.bob.get(f'/api/client/servers/{nodes[0][0]}/rotation/insights').status_code,404)
+            created=self.alice.post(f'/api/client/servers/{nodes[0][0]}/rotation/observers',json={'label':'test observer','region':'Shanghai','isp':'Telecom'},headers=headers)
+            self.assertEqual(created.status_code,200,created.json)
+            remote=server.app.test_client();observe_headers={'Authorization':'Bearer '+created.json['token']}
+            job=remote.get('/api/rotation-observer/jobs',headers=observe_headers).json['jobs'][0]
+            self.assertEqual(job['expected_ip'],ips[1])
+            sample={'trial_id':job['id'],'answers':[ips[0]],'resolver':'223.5.5.5','error':False}
+            self.assertEqual(remote.post('/api/rotation-observer/results',json=sample,headers=observe_headers).status_code,200)
+            for _ in range(3):
+                clock[0]+=3;sample['answers']=[ips[1]]
+                posted=remote.post('/api/rotation-observer/results',json=sample,headers=observe_headers)
+                self.assertEqual(posted.status_code,200,posted.json)
+            self.assertTrue(posted.json['stable'])
+            scoped=self.alice.post(f'/api/client/servers/{nodes[0][0]}/rotation/analysis-token',json={},headers=headers).json
+            analysis_headers={'Authorization':'Bearer '+scoped['token']}
+            stats=remote.get(scoped['path'],headers=analysis_headers)
+            self.assertEqual(stats.status_code,200,stats.json);self.assertEqual(stats.json['dns']['observed_stable']['count'],1)
+            self.assertFalse(stats.json['recommendation']['ready']);self.assertNotIn('private-token',stats.text)
+            self.assertEqual(self.admin.get('/api/admin/rotation-insights').status_code,200)
+            self.assertEqual(self.alice.get('/api/admin/rotation-insights').status_code,403)
+            self.assertEqual(remote.get(scoped['path'],headers=observe_headers).status_code,401)
+            self.assertEqual(remote.get('/api/rotation-observer/jobs',headers=analysis_headers).status_code,401)
+            self.assertEqual(remote.post(scoped['path'],json={},headers=analysis_headers).status_code,405)
+            self.alice.delete(f'/api/client/servers/{nodes[0][0]}/rotation/analysis-token',headers=headers)
+            self.assertEqual(remote.get(scoped['path'],headers=analysis_headers).status_code,401)
             reassigned=self.admin.patch(f'/api/servers/{nodes[1][0]}',json={'owner_id':self.bob.get('/api/me').json['id']},headers={'X-CSRF-Token':self.tokens['admin']})
             self.assertEqual(reassigned.status_code,200,reassigned.json)
             with server.connect() as db:self.assertEqual(db.execute('SELECT COUNT(*) FROM vps_rotations').fetchone()[0],0)
