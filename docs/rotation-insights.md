@@ -51,3 +51,5 @@ Authorization: Bearer <只读分析令牌>
 ## 后台管理轮换
 
 管理员侧栏新增「双 VPS 轮换」，也可在「IP 监控与解析」点击「双 VPS 轮换管理」。支持创建、配置预检、编辑周期/提前量/无心跳阈值/连接阈值、启停、删除。新建后台计划使用后台 DNS 绑定及后台检测计划指定的换 IP API，不自动选择共享 API，以免错换机器。已有客户计划可以在后台管理，但原归属和凭证范围保持不变；客户不能修改管理员创建的计划。未暂停或仍在恢复的计划不能直接删除。
+
+后台新建轮换无需预先手动绑定 DNS：选择后台 DNS API 后读取域名（阿里云 DescribeDomains，Cloudflare 为当前授权 Zone），选择或输入域名后读取 A 记录，按记录 ID 与线路选择。域名列表或记录读取不写入 DNS；“选用此记录”仅创建/复用面板绑定，并核对主 VPS IP。无 DescribeDomains 权限可手输主域名读取授权记录。阿里云文档：https://www.alibabacloud.com/help/en/dns/api-alidns-2015-01-09-describedomains 和 https://www.alibabacloud.com/help/en/dns/api-alidns-2015-01-09-describedomainrecords 。
