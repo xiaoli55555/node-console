@@ -455,6 +455,35 @@ class PanelTest(unittest.TestCase):
             self.assertEqual(pause_endpoint.status_code,200,pause_endpoint.json)
             self.assertEqual(self.alice.patch(f'/api/client/servers/{sid}/probe-config',json={'automatic':True},headers=headers).status_code,403)
 
+    def test_personal_boce_configuration_flow_is_available_to_multiple_customers(self):
+        from unittest.mock import patch
+        nodes={'data':{'list':[{'id':13,'node_name':'上海电信','isp_name':'电信'}]}}
+        users=[('alice',self.alice),('bob',self.bob)]
+        with patch('detectors.boce',return_value=nodes):
+            for username,client in users:
+                server_node=self.post('/api/servers',{'name':'personal-boce-'+username}).json
+                sid=server_node['id'];uid=client.get('/api/me').json['id']
+                self.admin.patch(f'/api/servers/{sid}',json={'owner_id':uid},headers={'X-CSRF-Token':self.tokens['admin']})
+                with server.connect() as db:db.execute('INSERT INTO ip_monitors(server_id,port,enabled) VALUES(?,443,1)',(sid,))
+                headers={'X-CSRF-Token':self.tokens[username]};endpoint=f'/api/client/servers/{sid}'
+                self.assertEqual(client.get(endpoint+'/probe-config').json['sources'],[])
+                # Exercise first-time save, update, and re-read as separate customer sessions.
+                for revision in (1,2):
+                    key=f'{username}-private-boce-key-{revision}'
+                    saved=client.post(endpoint+'/probe-source',json={'secret':key},headers=headers)
+                    self.assertEqual(saved.status_code,200,saved.json)
+                    source_id=saved.json['source_id']
+                    self.assertNotIn(key,saved.text)
+                    state=client.get(endpoint+'/probe-config').json
+                    self.assertEqual([source['id'] for source in state['sources']],[source_id])
+                    self.assertEqual(state['sources'][0]['personal'],1)
+                    configured=client.put(endpoint+'/probe-config',json={'source_id':source_id,'nodes':['13'],'interval_s':240,'daily_limit':300,'automatic':True},headers=headers)
+                    self.assertEqual(configured.status_code,200,configured.json)
+                    self.assertEqual(client.get(endpoint+'/probe-config').json['plan']['source_id'],source_id)
+                other=self.bob if username=='alice' else self.alice
+                self.assertEqual(other.get(endpoint+'/probe-config').status_code,404)
+
+
     def test_server_reassignment_disables_and_clears_previous_customer_boce_key(self):
         from unittest.mock import patch
         node=self.post('/api/servers',{'name':'handoff'}).json;sid=node['id']
