@@ -348,6 +348,7 @@ def run_binding(connect,cipher,bid,apply=False):
             with connect() as db:
                 row=db.execute('SELECT * FROM dns_bindings WHERE id=?',(bid,)).fetchone()
                 if not row:raise IntegrationError('绑定不存在')
+                if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vps_rotations'").fetchone() and db.execute('SELECT 1 FROM vps_rotations WHERE binding_id=?',(bid,)).fetchone():raise IntegrationError('此 DNS 记录由双 VPS 轮换独占管理，请在轮换设置中暂停或删除计划')
                 b=dict(row);connection=load_connection(db,cipher,b['connection_id'])
                 record=get_dns_record(connection,b)
                 validate_dns_record(record,b,connection)
@@ -432,7 +433,7 @@ def register(app,connect,cipher,auth,body,error,audit):
         with connect() as db:
             server=db.execute('SELECT id FROM servers WHERE id=? AND owner_id=?',(sid,g.user['id'])).fetchone()
             if not server:return error('服务器不存在',404)
-            rows=db.execute('SELECT b.id,b.connection_id,b.domain,b.rr,b.line,b.expected_ip,b.candidate,b.port,b.automatic,b.verify_new_ip,b.status,b.updated,c.name AS connection_name,c.kind AS dns_provider,CASE WHEN c.owner_id=? AND c.server_id=b.server_id THEN 1 ELSE 0 END AS customer_owned FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id WHERE b.server_id=? ORDER BY b.id',(g.user['id'],sid)).fetchall()
+            rows=db.execute('SELECT b.id,b.connection_id,b.domain,b.rr,b.line,b.expected_ip,b.candidate,b.port,b.automatic,b.verify_new_ip,b.status,b.updated,c.name AS connection_name,c.kind AS dns_provider,CASE WHEN c.owner_id=? AND c.server_id=b.server_id THEN 1 ELSE 0 END AS customer_owned,CASE WHEN EXISTS(SELECT 1 FROM vps_rotations r WHERE r.binding_id=b.id) THEN 1 ELSE 0 END AS rotation_managed FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id WHERE b.server_id=? ORDER BY b.id',(g.user['id'],sid)).fetchall()
             connections=[dict(r) for r in db.execute("SELECT id,name,kind,json_extract(config,'$.provider') AS provider,json_extract(config,'$.access_key_id') AS access_key_id,json_extract(config,'$.zone_name') AS zone_name FROM ip_connections WHERE owner_id=? AND server_id=? AND kind IN ('alidns','cloudflare','change_ip') ORDER BY id",(g.user['id'],sid))]
         return jsonify(bindings=[dict(r) for r in rows],connections=connections)
 
@@ -451,6 +452,7 @@ def register(app,connect,cipher,auth,body,error,audit):
         if type(port)is not int or not 1<=port<=65535 or type(enabled)is not bool:return error('请填写有效的 TCP 检测端口并选择监控开关')
         with connect() as db:
             if not client_server(db,sid):return error('服务器不存在',404)
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vps_rotations'").fetchone() and db.execute('SELECT 1 FROM vps_rotations WHERE enabled=1 AND (primary_server_id=? OR other_server_id=?)',(sid,sid)).fetchone():return error('轮换进行中，请先暂停后再修改监控端口或开关',409)
             current=db.execute('SELECT p.action_enabled,p.response_mode,p.owner_id,s.owner_id AS source_owner,s.server_id FROM detection_plans p JOIN detection_sources s ON s.id=p.source_id WHERE p.server_id=?',(sid,)).fetchone()
             if current and current['action_enabled'] and current['response_mode'] in ('reboot','change_api') and (current['owner_id']!=g.user['id'] or current['source_owner']!=g.user['id'] or current['server_id']!=sid):return error('管理员自动处理策略正在运行，不能修改检测端口；请联系管理员',409)
             db.execute('INSERT INTO ip_monitors(server_id,port,enabled,source_id) VALUES(?,?,?,NULL) ON CONFLICT(server_id) DO UPDATE SET port=excluded.port,enabled=excluded.enabled,source_id=NULL',(sid,port,int(enabled)))
@@ -579,6 +581,7 @@ def register(app,connect,cipher,auth,body,error,audit):
                 vals=(sid,cid,domain,rid,rr,line,ip,monitor['port'])
                 existing=d.get('id')
                 if existing:
+                    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vps_rotations'").fetchone() and db.execute('SELECT 1 FROM vps_rotations WHERE binding_id=?',(existing,)).fetchone():raise IntegrationError('此 DNS 记录由双 VPS 轮换独占管理，请先删除轮换计划')
                     changed=db.execute('UPDATE dns_bindings SET server_id=?,connection_id=?,source_id=NULL,domain=?,record_id=?,rr=?,line=?,expected_ip=?,port=?,automatic=0,verify_new_ip=1,candidate=NULL,candidate_since=NULL,status=\'等待检查\' WHERE id=? AND server_id=? AND id IN (SELECT b.id FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id WHERE c.owner_id=? AND c.server_id=?)',vals+(existing,sid,g.user['id'],sid)).rowcount
                     if not changed:raise IntegrationError('解析绑定不属于当前客户')
                     bid=existing
@@ -595,6 +598,7 @@ def register(app,connect,cipher,auth,body,error,audit):
         with connect() as db:
             row=db.execute('SELECT b.server_id FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id WHERE b.id=? AND c.owner_id=? AND c.server_id=b.server_id AND b.server_id IN (SELECT id FROM servers WHERE owner_id=?)',(bid,g.user['id'],g.user['id'])).fetchone()
             if not row:return error('解析绑定不存在',404)
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vps_rotations'").fetchone() and db.execute('SELECT 1 FROM vps_rotations WHERE binding_id=?',(bid,)).fetchone():return error('请先暂停并删除双 VPS 轮换计划',409)
             db.execute('DELETE FROM dns_bindings WHERE id=?',(bid,));audit(db,'客户删除 DNS 绑定 #'+str(bid))
         return jsonify(ok=True)
 
@@ -616,6 +620,7 @@ def register(app,connect,cipher,auth,body,error,audit):
         with connect() as db:
             binding=db.execute('SELECT b.id,b.server_id,s.name FROM dns_bindings b JOIN servers s ON s.id=b.server_id WHERE b.id=? AND s.owner_id=?',(bid,g.user['id'])).fetchone()
             if not binding:return error('解析绑定不存在',404)
+            if enabled and db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vps_rotations'").fetchone() and db.execute('SELECT 1 FROM vps_rotations WHERE binding_id=?',(bid,)).fetchone():return error('此 DNS 记录由双 VPS 轮换独占管理',409)
             if enabled:
                 plan=db.execute('SELECT p.automatic,s.enabled AS source_enabled,m.enabled AS monitor_enabled FROM detection_plans p JOIN detection_sources s ON s.id=p.source_id JOIN ip_monitors m ON m.server_id=p.server_id WHERE p.server_id=?',(binding['server_id'],)).fetchone()
                 if not plan or not plan['automatic'] or not plan['source_enabled'] or not plan['monitor_enabled']:

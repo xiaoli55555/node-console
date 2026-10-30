@@ -455,6 +455,72 @@ class PanelTest(unittest.TestCase):
             self.assertEqual(pause_endpoint.status_code,200,pause_endpoint.json)
             self.assertEqual(self.alice.patch(f'/api/client/servers/{sid}/probe-config',json={'automatic':True},headers=headers).status_code,403)
 
+    def test_client_vps_rotation_switches_dns_drains_connections_and_refreshes_standby_ip(self):
+        from unittest.mock import patch, MagicMock
+        import rotation
+        uid=self.alice.get('/api/me').json['id'];headers={'X-CSRF-Token':self.tokens['alice']}
+        nodes=[];ips=['8.8.8.8','1.1.1.1'];port=23456;now=int(time.time())
+        for label in ('primary','standby'):
+            node=self.post('/api/servers',{'name':'rotation-'+label}).json;sid=node['id'];nodes.append((sid,node['token']))
+            self.admin.patch(f'/api/servers/{sid}',json={'owner_id':uid},headers={'X-CSRF-Token':self.tokens['admin']})
+            with server.connect() as db:
+                db.execute('INSERT INTO ip_monitors(server_id,port,enabled) VALUES(?,?,1)',(sid,port))
+                source=db.execute("INSERT INTO detection_sources(name,kind,secret,enabled,owner_id,server_id) VALUES(?, 'boce', ?,1,?,?)",('BOCE '+label,server.CIPHER.encrypt(b'private-boce').decode(),uid,sid)).lastrowid
+                action=db.execute("INSERT INTO ip_connections(name,kind,config,secret,owner_id,server_id) VALUES(?,'change_ip',?,?,?,?)",('MoonVM '+label,json.dumps({'provider':'moonvm','product':'12345'}),server.CIPHER.encrypt(b'private-token-'+label.encode()).decode(),uid,sid)).lastrowid
+                db.execute("INSERT INTO detection_plans(server_id,source_id,nodes,interval_s,automatic,daily_limit,next_at,response_mode,action_connection_id,failure_threshold,owner_id) VALUES(?,?,?,120,1,1000,?,'change_api',?,3,?)",(sid,source,'[\"13\"]',now,action,uid))
+        binding_id=None
+        with server.connect() as db:
+            dns=db.execute("INSERT INTO ip_connections(name,kind,config,secret,owner_id,server_id) VALUES('Rotation DNS','alidns',?,?,?,?)",(json.dumps({'access_key_id':'test-id'}),server.CIPHER.encrypt(b'private-dns-secret').decode(),uid,nodes[0][0])).lastrowid
+            binding_id=db.execute("INSERT INTO dns_bindings(server_id,connection_id,domain,record_id,rr,line,expected_ip,port,automatic) VALUES(?,?,'example.com','record-1','edge','default',?,?,0)",(nodes[0][0],dns,ips[0],port)).lastrowid
+        clock=[now]
+        record={'RecordId':'record-1','RR':'edge','Line':'default','Type':'A','Value':ips[0],'TTL':60,'Status':'ENABLE'}
+        def report(i,tcp=25):
+            sid,token=nodes[i]
+            return self.admin.post('/api/agent/report',json={'public_ips':[],'egress_ips':[ips[i]],'egress_checked':clock[0],'connections_sampled':clock[0],'tcp':tcp,'udp':0,'uptime':clock[0],'rx_bytes':0,'tx_bytes':0},headers={'Authorization':'Bearer '+token})
+        with patch('time.time',side_effect=lambda:clock[0]),patch('rotation.get_dns_record',side_effect=lambda *_:dict(record)),patch('rotation.update_dns_record',side_effect=lambda _c,_b,_r,new:(record.update(Value=new) or dict(record))),patch('rotation.socket.create_connection',return_value=MagicMock()),patch('rotation.invoke_change_ip_api',return_value='换 IP 已受理') as change:
+            self.assertEqual(report(0).status_code,200);self.assertEqual(report(1).status_code,200)
+            with server.connect() as db:
+                for i,(sid,_) in enumerate(nodes):
+                    source=db.execute('SELECT source_id FROM detection_plans WHERE server_id=?',(sid,)).fetchone()[0]
+                    db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details) VALUES(?,?,?,?,'[\"13\"]','所选检测点 TCP 可达',?,?,?)",(sid,source,ips[i],port,clock[0]-10,clock[0],json.dumps([{'node_id':'13','state':'reachable'}])))
+            config=self.alice.put(f'/api/client/servers/{nodes[0][0]}/rotation',json={'other_server_id':nodes[1][0],'binding_id':binding_id,'interval_s':7200,'connection_threshold':80,'enabled':True},headers=headers)
+            self.assertEqual(config.status_code,200,config.json)
+            self.assertEqual(config.json['rotation']['active_server_id'],nodes[0][0])
+            self.assertEqual(self.bob.get(f'/api/client/servers/{nodes[0][0]}/rotation').status_code,404)
+            self.assertEqual(self.alice.patch(f'/api/client/dns-bindings/{binding_id}',json={'automatic':True},headers=headers).status_code,409)
+            with server.connect() as db:db.execute('UPDATE vps_rotations SET next_switch_at=? WHERE binding_id=?',(clock[0]-1,binding_id))
+            rotation.tick(server.connect,server.CIPHER)
+            with server.connect() as db:
+                row=db.execute('SELECT * FROM vps_rotations WHERE binding_id=?',(binding_id,)).fetchone()
+                self.assertEqual(row['phase'],'draining');self.assertEqual(row['active_server_id'],nodes[1][0]);self.assertEqual(row['drain_server_id'],nodes[0][0])
+                self.assertEqual(row['drain_grace_s'],120)
+                self.assertEqual(db.execute('SELECT expected_ip FROM dns_bindings WHERE id=?',(binding_id,)).fetchone()[0],ips[1])
+            rotation.tick(server.connect,server.CIPHER)
+            with server.connect() as db:self.assertEqual(db.execute('SELECT low_samples FROM vps_rotations').fetchone()[0],0)
+            with server.connect() as db:
+                row=db.execute('SELECT * FROM vps_rotations WHERE binding_id=?',(binding_id,)).fetchone()
+                db.execute('UPDATE vps_rotations SET drain_started=?,drain_grace_s=0 WHERE id=?',(clock[0]-100,row['id']))
+            clock[0]+=15;self.assertEqual(report(0,tcp=80).status_code,200);rotation.tick(server.connect,server.CIPHER)
+            with server.connect() as db:self.assertEqual(db.execute('SELECT low_samples FROM vps_rotations').fetchone()[0],0)
+            clock[0]+=15;self.assertEqual(report(0,tcp=70).status_code,200);rotation.tick(server.connect,server.CIPHER)
+            with server.connect() as db:self.assertEqual(db.execute('SELECT low_samples FROM vps_rotations').fetchone()[0],1)
+            clock[0]+=15;self.assertEqual(report(0,tcp=70).status_code,200);rotation.tick(server.connect,server.CIPHER)
+            self.assertEqual(change.call_count,1)
+            with server.connect() as db:self.assertEqual(db.execute('SELECT phase FROM vps_rotations').fetchone()[0],'waiting_ip')
+            ips[0]='9.9.9.9';clock[0]+=10;self.assertEqual(report(0,tcp=30).status_code,200);rotation.tick(server.connect,server.CIPHER)
+            with server.connect() as db:
+                row=db.execute('SELECT * FROM vps_rotations').fetchone();self.assertEqual(row['phase'],'waiting_probe')
+                source=db.execute('SELECT source_id FROM detection_plans WHERE server_id=?',(nodes[0][0],)).fetchone()[0]
+                db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details) VALUES(?,?,?,?,'[\"13\"]','所选检测点 TCP 可达',?,?,?)",(nodes[0][0],source,ips[0],port,clock[0],clock[0],json.dumps([{'node_id':'13','state':'reachable'}])))
+            clock[0]+=5;rotation.tick(server.connect,server.CIPHER)
+            with server.connect() as db:
+                row=db.execute('SELECT * FROM vps_rotations').fetchone()
+                self.assertEqual(row['phase'],'active');self.assertEqual(row['active_server_id'],nodes[1][0]);self.assertIsNone(row['drain_server_id'])
+            self.assertEqual(change.call_count,1)
+            reassigned=self.admin.patch(f'/api/servers/{nodes[1][0]}',json={'owner_id':self.bob.get('/api/me').json['id']},headers={'X-CSRF-Token':self.tokens['admin']})
+            self.assertEqual(reassigned.status_code,200,reassigned.json)
+            with server.connect() as db:self.assertEqual(db.execute('SELECT COUNT(*) FROM vps_rotations').fetchone()[0],0)
+
     def test_personal_boce_configuration_flow_is_available_to_multiple_customers(self):
         from unittest.mock import patch
         nodes={'data':{'list':[{'id':13,'node_name':'上海电信','isp_name':'电信'}]}}

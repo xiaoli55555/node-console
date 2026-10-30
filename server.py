@@ -501,6 +501,8 @@ def assign(sid):
         if owner is not None and not db.execute("SELECT id FROM users WHERE id=? AND role='client'",(owner,)).fetchone():return error('客户不存在')
         if current['owner_id']!=owner and current['owner_id'] is not None:
             # Customer-owned DNS/action credentials must never transfer with a VPS.
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vps_rotations'").fetchone():
+                db.execute('DELETE FROM vps_rotations WHERE primary_server_id=? OR other_server_id=?',(sid,sid))
             old_connections=db.execute('SELECT id FROM ip_connections WHERE owner_id=? AND server_id=?',(current['owner_id'],sid)).fetchall()
             old_connection_ids=[r['id'] for r in old_connections]
             if old_connection_ids:
@@ -777,6 +779,9 @@ with connect() as cipher_db:
     CIPHER=load_cipher(DATA,bool(cipher_db.execute('SELECT 1 FROM users WHERE password_encrypted IS NOT NULL LIMIT 1').fetchone() or cipher_db.execute('SELECT 1 FROM ip_connections LIMIT 1').fetchone() or cipher_db.execute('SELECT 1 FROM detection_sources LIMIT 1').fetchone()))
 register_ip_dns(app,connect,CIPHER,auth,body,error,audit)
 register_detectors(app,connect,CIPHER,auth,body,error,audit)
+from rotation import initialize as initialize_rotations, register as register_rotations
+initialize_rotations(connect)
+register_rotations(app,connect,CIPHER,auth,body,error,audit)
 if __name__=='__main__':
     import argparse, getpass
     parser=argparse.ArgumentParser();parser.add_argument('command',choices=['admin','backup','entry']);parser.add_argument('target',nargs='?');args=parser.parse_args()
