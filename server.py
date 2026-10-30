@@ -499,6 +499,7 @@ def assign(sid):
         current=db.execute('SELECT id,owner_id FROM servers WHERE id=?',(sid,)).fetchone()
         if not current:return error('服务器不存在',404)
         if owner is not None and not db.execute("SELECT id FROM users WHERE id=? AND role='client'",(owner,)).fetchone():return error('客户不存在')
+        if current['owner_id']!=owner and db.execute('SELECT 1 FROM vps_rotations r WHERE (r.primary_server_id=? OR r.other_server_id=? OR r.failover_server_id=?) AND EXISTS(SELECT 1 FROM vps_failover_leases l WHERE l.rotation_id=r.id)',(sid,sid,sid)).fetchone():return error('故障转移仍在接替，解析切回前不能变更服务器归属',409)
         if current['owner_id']!=owner and current['owner_id'] is not None:
             # Customer-owned DNS/action credentials must never transfer with a VPS.
             if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vps_rotations'").fetchone():
@@ -544,6 +545,7 @@ def create_install_ticket(sid):
 @auth(True)
 def delete(sid):
     with connect() as db:
+        if db.execute('SELECT 1 FROM vps_rotations r WHERE r.failover_server_id=? OR ((r.primary_server_id=? OR r.other_server_id=?) AND EXISTS(SELECT 1 FROM vps_failover_leases l WHERE l.rotation_id=r.id))',(sid,sid,sid)).fetchone():return error('该服务器参与 A 故障转移，请先安全切回解析并移除故障转移配置',409)
         db.execute('DELETE FROM servers WHERE id=?',(sid,));audit(db,f'移除服务器 #{sid}')
     return jsonify(ok=True)
 
@@ -607,6 +609,11 @@ def report():
                     clean['egress_ips']=sorted(set(str(ip) for ip in addresses))
                 except ValueError:return error('出口 IP 格式无效')
             else:clean['egress_ips']=None
+        if d.get('tcp_by_port') is not None:
+            counts=d['tcp_by_port']
+            if not isinstance(counts,dict) or len(counts)>65535:return error('端口连接数格式无效')
+            if any(not k.isdecimal() or not 1<=int(k)<=65535 or str(int(k))!=k or type(v)is not int or not 0<=v<=2**53 for k,v in counts.items()):return error('端口连接数格式无效')
+            clean['tcp_by_port']=counts
         for stamp_key in ('egress_checked','connections_sampled'):
             stamp=d.get(stamp_key)
             if stamp is not None:

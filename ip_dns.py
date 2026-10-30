@@ -349,6 +349,8 @@ def run_binding(connect,cipher,bid,apply=False):
                 row=db.execute('SELECT * FROM dns_bindings WHERE id=?',(bid,)).fetchone()
                 if not row:raise IntegrationError('绑定不存在')
                 if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vps_rotations'").fetchone() and db.execute('SELECT 1 FROM vps_rotations WHERE binding_id=?',(bid,)).fetchone():raise IntegrationError('此 DNS 记录由双 VPS 轮换独占管理，请在轮换设置中暂停或删除计划')
+                from failover import guarded
+                if guarded(db,bid):raise IntegrationError('此记录正由 A 故障转移接管，暂停单机自动解析同步')
                 b=dict(row);connection=load_connection(db,cipher,b['connection_id'])
                 record=get_dns_record(connection,b)
                 validate_dns_record(record,b,connection)
@@ -433,7 +435,7 @@ def register(app,connect,cipher,auth,body,error,audit):
         with connect() as db:
             server=db.execute('SELECT id FROM servers WHERE id=? AND owner_id=?',(sid,g.user['id'])).fetchone()
             if not server:return error('服务器不存在',404)
-            rows=db.execute('SELECT b.id,b.connection_id,b.domain,b.rr,b.line,b.expected_ip,b.candidate,b.port,b.automatic,b.verify_new_ip,b.status,b.updated,c.name AS connection_name,c.kind AS dns_provider,CASE WHEN c.owner_id=? AND c.server_id=b.server_id THEN 1 ELSE 0 END AS customer_owned,CASE WHEN EXISTS(SELECT 1 FROM vps_rotations r WHERE r.binding_id=b.id) THEN 1 ELSE 0 END AS rotation_managed FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id WHERE b.server_id=? ORDER BY b.id',(g.user['id'],sid)).fetchall()
+            rows=db.execute('SELECT b.id,b.connection_id,b.domain,b.rr,b.line,b.expected_ip,b.candidate,b.port,b.automatic,b.verify_new_ip,b.status,b.updated,c.name AS connection_name,c.kind AS dns_provider,CASE WHEN c.owner_id=? AND c.server_id=b.server_id THEN 1 ELSE 0 END AS customer_owned,CASE WHEN EXISTS(SELECT 1 FROM vps_rotations r WHERE r.binding_id=b.id) OR EXISTS(SELECT 1 FROM vps_failover_leases l WHERE l.binding_id=b.id) THEN 1 ELSE 0 END AS rotation_managed FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id WHERE b.server_id=? ORDER BY b.id',(g.user['id'],sid)).fetchall()
             connections=[dict(r) for r in db.execute("SELECT id,name,kind,json_extract(config,'$.provider') AS provider,json_extract(config,'$.access_key_id') AS access_key_id,json_extract(config,'$.zone_name') AS zone_name FROM ip_connections WHERE owner_id=? AND server_id=? AND kind IN ('alidns','cloudflare','change_ip') ORDER BY id",(g.user['id'],sid))]
         return jsonify(bindings=[dict(r) for r in rows],connections=connections)
 
@@ -580,6 +582,8 @@ def register(app,connect,cipher,auth,body,error,audit):
                     if ip not in egress or time.time()-checked>180:raise IntegrationError('所选解析当前 IP 与该 VPS 新鲜上报的公网 IP 不一致，已阻止绑定')
                 vals=(sid,cid,domain,rid,rr,line,ip,monitor['port'])
                 existing=d.get('id')
+                from failover import guarded
+                if existing and guarded(db,existing):raise IntegrationError('此记录由 A 故障转移接管，切回前不能修改')
                 if existing:
                     if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vps_rotations'").fetchone() and db.execute('SELECT 1 FROM vps_rotations WHERE binding_id=?',(existing,)).fetchone():raise IntegrationError('此 DNS 记录由双 VPS 轮换独占管理，请先删除轮换计划')
                     changed=db.execute('UPDATE dns_bindings SET server_id=?,connection_id=?,source_id=NULL,domain=?,record_id=?,rr=?,line=?,expected_ip=?,port=?,automatic=0,verify_new_ip=1,candidate=NULL,candidate_since=NULL,status=\'等待检查\' WHERE id=? AND server_id=? AND id IN (SELECT b.id FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id WHERE c.owner_id=? AND c.server_id=?)',vals+(existing,sid,g.user['id'],sid)).rowcount
@@ -599,6 +603,8 @@ def register(app,connect,cipher,auth,body,error,audit):
             row=db.execute('SELECT b.server_id FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id WHERE b.id=? AND c.owner_id=? AND c.server_id=b.server_id AND b.server_id IN (SELECT id FROM servers WHERE owner_id=?)',(bid,g.user['id'],g.user['id'])).fetchone()
             if not row:return error('解析绑定不存在',404)
             if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vps_rotations'").fetchone() and db.execute('SELECT 1 FROM vps_rotations WHERE binding_id=?',(bid,)).fetchone():return error('请先暂停并删除双 VPS 轮换计划',409)
+            from failover import guarded
+            if guarded(db,bid):return error('此记录由 A 故障转移接管，切回前不能删除',409)
             db.execute('DELETE FROM dns_bindings WHERE id=?',(bid,));audit(db,'客户删除 DNS 绑定 #'+str(bid))
         return jsonify(ok=True)
 
@@ -769,6 +775,8 @@ def register(app,connect,cipher,auth,body,error,audit):
             with connect() as db:
                 if not db.execute('SELECT 1 FROM servers WHERE id=?',(d.get('server_id'),)).fetchone():raise IntegrationError('请选择服务器')
                 if not db.execute('SELECT 1 FROM ip_monitors WHERE server_id=?',(d.get('server_id'),)).fetchone():raise IntegrationError('请先将此 VPS 加入监控')
+                from failover import guarded
+                if d.get('id') and guarded(db,d['id']):raise IntegrationError('此记录由 A 故障转移接管，切回前不能修改绑定')
                 c=load_connection(db,cipher,d.get('connection_id'))
                 if c['kind'] not in ('alidns','cloudflare') or c.get('owner_id') is not None:raise IntegrationError('请选择管理员的 DNS 连接')
                 source=d.get('source_id') or None

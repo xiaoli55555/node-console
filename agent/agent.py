@@ -14,6 +14,19 @@ def tcp_count(root=Path('/proc')):
             if len(cols)>3 and cols[3]=='01':count+=1
     return count if found else None
 
+def tcp_port_counts(root=Path('/proc')):
+    counts={};found=False
+    for name in ('tcp','tcp6'):
+        path=root/'net'/name
+        if not path.exists():continue
+        found=True
+        for line in path.read_text().splitlines()[1:]:
+            cols=line.split()
+            if len(cols)>3 and cols[3]=='01':
+                port=str(int(cols[1].rsplit(':',1)[1],16))
+                counts[port]=counts.get(port,0)+1
+    return counts if found else None
+
 def udp_count():
     # Match ss -uanH: IPv4/IPv6 UDP sockets in all states, not conntrack flows.
     if not shutil.which('ss'):return None,'未安装 ss（iproute2），UDP socket 数不可用'
@@ -43,13 +56,15 @@ def cpu_snapshot():
     return sum(v),v[3]+v[4]
 
 class ConnectionSampler:
-    def __init__(self):self.next_at=0;self.values=(None,None,'尚未采集连接数');self.sampled_at=None
+    def __init__(self):self.next_at=0;self.values=(None,None,'尚未采集连接数');self.sampled_at=None;self.by_port=None
     def sample(self,clock=time.monotonic):
         now=clock()
         if now>=self.next_at:
             udp,err=udp_count()
             try:tcp=tcp_count()
             except OSError:tcp=None;err+=' TCP 采集失败'
+            try:self.by_port=tcp_port_counts()
+            except (OSError,ValueError):self.by_port=None
             self.values=(tcp,udp,err.strip());self.sampled_at=int(time.time());self.next_at=now+15
         return self.values
 
@@ -94,7 +109,7 @@ def collect(previous=None,connections=None):
     return {'cpu_percent':cpu,'memory_percent':round(100*(1-mem.get('MemAvailable',mem.get('MemFree',0))/mem['MemTotal']),1),
             'memory_total':mem['MemTotal'],'memory_used':max(0,mem['MemTotal']-mem.get('MemAvailable',mem.get('MemFree',0))),'cpu_count':logical_cpu_count(),'disk_percent':round(100*disk.used/disk.total,1),'disk_total':disk.total,
             'uptime':int(float(Path('/proc/uptime').read_text().split()[0])), 'rx_bytes':rx,'tx_bytes':tx,
-            'udp_method':'socket','connections_sampled':connections.sampled_at if connections else int(time.time()),'capabilities':['reboot'],'tcp':tcp,'udp':udp,'public_ips':addresses,'ip_error':ip_error,'network_error':err.strip(),'hostname':socket.gethostname(),'os':os_name,'kernel':platform.release()},now
+            'tcp_by_port':connections.by_port if connections else None,'udp_method':'socket','connections_sampled':connections.sampled_at if connections else int(time.time()),'capabilities':['reboot'],'tcp':tcp,'udp':udp,'public_ips':addresses,'ip_error':ip_error,'network_error':err.strip(),'hostname':socket.gethostname(),'os':os_name,'kernel':platform.release()},now
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('--once',action='store_true');p.add_argument('--config',default='/etc/hk-sdan-agent/config.json');a=p.parse_args()

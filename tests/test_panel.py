@@ -455,6 +455,56 @@ class PanelTest(unittest.TestCase):
             self.assertEqual(pause_endpoint.status_code,200,pause_endpoint.json)
             self.assertEqual(self.alice.patch(f'/api/client/servers/{sid}/probe-config',json={'automatic':True},headers=headers).status_code,403)
 
+    def test_fixed_primary_mode_save_pause_and_legacy_mode_selection(self):
+        from unittest.mock import patch
+        import rotation
+        a=self.post('/api/servers',{'name':'fixed A'}).json['id']
+        b=self.post('/api/servers',{'name':'rotating B'}).json['id']
+        now=int(time.time())
+        with server.connect() as db:
+            cid=db.execute("INSERT INTO ip_connections(name,kind,config,secret) VALUES('DNS','alidns','{}','test')").lastrowid
+            bid=db.execute("INSERT INTO dns_bindings(server_id,connection_id,domain,record_id,rr,line,expected_ip,port,automatic) VALUES(?,?,'example.com','mobile-record','edge','mobile','8.8.8.8',443,0)",(a,cid)).lastrowid
+        def snapshot(db,sid,now,cipher):return {'ip':'8.8.8.8' if sid==a else '1.1.1.1','port':443,'metrics':{'tcp_by_port':{},'connections_sampled':now}}
+        payload={'other_server_id':b,'binding_id':bid,'interval_s':7200,'takeover_s':600,'first_switch_at':now+120,'mode':'fixed_primary','mobile_only_ack':True,'enabled':True}
+        url=f'/api/admin/servers/{a}/rotation'
+        with patch('rotation._validated_plan',return_value={'monitor_port':443}),patch('rotation._server_snapshot',side_effect=snapshot),patch('rotation.load_connection',return_value={}),patch('rotation.get_dns_record',return_value={'Value':'8.8.8.8'}),patch('rotation.validate_dns_record'):
+            result=self.admin.put(url,json=dict(payload,mobile_only_ack=False),headers={'X-CSRF-Token':self.tokens['admin']})
+            self.assertEqual(result.status_code,400)
+            result=self.admin.put(url,json=payload,headers={'X-CSRF-Token':self.tokens['admin']})
+            self.assertEqual(result.status_code,200,result.json)
+            row=result.json['rotation'];self.assertEqual(row['mode'],'fixed_primary');self.assertEqual(row['next_switch_at'],now+120);self.assertEqual(row['lead_s'],0)
+            blocked=self.admin.put(url,json=dict(payload,mode='alternating'),headers={'X-CSRF-Token':self.tokens['admin']})
+            self.assertEqual(blocked.status_code,409)
+            self.assertEqual(self.admin.put(url,json=dict(payload,enabled=False),headers={'X-CSRF-Token':self.tokens['admin']}).status_code,200)
+            result=self.admin.put(url,json=dict(payload,mode='alternating',enabled=False),headers={'X-CSRF-Token':self.tokens['admin']})
+            self.assertEqual(result.status_code,200,result.json);self.assertEqual(result.json['rotation']['mode'],'alternating');self.assertEqual(result.json['rotation']['enabled'],0)
+
+    def test_A_automatic_DNS_sync_updates_other_records_but_keeps_mobile_on_B(self):
+        from unittest.mock import patch,MagicMock
+        import ip_dns
+        a=self.post('/api/servers',{'name':'main'}).json['id']
+        b=self.post('/api/servers',{'name':'mobile standby'}).json['id']
+        uid=self.admin.get('/api/me').json['id']
+        with server.connect() as db:
+            cid=db.execute("INSERT INTO ip_connections(name,kind,config,secret) VALUES('DNS','alidns','{}','test')").lastrowid
+            bids={}
+            for line,address in [('mobile','1.1.1.1'),('telecom','8.8.8.8'),('unicom','8.8.8.8')]:
+                bids[line]=db.execute("INSERT INTO dns_bindings(server_id,connection_id,domain,record_id,rr,line,expected_ip,port,automatic,verify_new_ip) VALUES(?,?,'example.com',?,'edge',?,?,443,1,1)",(a,cid,line,line,address)).lastrowid
+            db.execute("INSERT INTO vps_rotations(owner_id,primary_server_id,other_server_id,binding_id,active_server_id,enabled,mode,next_switch_at,updated) VALUES(?,?,?,?,?,1,'fixed_primary',2000,1000)",(uid,a,b,bids['mobile'],b))
+        records={line:{'RecordId':line,'RR':'edge','Line':line,'Type':'A','Value':ip,'TTL':60,'Status':'ENABLE'} for line,ip in [('mobile','1.1.1.1'),('telecom','8.8.8.8'),('unicom','8.8.8.8')]}
+        clock=[int(time.time())]
+        with patch('ip_dns.time.time',side_effect=lambda:clock[0]),patch('ip_dns.load_connection',return_value={'kind':'alidns'}),patch('ip_dns.candidate_ip',return_value='9.9.9.9'),patch('ip_dns.boce_dns_gate',return_value=None),patch('ip_dns.get_dns_record',side_effect=lambda c,b:dict(records[b['record_id']])),patch('ip_dns.update_dns_record',side_effect=lambda c,b,r,ip:records[b['record_id']].update(Value=ip)) as update,patch('ip_dns.socket.create_connection',return_value=MagicMock()):
+            for line in ('telecom','unicom'):
+                ip_dns.run_binding(server.connect,server.CIPHER,bids[line],apply=True)
+                clock[0]+=61
+                result=ip_dns.run_binding(server.connect,server.CIPHER,bids[line],apply=True)
+                self.assertTrue(result['ok']);self.assertEqual(records[line]['Value'],'9.9.9.9')
+            with self.assertRaises(ip_dns.IntegrationError):ip_dns.run_binding(server.connect,server.CIPHER,bids['mobile'],apply=True)
+            self.assertEqual(update.call_count,2)
+        self.assertEqual(records['mobile']['Value'],'1.1.1.1')
+        with server.connect() as db:
+            self.assertEqual(db.execute('SELECT expected_ip FROM dns_bindings WHERE id=?',(bids['mobile'],)).fetchone()[0],'1.1.1.1')
+
     def test_client_vps_rotation_switches_dns_drains_connections_and_refreshes_standby_ip(self):
         from unittest.mock import patch, MagicMock
         import rotation

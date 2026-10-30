@@ -61,3 +61,8 @@ test('rotation status distinguishes pause recovery overdue and escapes history',
  assert.match(ctx.rotationHistoryMarkup({events:[{message:'<bad>',created:1,server_id:2}]}),/&lt;bad&gt;/);
  assert.match(ctx.rotationHistoryMarkup({}),/暂无轮换记录/);
 });
+
+test('live rotation status shows C failover and freezes timer instead of claiming A serves',()=>{
+ const html=ctx.rotationLiveMarkup({phase:'active',mode:'fixed_primary',primary_server_id:1,active_server_id:1,active_name:'C（故障转移）',enabled:1,next_switch_at:2000000000,failover_leases:[{binding_id:3}],status:'A 下线，全部解析接替'});
+ assert.match(html,/A 故障转移接替中/);assert.match(html,/故障接替期间暂停定时轮换/);assert.match(html,/C（故障转移）/);
+});
