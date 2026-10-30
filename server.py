@@ -785,6 +785,8 @@ register_detectors(app,connect,CIPHER,auth,body,error,audit)
 from rotation import initialize as initialize_rotations, register as register_rotations
 initialize_rotations(connect)
 register_rotations(app,connect,CIPHER,auth,body,error,audit)
+from rotation_dns import register as register_rotation_dns
+register_rotation_dns(app,connect,CIPHER,auth,body,error,audit)
 from rotation_insights import initialize as initialize_insights, register as register_insights
 initialize_insights(connect)
 register_insights(app,connect,auth,body,error,audit)
