@@ -6,9 +6,13 @@ import math
 import re
 import secrets
 import time
-from flask import g, jsonify, request
+from flask import g, jsonify, request, Response
 
 SCHEMA='''
+CREATE TABLE IF NOT EXISTS rotation_report_samples(
+ id INTEGER PRIMARY KEY,rotation_id INTEGER NOT NULL REFERENCES vps_rotations(id) ON DELETE CASCADE,
+ created INTEGER NOT NULL,payload TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS rotation_report_time ON rotation_report_samples(rotation_id,created);
 CREATE TABLE IF NOT EXISTS rotation_dns_trials(
  id INTEGER PRIMARY KEY,rotation_id INTEGER NOT NULL REFERENCES vps_rotations(id) ON DELETE CASCADE,
  hostname TEXT NOT NULL,line TEXT NOT NULL,old_ip TEXT NOT NULL,new_ip TEXT NOT NULL,
@@ -138,6 +142,24 @@ def summarize(db,rid,now=None):
         'recommendation':{'mode':'advisory_only','ready':candidate is not None,'candidate':candidate,'reasons':reasons,'suggested_lead_s':lead},
         'limitations':['IP 起点为 agent 首次观察变化，不是供应商分配时间','全节点 TCP 不通不等于已证实被墙；超时、未知和缺失不算失败','未观测到失效的 IP 作为删失样本，不当成故障寿命','DNS 统计只代表已部署节点和所选记录线路；未稳定的样本保留，不作为零延迟','Cloudflare 代理记录无法通过公共 DNS 比较源站 IP','本接口不会修改策略、DNS 或调用换 IP API']}
 
+def report_snapshot(db,rid,now=None):
+    now=int(time.time()) if now is None else now
+    data=summarize(db,rid,now)
+    row=db.execute('SELECT enabled,phase,status,active_server_id,next_switch_at,updated FROM vps_rotations WHERE id=?',(rid,)).fetchone()
+    data['execution']=dict(row)
+    return data
+
+def collect_reports(connect,now=None):
+    now=int(time.time()) if now is None else now
+    with connect() as db:
+        ids=[r[0] for r in db.execute('SELECT id FROM vps_rotations')]
+        db.execute('DELETE FROM rotation_report_samples WHERE created<?',(now-7*86400,))
+        for rid in ids:
+            last=db.execute('SELECT MAX(created) FROM rotation_report_samples WHERE rotation_id=?',(rid,)).fetchone()[0]
+            if last is not None and now-last<600:continue
+            payload=json.dumps(report_snapshot(db,rid,now),ensure_ascii=False)
+            db.execute('INSERT INTO rotation_report_samples(rotation_id,created,payload) VALUES(?,?,?)',(rid,now,payload))
+
 def register(app,connect,auth,body,error,audit):
     def owned(db,sid):
         return db.execute('SELECT r.* FROM vps_rotations r JOIN servers s ON s.id=? WHERE (r.primary_server_id=s.id OR r.other_server_id=s.id) AND s.owner_id=? AND r.owner_id=?',(sid,g.user['id'],g.user['id'])).fetchone()
@@ -146,6 +168,16 @@ def register(app,connect,auth,body,error,audit):
         return value[7:] if value.startswith('Bearer ') and len(value)<256 else ''
     def observer(db):
         return db.execute('SELECT * FROM rotation_observers WHERE token_hash=? AND enabled=1',(digest(bearer()),)).fetchone()
+
+    @app.get('/api/admin/rotation-insights/<int:rid>/report')
+    @auth(admin=True)
+    def download_rotation_report(rid):
+        with connect() as db:
+            if not db.execute('SELECT 1 FROM vps_rotations WHERE id=?',(rid,)).fetchone():return error('轮换计划不存在',404)
+            data={'format_version':1,'collection_interval_s':600,'retention_days':7,'current':report_snapshot(db,rid),
+                  'samples':[json.loads(r['payload']) for r in db.execute('SELECT payload FROM rotation_report_samples WHERE rotation_id=? ORDER BY created DESC LIMIT 1008',(rid,))],
+                  'events':[dict(r) for r in db.execute('SELECT server_id,message,created FROM vps_rotation_events WHERE rotation_id=? ORDER BY id DESC LIMIT 500',(rid,))]}
+        return Response(json.dumps(data,ensure_ascii=False,indent=2),mimetype='application/json',headers={'Content-Disposition':f'attachment; filename="rotation-{rid}-report.json"','Cache-Control':'no-store'})
 
     @app.get('/api/admin/rotation-insights')
     @auth(admin=True)

@@ -4,6 +4,7 @@ import server
 from detectors import tick as detection_tick
 from ip_dns import run_binding, check_monitor, IntegrationError
 from rotation import tick as rotation_tick
+from rotation_insights import collect_reports
 
 def tick():
     with server.connect() as db:
@@ -27,4 +28,6 @@ if __name__=='__main__':
         try:rotation_tick(server.connect,server.CIPHER)
         except BlockingIOError:pass
         except Exception:print("VPS rotation: cycle failed",flush=True)
+        try:collect_reports(server.connect)
+        except Exception:print("Rotation report: collection failed",flush=True)
         time.sleep(5)
