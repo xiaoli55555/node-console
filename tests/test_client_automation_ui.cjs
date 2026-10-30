@@ -43,3 +43,8 @@ test('customer rotation setup exposes paired VPS, DNS record, interval and stric
  assert.match(html,/name="interval_minutes"[^>]*value="120"/);
  assert.match(html,/name="binding_id"/);
 });
+
+test('rotation analytics provide measurement and scoped integration controls',()=>{
+ const html=ctx.customerDnsSection({plan:{},monitor:{port:443}},[],7,[],{rotation:{primary_server_id:7,other_server_id:8,interval_s:3000,lead_s:120,active_name:'A',status:'ready'}},[{id:8,name:'B'}]);
+ for(const text of ['查看统计与建议','生成只读分析接口','撤销分析接口令牌','实际 DNS 观察节点','Cloudflare 代理记录'])assert.ok(html.includes(text),text);
+});
