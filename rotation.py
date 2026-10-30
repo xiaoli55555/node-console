@@ -203,7 +203,11 @@ def _failed_ip(db,sid,now):
         return bool(nodes) and len(rows)==len(nodes) and {str(x.get('node_id')) for x in rows}==set(map(str,nodes)) and all(x.get('state')=='unreachable' for x in rows)
     except (TypeError,ValueError,AttributeError):return False
 
-def _dns_switch(connect,cipher,rotation,now,emergency=False):
+def _offline(db,sid,now):
+    node=db.execute('SELECT seen FROM servers WHERE id=?',(sid,)).fetchone()
+    return not node or not node['seen'] or now-node['seen']>90
+
+def _dns_switch(connect,cipher,rotation,now,emergency=False,offline=False):
     with connect() as db:
         r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rotation,)).fetchone()
         if not r or not r['enabled']:return
@@ -214,7 +218,8 @@ def _dns_switch(connect,cipher,rotation,now,emergency=False):
         conn=load_connection(db,cipher,binding['connection_id'])
         target=r['other_server_id'] if r['active_server_id']==r['primary_server_id'] else r['primary_server_id']
         _validated_plan(db,target,r['owner_id'])
-        old_ip,port,_=_fresh_ip(db,r['active_server_id'],now,cipher)
+        if offline:old_ip,port=binding['expected_ip'],binding['port']
+        else:old_ip,port,_=_fresh_ip(db,r['active_server_id'],now,cipher)
         target_ip,target_port,_=_fresh_ip(db,target,now,cipher)
         if target_port!=port or target_ip==old_ip:raise IntegrationError('备用 VPS 端口或公网 IP 无效')
         last=db.execute('SELECT updated FROM detection_runs WHERE server_id=? ORDER BY id DESC LIMIT 1',(target,)).fetchone()
@@ -231,21 +236,30 @@ def _dns_switch(connect,cipher,rotation,now,emergency=False):
         except (TypeError,ValueError):ttl=300
         if ttl<=1:ttl=300
         if ttl>604800:raise IntegrationError('DNS TTL 超过 7 天，已停止轮换')
-        grace=0 if emergency else ttl+60
+        grace=0 if emergency and not offline else ttl+60
         update_dns_record(conn,binding,record,target_ip)
         updated=get_dns_record(conn,binding)
         expected=dict(binding,expected_ip=target_ip)
         validate_dns_record(updated,expected,conn)
         message=f"DNS 已从 {old_ip} 切换到 {target_ip}；等待旧 VPS #{r['active_server_id']} 连接降到阈值以下"
+        if offline:message=f'承载 VPS 离线，DNS 已从 {old_ip} 切到 {target_ip}；旧机等待恢复，未执行换 IP'
         db.execute('UPDATE dns_bindings SET expected_ip=?,status=?,updated=? WHERE id=?',(target_ip,message,now,binding['id']))
         db.execute("UPDATE vps_rotations SET active_server_id=?,phase='draining',drain_server_id=?,drain_started=?,drain_grace_s=?,old_ip=?,new_ip=NULL,action_started=NULL,last_sample_at=NULL,low_samples=0,status=?,next_switch_at=?,updated=? WHERE id=?",(target,r['active_server_id'],now,grace,old_ip,message,now+r['interval_s']-r['lead_s'],now,rotation))
-        db.execute('UPDATE vps_rotations SET emergency=?,low_samples=? WHERE id=?',(int(emergency),2 if emergency else 0,rotation))
+        db.execute('UPDATE vps_rotations SET emergency=?,low_samples=? WHERE id=?',(int(emergency and not offline),2 if emergency and not offline else 0,rotation))
         _event(db,rotation,r['active_server_id'],message,now)
 
 def _run_rotation(connect,cipher,rid,now):
     with connect() as db:
         r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
         if not r or not r['enabled']:return
+        if r['phase'] in ('active','draining') and _offline(db,r['active_server_id'],now):
+            target=r['other_server_id'] if r['active_server_id']==r['primary_server_id'] else r['primary_server_id']
+            if _offline(db,target,now):raise IntegrationError('当前机和备用机均离线，没有可用备用机；保持 DNS 并等待恢复')
+            last=db.execute('SELECT MAX(created) FROM detection_runs WHERE server_id=?',(target,)).fetchone()[0]
+            if last is None or now-last>=60:
+                db.execute('UPDATE detection_plans SET next_at=MIN(next_at,?) WHERE server_id=?',(now,target));db.commit()
+            _dns_switch(connect,cipher,rid,now,emergency=True,offline=True)
+            r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
         if r['phase'] in ('active','draining') and _failed_ip(db,r['active_server_id'],now):
             target=r['other_server_id'] if r['active_server_id']==r['primary_server_id'] else r['primary_server_id']
             if not _failed_ip(db,target,now):
