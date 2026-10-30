@@ -128,7 +128,8 @@ def finish(db,run,status,rows):
     if plan and plan['source_enabled'] and plan['source_id']==run['source_id'] and plan['nodes']==run['nodes'] and current and current['enabled'] and current['port']==run['port'] and (not current['current_ip'] or current['current_ip']==run['ip']):
         scheduled=bool(run['scheduled']) if 'scheduled' in run.keys() else False
         streak=plan['failure_streak']
-        if scheduled and plan['action_enabled'] and run['id']>plan['action_after_run']:
+        rotation_managed=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vps_rotations'").fetchone() and db.execute('SELECT 1 FROM vps_rotations WHERE enabled=1 AND (primary_server_id=? OR other_server_id=?)',(run['server_id'],run['server_id'])).fetchone()
+        if scheduled and plan['action_enabled'] and run['id']>plan['action_after_run'] and not rotation_managed:
             recovering=db.execute("SELECT 1 FROM detection_runs WHERE server_id=? AND action_status='verifying' LIMIT 1",(run['server_id'],)).fetchone()
             complete_failure=bool(rows) and (all(r.get('state')=='unreachable' for r in rows) or (recovering and all(r.get('state') in ('reachable','unreachable') for r in rows) and any(r.get('state')=='unreachable' for r in rows)))
             if complete_failure:
@@ -256,7 +257,8 @@ def execute_change_ip_actions(connect,cipher):
                 # Legacy reboot runs have no command link; leave their queue alone.
                 if p and p['response_mode']=='reboot':continue
                 db.execute("UPDATE detection_runs SET action_status='cancelled',action_result='换 IP 计划已移除或更换' WHERE id=?",(rid,));continue
-            valid=p['automatic'] and p['action_enabled'] and p['source_enabled'] and p['monitor_enabled'] and r['scheduled'] and r['id']>p['action_after_run'] and p['source_id']==r['source_id'] and p['nodes']==r['nodes'] and p['monitor_port']==r['port'] and p['action_connection_id']
+            rotation_managed=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vps_rotations'").fetchone() and db.execute('SELECT 1 FROM vps_rotations WHERE enabled=1 AND (primary_server_id=? OR other_server_id=?)',(r['server_id'],r['server_id'])).fetchone()
+            valid=not rotation_managed and p['automatic'] and p['action_enabled'] and p['source_enabled'] and p['monitor_enabled'] and r['scheduled'] and r['id']>p['action_after_run'] and p['source_id']==r['source_id'] and p['nodes']==r['nodes'] and p['monitor_port']==r['port'] and p['action_connection_id']
             if not valid:
                 db.execute("UPDATE detection_runs SET action_status='cancelled',action_result='监控或动作已暂停，或检测目标/计划已变更' WHERE id=?",(rid,));continue
             try:address=candidate_ip(db,{'server_id':r['server_id'],'source_id':db.execute('SELECT source_id FROM ip_monitors WHERE server_id=?',(r['server_id'],)).fetchone()[0]},cipher)

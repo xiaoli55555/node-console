@@ -39,7 +39,7 @@ test('admin-owned active automation renders locked instructions for customers',(
 
 test('customer rotation setup exposes paired VPS, DNS record, interval and strict TCP threshold',()=>{
  const html=ctx.customerDnsSection({plan:{},monitor:{port:23456,enabled:true}},[{id:11,rr:'edge',domain:'example.com',line:'default',expected_ip:'8.8.8.8',dns_provider:'cloudflare',customer_owned:true}],7,[],{rotation:null},[{id:8,name:'standby-vps'}]);
- for(const text of ['双 VPS 定时轮换','standby-vps','每台 VPS 承载时间（小时）','旧机连接数触发阈值（严格低于）','80','开启定时轮换','BOCE 复检'])assert.ok(html.includes(text),text);
- assert.match(html,/name="interval_hours"[^>]*value="2"/);
+ for(const text of ['双 VPS 定时轮换','standby-vps','每台 VPS 承载时间（分钟）','旧机连接数触发阈值（严格低于）','80','开启定时轮换','BOCE 复检'])assert.ok(html.includes(text),text);
+ assert.match(html,/name="interval_minutes"[^>]*value="120"/);
  assert.match(html,/name="binding_id"/);
 });
