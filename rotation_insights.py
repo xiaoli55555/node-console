@@ -154,6 +154,24 @@ def register(app,connect,auth,body,error,audit):
             rows=db.execute('SELECT id FROM vps_rotations ORDER BY id DESC LIMIT 100').fetchall()
             return jsonify(rotations=[summarize(db,r['id']) for r in rows])
 
+    @app.post('/api/admin/rotation-insights/<int:rid>/analysis-token')
+    @auth(admin=True)
+    def admin_analysis_token(rid):
+        with connect() as db:
+            if not db.execute('SELECT 1 FROM vps_rotations WHERE id=?',(rid,)).fetchone():return error('轮换计划不存在',404)
+            token=secrets.token_urlsafe(36)
+            db.execute('INSERT INTO rotation_analysis_tokens(rotation_id,token_hash,created) VALUES(?,?,?) ON CONFLICT(rotation_id) DO UPDATE SET token_hash=excluded.token_hash,created=excluded.created',(rid,digest(token),int(time.time())))
+            audit(db,'管理员生成轮换只读统计令牌 #'+str(rid))
+            return jsonify(token=token,path='/api/rotation-insights/'+str(rid),scope='read_only_statistics',message='仅本次显示；重新生成使旧令牌失效')
+
+    @app.delete('/api/admin/rotation-insights/<int:rid>/analysis-token')
+    @auth(admin=True)
+    def admin_revoke_analysis(rid):
+        with connect() as db:
+            if not db.execute('SELECT 1 FROM vps_rotations WHERE id=?',(rid,)).fetchone():return error('轮换计划不存在',404)
+            db.execute('DELETE FROM rotation_analysis_tokens WHERE rotation_id=?',(rid,));audit(db,'管理员撤销轮换统计令牌 #'+str(rid))
+        return jsonify(ok=True)
+
     @app.get('/api/client/servers/<int:sid>/rotation/insights')
     @auth()
     def insights(sid):
