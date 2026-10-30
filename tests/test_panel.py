@@ -483,9 +483,15 @@ class PanelTest(unittest.TestCase):
                 for i,(sid,_) in enumerate(nodes):
                     source=db.execute('SELECT source_id FROM detection_plans WHERE server_id=?',(sid,)).fetchone()[0]
                     db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details) VALUES(?,?,?,?,'[\"13\"]','所选检测点 TCP 可达',?,?,?)",(sid,source,ips[i],port,clock[0]-10,clock[0],json.dumps([{'node_id':'13','state':'reachable'}])))
+            with server.connect() as db:db.execute("UPDATE detection_plans SET response_mode='none',action_connection_id=NULL WHERE server_id=?",(nodes[1][0],))
+            with server.connect() as db:db.execute('UPDATE dns_bindings SET automatic=1 WHERE id=?',(binding_id,))
+            preflight=self.alice.post(f'/api/client/servers/{nodes[0][0]}/rotation/readiness',json={'other_server_id':nodes[1][0],'binding_id':binding_id},headers=headers)
+            self.assertEqual(preflight.status_code,200,preflight.json);self.assertTrue(preflight.json['ok'],preflight.json)
+            self.assertEqual(change.call_count,0);self.assertEqual(record['Value'],ips[0])
             config=self.alice.put(f'/api/client/servers/{nodes[0][0]}/rotation',json={'other_server_id':nodes[1][0],'binding_id':binding_id,'interval_s':7200,'connection_threshold':80,'enabled':True},headers=headers)
             self.assertEqual(config.status_code,200,config.json)
             self.assertEqual(config.json['rotation']['active_server_id'],nodes[0][0])
+            self.assertEqual(config.json['rotation']['next_switch_at'],clock[0]+7200-120)
             self.assertEqual(self.bob.get(f'/api/client/servers/{nodes[0][0]}/rotation').status_code,404)
             self.assertEqual(self.alice.patch(f'/api/client/dns-bindings/{binding_id}',json={'automatic':True},headers=headers).status_code,409)
             with server.connect() as db:db.execute('UPDATE vps_rotations SET next_switch_at=? WHERE binding_id=?',(clock[0]-1,binding_id))
