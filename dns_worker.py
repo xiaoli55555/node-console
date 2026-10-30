@@ -3,6 +3,7 @@ import time
 import server
 from detectors import tick as detection_tick
 from ip_dns import run_binding, check_monitor, IntegrationError
+from rotation import tick as rotation_tick
 
 def tick():
     with server.connect() as db:
@@ -23,4 +24,7 @@ if __name__=='__main__':
         except Exception:print('DNS worker: cycle failed',flush=True)
         try:detection_tick(server.connect,server.CIPHER)
         except Exception:print("Detection worker: cycle failed",flush=True)
+        try:rotation_tick(server.connect,server.CIPHER)
+        except BlockingIOError:pass
+        except Exception:print("VPS rotation: cycle failed",flush=True)
         time.sleep(5)
