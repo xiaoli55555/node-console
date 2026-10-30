@@ -517,6 +517,18 @@ class PanelTest(unittest.TestCase):
                 row=db.execute('SELECT * FROM vps_rotations').fetchone()
                 self.assertEqual(row['phase'],'active');self.assertEqual(row['active_server_id'],nodes[1][0]);self.assertIsNone(row['drain_server_id'])
             self.assertEqual(change.call_count,1)
+            # Active B fails before its timer: return DNS to healthy A, bypass B's 200 connections.
+            self.assertEqual(report(1,tcp=200).status_code,200)
+            with server.connect() as db:
+                source=db.execute('SELECT source_id FROM detection_plans WHERE server_id=?',(nodes[1][0],)).fetchone()[0]
+                db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details) VALUES(?,?,?,?,'[\"13\"]','国内不通',?,?,?)",(nodes[1][0],source,ips[1],port,clock[0],clock[0],json.dumps([{'node_id':'13','state':'unreachable'}])))
+            rotation.tick(server.connect,server.CIPHER)
+            with server.connect() as db:
+                row=db.execute('SELECT * FROM vps_rotations').fetchone()
+                self.assertEqual(row['active_server_id'],nodes[0][0])
+                self.assertEqual(row['phase'],'waiting_ip')
+                self.assertEqual(row['emergency'],1)
+            self.assertEqual(change.call_count,2)
             reassigned=self.admin.patch(f'/api/servers/{nodes[1][0]}',json={'owner_id':self.bob.get('/api/me').json['id']},headers={'X-CSRF-Token':self.tokens['admin']})
             self.assertEqual(reassigned.status_code,200,reassigned.json)
             with server.connect() as db:self.assertEqual(db.execute('SELECT COUNT(*) FROM vps_rotations').fetchone()[0],0)
