@@ -9,7 +9,7 @@ class RotationConditions(unittest.TestCase):
         self.tmp=tempfile.TemporaryDirectory();self.path=Path(self.tmp.name)/'test.db'
         rotation.initialize(self.connect)
         with self.connect() as db:
-            db.executescript('CREATE TABLE detection_runs(server_id INTEGER,created INTEGER);CREATE TABLE detection_plans(server_id INTEGER,next_at INTEGER);')
+            db.executescript('CREATE TABLE servers(id INTEGER,seen INTEGER);INSERT INTO servers VALUES(1,990);INSERT INTO servers VALUES(2,990);CREATE TABLE detection_runs(server_id INTEGER,created INTEGER);CREATE TABLE detection_plans(server_id INTEGER,next_at INTEGER);')
             db.execute("INSERT INTO vps_rotations(owner_id,primary_server_id,other_server_id,binding_id,active_server_id,enabled,phase,next_switch_at,updated,interval_s,lead_s) VALUES(1,1,2,1,1,1,'active',1000,900,120,20)")
             db.execute('INSERT INTO detection_runs VALUES(1,990)');db.execute('INSERT INTO detection_runs VALUES(2,990)')
     def tearDown(self):self.tmp.cleanup()
@@ -59,3 +59,14 @@ class RotationConditions(unittest.TestCase):
         with patch('rotation._failed_ip',return_value=True),patch('rotation._fresh_ip',return_value=('8.8.8.8',443,{})),patch('rotation._dns_switch') as switch:
             rotation._run_rotation(self.connect,None,1,950);switch.assert_not_called()
         self.assertEqual(self.row()['drain_server_id'],2);self.assertEqual(self.row()['emergency'],1)
+
+    def test_active_offline_uses_healthy_standby(self):
+        with self.connect() as db:db.execute('UPDATE servers SET seen=800 WHERE id=1')
+        with patch('rotation._dns_switch',side_effect=IntegrationError('simulated')) as switch:
+            with self.assertRaises(IntegrationError):rotation._run_rotation(self.connect,None,1,1000)
+            switch.assert_called_once_with(self.connect,None,1,1000,emergency=True,offline=True)
+    def test_both_offline_preserves_dns(self):
+        with self.connect() as db:db.execute('UPDATE servers SET seen=800')
+        with patch('rotation._dns_switch') as switch:
+            with self.assertRaisesRegex(IntegrationError,'均离线'):rotation._run_rotation(self.connect,None,1,1000)
+            switch.assert_not_called()
