@@ -19,3 +19,9 @@ test('admin rotation insights expose scoped token generation, copy and revoke',(
  assert.match(html,/&lt;node&gt;/);assert.match(html,/&lt;pending&gt;/);assert.doesNotMatch(html,/<node>/);
  assert.match(ctx.adminRotationInsightsMarkup([],[]),/尚无轮换任务/);
 });
+
+test('admin rotation manager renders creation and complete lifecycle controls',()=>{
+ const html=ctx.adminRotationsMarkup({rotations:[{id:5,primary_name:'<A>',other_name:'B',owner_role:'admin',enabled:1,active_name:'B',interval_s:3000,lead_s:120,offline_after_s:15,status:'ready'}]});
+ for(const text of ['创建双 VPS 轮换','data-rotation-edit="5"','data-rotation-toggle="5"','data-rotation-delete="5"','后台计划'])assert.ok(html.includes(text),text);
+ assert.match(html,/&lt;A&gt;/);assert.match(ctx.adminRotationsMarkup({rotations:[]}),/尚无轮换任务/);
+});
