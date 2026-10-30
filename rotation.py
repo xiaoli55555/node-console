@@ -72,6 +72,7 @@ def _rotation_json(db,row):
     data['other_name']=next((x['name'] for x in names if x['id']==data['other_server_id']),str(data['other_server_id']))
     active=db.execute('SELECT name FROM servers WHERE id=?',(data['active_server_id'],)).fetchone()
     data['active_name']=active['name'] if active else str(data['active_server_id'])
+    data['events']=[dict(e) for e in db.execute('SELECT server_id,message,created FROM vps_rotation_events WHERE rotation_id=? ORDER BY id DESC LIMIT 50',(data['id'],))]
     return data
 
 def _server_snapshot(db,sid,now,cipher):
@@ -437,6 +438,8 @@ def tick(connect,cipher):
                 with connect() as db:
                     after=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
                     record_progress(db,before,after,int(time.time()))
+                    if before and after and before["phase"]!=after["phase"]:
+                        _event(db,rid,after["drain_server_id"],after["status"],int(time.time()))
             except IntegrationError as e:
                 with connect() as db:
                     message='轮换暂缓：'+str(e);row=db.execute('SELECT status FROM vps_rotations WHERE id=?',(rid,)).fetchone()
