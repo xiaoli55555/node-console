@@ -70,3 +70,10 @@ class RotationConditions(unittest.TestCase):
         with patch('rotation._dns_switch') as switch:
             with self.assertRaisesRegex(IntegrationError,'均离线'):rotation._run_rotation(self.connect,None,1,1000)
             switch.assert_not_called()
+
+    def test_offline_threshold_is_short_and_configurable(self):
+        with self.connect() as db:
+            db.execute('UPDATE servers SET seen=985 WHERE id=1')
+            self.assertTrue(rotation._offline(db,1,1000,15))
+            self.assertFalse(rotation._offline(db,1,1000,20))
+            self.assertFalse(rotation._offline(db,2,1000,15))
