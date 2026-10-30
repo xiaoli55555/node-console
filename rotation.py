@@ -53,6 +53,8 @@ def initialize(connect):
 
         if 'lead_s' not in {r[1] for r in db.execute('PRAGMA table_info(vps_rotations)')}:db.execute('ALTER TABLE vps_rotations ADD COLUMN lead_s INTEGER NOT NULL DEFAULT 0')
 
+        if 'offline_after_s' not in {r[1] for r in db.execute('PRAGMA table_info(vps_rotations)')}:db.execute('ALTER TABLE vps_rotations ADD COLUMN offline_after_s INTEGER NOT NULL DEFAULT 15')
+
 def _owned_server(db,sid,uid):
     return db.execute('SELECT id,name,metrics,seen FROM servers WHERE id=? AND owner_id=?',(sid,uid)).fetchone()
 
@@ -99,8 +101,8 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
     @auth()
     def save_rotation(sid):
         if g.user['role']!='client':return error('此功能仅供客户账号使用',403)
-        d=body();other=d.get('other_server_id');binding_id=d.get('binding_id');interval=d.get('interval_s',7200);threshold=d.get('connection_threshold',80);enabled=d.get('enabled');lead=d.get('lead_s',min(120,interval//4) if type(interval)is int else 0)
-        if type(other)is not int or other==sid or type(binding_id)is not int or type(interval)is not int or not 60<=interval<=604800 or type(threshold)is not int or not 1<=threshold<=10000 or type(lead)is not int or not 0<=lead<interval or type(enabled)is not bool:return error('请检查备用 VPS、DNS 记录、轮换间隔、连接数阈值和开关')
+        d=body();other=d.get('other_server_id');binding_id=d.get('binding_id');interval=d.get('interval_s',7200);threshold=d.get('connection_threshold',80);enabled=d.get('enabled');offline_after=d.get('offline_after_s',15);lead=d.get('lead_s',min(120,interval//4) if type(interval)is int else 0)
+        if type(other)is not int or other==sid or type(binding_id)is not int or type(interval)is not int or not 60<=interval<=604800 or type(threshold)is not int or not 1<=threshold<=10000 or type(offline_after)is not int or not 10<=offline_after<=120 or type(lead)is not int or not 0<=lead<interval or type(enabled)is not bool:return error('请检查备用 VPS、DNS 记录、轮换间隔、连接数阈值和开关')
         now=int(time.time())
         try:
             with connect() as db:
@@ -135,7 +137,7 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
                     rid=rotation['id']
                 else:
                     rid=db.execute("INSERT INTO vps_rotations(owner_id,primary_server_id,other_server_id,binding_id,active_server_id,enabled,interval_s,connection_threshold,phase,next_switch_at,status,updated) VALUES(?,?,?,?,?,1,?,?,'active',?,'轮换已开启',?)",(g.user['id'],sid,other,binding_id,sid,interval,threshold,now+interval-lead,now)).lastrowid
-                db.execute('UPDATE vps_rotations SET lead_s=? WHERE id=?',(lead,rid))
+                db.execute('UPDATE vps_rotations SET lead_s=?,offline_after_s=? WHERE id=?',(lead,offline_after,rid))
                 audit(db,'配置双 VPS 定时轮换 #'+str(rid))
                 return jsonify(ok=True,rotation=_rotation_json(db,db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()))
         except IntegrationError as e:return error(str(e),409)
@@ -203,9 +205,9 @@ def _failed_ip(db,sid,now):
         return bool(nodes) and len(rows)==len(nodes) and {str(x.get('node_id')) for x in rows}==set(map(str,nodes)) and all(x.get('state')=='unreachable' for x in rows)
     except (TypeError,ValueError,AttributeError):return False
 
-def _offline(db,sid,now):
+def _offline(db,sid,now,timeout=15):
     node=db.execute('SELECT seen FROM servers WHERE id=?',(sid,)).fetchone()
-    return not node or not node['seen'] or now-node['seen']>90
+    return not node or not node['seen'] or now-node['seen']>=timeout
 
 def _dns_switch(connect,cipher,rotation,now,emergency=False,offline=False):
     with connect() as db:
@@ -252,9 +254,9 @@ def _run_rotation(connect,cipher,rid,now):
     with connect() as db:
         r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
         if not r or not r['enabled']:return
-        if r['phase'] in ('active','draining') and _offline(db,r['active_server_id'],now):
+        if r['phase'] in ('active','draining') and _offline(db,r['active_server_id'],now,r['offline_after_s']):
             target=r['other_server_id'] if r['active_server_id']==r['primary_server_id'] else r['primary_server_id']
-            if _offline(db,target,now):raise IntegrationError('当前机和备用机均离线，没有可用备用机；保持 DNS 并等待恢复')
+            if _offline(db,target,now,r['offline_after_s']):raise IntegrationError('当前机和备用机均离线，没有可用备用机；保持 DNS 并等待恢复')
             last=db.execute('SELECT MAX(created) FROM detection_runs WHERE server_id=?',(target,)).fetchone()[0]
             if last is None or now-last>=60:
                 db.execute('UPDATE detection_plans SET next_at=MIN(next_at,?) WHERE server_id=?',(now,target));db.commit()
