@@ -1,6 +1,6 @@
 # 轮换实测与只读分析接口
 
-更新后，在客户「自动换 IP 服务 → 主 VPS → 双 VPS 定时轮换」中选择「查看统计与建议」。管理员的 IP/DNS 页面也有「轮换统计与优化建议」。
+更新后，在客户「自动换 IP 服务 → 主 VPS → 双 VPS 定时轮换」中选择「查看统计与建议」。管理员可从「IP 监控与解析 → 轮换统计与优化建议」打开汇总，在每组轮换下直接生成、复制或撤销只读分析接口，无需切换客户账号。
 
 ## 已收集与未收集的数据
 
@@ -32,6 +32,8 @@
 | `POST /api/client/servers/{sid}/rotation/observers` | 创建观察节点；JSON 为 label、region、isp |
 | `DELETE /api/client/servers/{sid}/rotation/observers/{oid}` | 停用该轮换的观察节点 |
 | `GET /api/admin/rotation-insights` | 管理员查看轮换统计汇总 |
+| `POST /api/admin/rotation-insights/{rid}/analysis-token` | 管理员生成该组专用只读令牌 |
+| `DELETE /api/admin/rotation-insights/{rid}/analysis-token` | 管理员撤销该组令牌 |
 
 外部分析只允许：
 
