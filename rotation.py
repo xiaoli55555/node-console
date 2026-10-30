@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 from flask import g, jsonify
+from rotation_insights import record_switch, record_progress
 
 from detectors import boce_dns_gate
 from ip_dns import (
@@ -239,10 +240,12 @@ def _dns_switch(connect,cipher,rotation,now,emergency=False,offline=False):
         if ttl<=1:ttl=300
         if ttl>604800:raise IntegrationError('DNS TTL 超过 7 天，已停止轮换')
         grace=0 if emergency and not offline else ttl+60
+        submitted=int(time.time())
         update_dns_record(conn,binding,record,target_ip)
         updated=get_dns_record(conn,binding)
         expected=dict(binding,expected_ip=target_ip)
         validate_dns_record(updated,expected,conn)
+        record_switch(db,rotation,binding,old_ip,target_ip,submitted,int(time.time()),ttl,bool(record.get('proxied',False)))
         message=f"DNS 已从 {old_ip} 切换到 {target_ip}；等待旧 VPS #{r['active_server_id']} 连接降到阈值以下"
         if offline:message=f'承载 VPS 离线，DNS 已从 {old_ip} 切到 {target_ip}；旧机等待恢复，未执行换 IP'
         db.execute('UPDATE dns_bindings SET expected_ip=?,status=?,updated=? WHERE id=?',(target_ip,message,now,binding['id']))
@@ -384,7 +387,12 @@ def tick(connect,cipher):
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         with connect() as db:ids=[r[0] for r in db.execute('SELECT id FROM vps_rotations WHERE enabled=1 ORDER BY id')]
         for rid in ids:
-            try:_run_rotation(connect,cipher,rid,int(time.time()))
+            try:
+                with connect() as db:before=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
+                _run_rotation(connect,cipher,rid,int(time.time()))
+                with connect() as db:
+                    after=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
+                    record_progress(db,before,after,int(time.time()))
             except IntegrationError as e:
                 with connect() as db:
                     message='轮换暂缓：'+str(e);row=db.execute('SELECT status FROM vps_rotations WHERE id=?',(rid,)).fetchone()

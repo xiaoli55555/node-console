@@ -750,6 +750,9 @@ def ip_history(sid):
                        latest_observed=latest['observed'] if latest else None,total=count,has_more=more,
                        next_cursor=events[-1]['id'] if more else None)
 
+@app.get('/dns-observer.py')
+def dns_observer_download():return send_from_directory(ROOT/'probe','dns_observer.py',mimetype='text/x-python')
+
 @app.get('/agent-update.sh')
 def agent_updater_download(): return send_from_directory(ROOT/'agent','update.sh',mimetype='text/plain')
 
@@ -782,6 +785,9 @@ register_detectors(app,connect,CIPHER,auth,body,error,audit)
 from rotation import initialize as initialize_rotations, register as register_rotations
 initialize_rotations(connect)
 register_rotations(app,connect,CIPHER,auth,body,error,audit)
+from rotation_insights import initialize as initialize_insights, register as register_insights
+initialize_insights(connect)
+register_insights(app,connect,auth,body,error,audit)
 if __name__=='__main__':
     import argparse, getpass
     parser=argparse.ArgumentParser();parser.add_argument('command',choices=['admin','backup','entry']);parser.add_argument('target',nargs='?');args=parser.parse_args()
