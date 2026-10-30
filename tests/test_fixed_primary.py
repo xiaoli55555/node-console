@@ -27,7 +27,7 @@ class FixedPrimary(unittest.TestCase):
             db.execute("INSERT INTO vps_rotations(owner_id,primary_server_id,other_server_id,binding_id,active_server_id,enabled,phase,next_switch_at,updated,interval_s,mode,takeover_s,mobile_only_ack) VALUES(1,1,2,1,1,1,'active',1000,900,7200,'fixed_primary',600,1)")
         self.ips={1:'8.8.8.8',2:'1.1.1.1'};self.count=80;self.now=1000;self.failed=set()
         self.record={'content':self.ips[1],'ttl':60}
-        def fresh(db,sid,now,cipher):return self.ips[sid],443,{'connections_sampled':now,'tcp':999,'tcp_by_port':{'443':self.count}}
+        def fresh(db,sid,now,cipher):return self.ips[sid],443,{'connections_sampled':now,'tcp':self.count,'tcp_by_port':{'443':999}}
         self.patches=[patch('rotation._validated_plan',return_value={'action_connection_id':1}),patch('rotation._fresh_ip',side_effect=fresh),patch('rotation._failed_ip',side_effect=lambda db,sid,now:sid in self.failed),patch('rotation._fixed_failure',side_effect=lambda db,sid,now:sid in self.failed),patch('rotation._offline',return_value=False),patch('rotation.load_connection',return_value={'kind':'change_ip'}),patch('rotation.get_dns_record',side_effect=lambda *_:dict(self.record)),patch('rotation.validate_dns_record'),patch('rotation.update_dns_record',side_effect=lambda c,b,r,ip:self.record.update(content=ip)),patch('rotation.boce_dns_gate',side_effect=lambda db,sid,*args,**kwargs:'所选检测点不通' if sid in self.failed else None),patch('rotation.socket.create_connection',return_value=MagicMock()),patch('rotation.record_switch'),patch('rotation.invoke_change_ip_api',return_value='accepted')]
         self.mocks=[p.start() for p in self.patches];self.change=self.mocks[-1]
     def tearDown(self):
@@ -68,13 +68,13 @@ class FixedPrimary(unittest.TestCase):
         self.switch(1000);self.switch(1600);self.failed={2};self.count=100
         rotation._run_rotation(self.connect,None,1,1751)
         self.assertEqual(self.row()['low_samples'],0);self.change.assert_not_called()
-    def test_missing_or_stale_business_sample_never_treated_as_zero(self):
+    def test_missing_or_stale_TCP_sample_never_treated_as_zero(self):
         self.switch(1000);self.switch(1600)
-        with patch('rotation._fresh_ip',return_value=('1.1.1.1',443,{'tcp':0,'connections_sampled':1750})):
+        with patch('rotation._fresh_ip',return_value=('1.1.1.1',443,{'connections_sampled':1750})):
             rotation._run_rotation(self.connect,None,1,1751)
-        self.change.assert_not_called();self.assertIn('新版 agent',self.row()['status'])
+        self.change.assert_not_called();self.assertIn('TCP',self.row()['status'])
         for stamp in (1,2000):
-            with self.assertRaises(IntegrationError):rotation._business_count({'connections_sampled':stamp,'tcp_by_port':{}},443,1751)
+            with self.assertRaises(IntegrationError):rotation._rotation_tcp_count({'connections_sampled':stamp,'tcp':0},1751)
     def test_primary_refresh_only_after_confirmed_failure(self):
         self.failed={1}
         rotation._run_rotation(self.connect,None,1,1000)
@@ -161,6 +161,12 @@ class FixedPrimary(unittest.TestCase):
         self.record['content']='9.9.9.9'
         rotation._run_rotation(self.connect,None,1,1002)
         self.assertIn('外部',self.row()['status']);self.change.assert_not_called()
+    def test_existing_TCP_total_is_used_without_business_port_map(self):
+        self.assertEqual(rotation._rotation_tcp_count({'tcp':79,'connections_sampled':1000},1000),(79,1000))
+        self.assertEqual(rotation._rotation_tcp_count({'tcp':100,'tcp_by_port':{'443':0},'connections_sampled':1000},1000),(100,1000))
+        for invalid in (None,True,-1,1.5,'0'):
+            with self.subTest(value=invalid):
+                with self.assertRaises(IntegrationError):rotation._rotation_tcp_count({'tcp':invalid,'connections_sampled':1000},1000)
     def test_migration_keeps_old_mode_and_is_repeatable(self):
         rotation.initialize(self.connect)
         with self.connect() as db:

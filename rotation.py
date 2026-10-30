@@ -67,13 +67,12 @@ def _fixed(r):
     return r['mode']=='fixed_primary'
 
 
-def _business_count(metrics,port,now):
+def _rotation_tcp_count(metrics,now):
     stamp=metrics.get('connections_sampled')
-    counts=metrics.get('tcp_by_port')
-    if type(stamp)is not int or not 0<=now-stamp<=45 or not isinstance(counts,dict):
-        raise IntegrationError('等待新版 agent 的新鲜业务端口连接数；不会使用总 TCP 数代替')
-    count=counts.get(str(port),0)
-    if type(count)is not int or count<0:raise IntegrationError('业务端口连接数无效，暂停换 IP')
+    count=metrics.get('tcp')
+    if type(stamp)is not int or not 0<=now-stamp<=45:
+        raise IntegrationError('等待新鲜 TCP 已建立连接总数；采样缺失或过期，不会按 0 处理')
+    if type(count)is not int or count<0:raise IntegrationError('TCP 已建立连接总数无效，暂停换 IP')
     return count,stamp
 
 
@@ -193,7 +192,7 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
                 a=_server_snapshot(db,sid,now,cipher);b=_server_snapshot(db,other,now,cipher)
                 if a['port']!=b['port'] or a['port']!=binding['port']:return error('两台 VPS 的业务 TCP 检测端口必须相同')
                 if a['ip']==b['ip']:return error('两台 VPS 当前公网 IP 相同，不能进行轮换')
-                if mode=='fixed_primary':_business_count(b['metrics'],b['port'],now)
+                if mode=='fixed_primary':_rotation_tcp_count(b['metrics'],now)
                 if mode=='fixed_primary' and (not rotation or not rotation['enabled']) and (_pending_action(db,sid) or _pending_action(db,other)):return error('机器存在未完成的重启或换 IP 动作，完成核对后再启用固定主机模式',409)
                 active_ip=(a['ip'] if not rotation or rotation['active_server_id']==sid else b['ip'])
                 connection=load_connection(db,cipher,binding['connection_id'])
@@ -232,10 +231,12 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
             for target in (sid,other):
                 try:
                     _validated_plan(db,target,effective_uid);snap=_server_snapshot(db,target,now,cipher)
-                    if d.get('mode')=='fixed_primary' and target==other:_business_count(snap['metrics'],snap['port'],now)
+                    if d.get('mode')=='fixed_primary' and target==other:_rotation_tcp_count(snap['metrics'],now)
                     reason=boce_dns_gate(db,target,snap['ip'],snap['port'],require_plan=True)
                     if reason:raise IntegrationError(reason)
-                    checks.append({'name':'VPS #'+str(target),'ok':True,'message':'IP、TCP 上报、BOCE 和换 IP 动作（重启 / API）已就绪'})
+                    message='IP、TCP 上报、BOCE 和换 IP 动作（重启 / API）已就绪'
+                    if d.get('mode')=='fixed_primary' and target==other:message='使用现有 TCP 已建立连接总数；IP、所选检测点和换 IP 动作已就绪'
+                    checks.append({'name':'VPS #'+str(target),'ok':True,'message':message})
                 except IntegrationError as e:checks.append({'name':'VPS #'+str(target),'ok':False,'message':str(e)})
             backup=d.get('failover_server_id')
             if backup is not None:
@@ -589,7 +590,7 @@ def _run_rotation(connect,cipher,rid,now):
                 db.execute("UPDATE vps_rotations SET phase='waiting_probe',new_ip=?,action_started=COALESCE(action_started,?),status=?,updated=? WHERE id=?",(ip,now,'旧 VPS IP 已变化，等待 BOCE 复检',now,rid));return
             stamp=metrics.get('connections_sampled');count=metrics.get('tcp')
             if _fixed(r) and old==r['other_server_id']:
-                try:count,stamp=_business_count(metrics,port,now)
+                try:count,stamp=_rotation_tcp_count(metrics,now)
                 except IntegrationError as e:
                     db.execute('UPDATE vps_rotations SET status=?,updated=?,low_samples=0 WHERE id=?',(str(e),now,rid));return
 
