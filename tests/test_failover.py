@@ -39,7 +39,7 @@ class PrimaryFailover(unittest.TestCase):
         self.patches += [patch('rotation.load_connection',return_value={'kind':'alidns'}),patch('rotation.get_dns_record',side_effect=get),patch('rotation.update_dns_record',side_effect=update),patch('failover.load_connection',return_value={'kind':'alidns'}),patch('failover.get_dns_record',side_effect=get),patch('failover.update_dns_record',side_effect=update),patch('rotation.boce_dns_gate',side_effect=lambda db,sid,*args,**kw:None if self.health.get(sid) else 'selected nodes unreachable'),patch('rotation.socket.create_connection',return_value=MagicMock()),patch('rotation.invoke_change_ip_api',return_value='accepted')]
         self.mocks=[p.start() for p in self.patches[1:]]
         self.change=self.mocks[-1];self.write=self.mocks[5]
-        self.payload={'other_server_id':self.sid('B'),'binding_id':self.bindings['mobile'],'interval_s':7200,'takeover_s':600,'lead_s':0,'mode':'fixed_primary','mobile_only_ack':True,'enabled':True,'connection_threshold':80,'failover_server_id':self.sid('C'),'failover_binding_ids':list(self.bindings.values()),'failover_recovery_s':30}
+        self.payload={'other_server_id':self.sid('B'),'binding_id':self.bindings['mobile'],'interval_s':7200,'first_switch_at':self.clock[0]+7200,'takeover_s':600,'lead_s':0,'mode':'fixed_primary','mobile_only_ack':True,'enabled':True,'connection_threshold':80,'failover_server_id':self.sid('C'),'failover_binding_ids':list(self.bindings.values()),'failover_recovery_s':30}
         result=self.save();self.assertEqual(result.status_code,200,result.json)
         self.rid=result.json['rotation']['id']
     def tearDown(self):

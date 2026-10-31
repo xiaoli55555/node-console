@@ -38,14 +38,16 @@ class FixedPrimary(unittest.TestCase):
     def row(self):
         with self.connect() as db:return dict(db.execute('SELECT * FROM vps_rotations').fetchone())
     def switch(self,now):
-        with self.connect() as db:db.execute('UPDATE detection_runs SET updated=?,created=?',(now,now))
+        with self.connect() as db:
+            db.execute('UPDATE detection_runs SET updated=?,created=?',(now,now))
+            db.execute('UPDATE vps_rotations SET next_switch_at=?',(now,))
         rotation._dns_switch(self.connect,None,1,now)
     def test_takeover_return_drain_refresh_and_rejoin(self):
         self.switch(1000)
-        r=self.row();self.assertEqual(r['active_server_id'],2);self.assertEqual(r['phase'],'active');self.assertIsNone(r['drain_server_id']);self.assertEqual(r['next_switch_at'],1600)
+        r=self.row();self.assertEqual(r['active_server_id'],2);self.assertEqual(r['phase'],'active');self.assertIsNone(r['drain_server_id']);self.assertEqual(r['next_switch_at'],8200)
         self.change.assert_not_called()
         self.switch(1600)
-        r=self.row();self.assertEqual(r['active_server_id'],1);self.assertEqual(r['drain_server_id'],2);self.assertEqual(r['phase'],'draining');self.assertEqual(r['next_switch_at'],8200)
+        r=self.row();self.assertEqual(r['active_server_id'],1);self.assertEqual(r['drain_server_id'],2);self.assertEqual(r['phase'],'draining');self.assertEqual(r['next_switch_at'],1600)
         rotation._run_rotation(self.connect,None,1,1700);self.change.assert_not_called() # TTL grace
         rotation._run_rotation(self.connect,None,1,1721);self.assertEqual(self.row()['low_samples'],0) # 80 not <80
         self.count=79
@@ -55,19 +57,20 @@ class FixedPrimary(unittest.TestCase):
         rotation._run_rotation(self.connect,None,1,1751);self.change.assert_called_once();self.assertEqual(self.change.call_args.args[1],2)
         self.ips[2]='9.9.9.9'
         rotation._run_rotation(self.connect,None,1,1760)
-        rotation._run_rotation(self.connect,None,1,1770)
-        self.assertEqual(self.row()['phase'],'active');self.assertEqual(self.row()['next_switch_at'],8200)
-        self.assertEqual(self.record['content'],'8.8.8.8');self.assertEqual(self.ips[1],'8.8.8.8')
+        self.refresh(1770);rotation._run_rotation(self.connect,None,1,1770)
+        self.assertEqual(self.row()['phase'],'active');self.assertEqual(self.row()['next_switch_at'],8970)
+        self.assertEqual(self.row()['active_server_id'],2)
+        self.assertEqual(self.record['content'],'9.9.9.9');self.assertEqual(self.ips[1],'8.8.8.8')
         with self.connect() as db:self.assertEqual(db.execute('SELECT status FROM dns_bindings WHERE id=2').fetchone()[0],'untouched telecom')
     def test_failed_primary_does_not_force_scheduled_return(self):
         self.switch(1000)
         with patch('rotation.boce_dns_gate',return_value='unreachable'):
             with self.assertRaises(IntegrationError):self.switch(1600)
         self.assertEqual(self.row()['active_server_id'],2);self.assertEqual(self.record['content'],'1.1.1.1');self.change.assert_not_called()
-    def test_failed_rotation_vps_still_waits_for_threshold(self):
-        self.switch(1000);self.switch(1600);self.failed={2};self.count=100
+    def test_failed_rotation_vps_skips_normal_TCP_threshold(self):
+        self.switch(1000);self.switch(1600);self.failed={2};self.count=100;self.refresh(1751)
         rotation._run_rotation(self.connect,None,1,1751)
-        self.assertEqual(self.row()['low_samples'],0);self.change.assert_not_called()
+        self.change.assert_called_once();self.assertEqual(self.change.call_args.args[1],2)
     def test_missing_or_stale_TCP_sample_never_treated_as_zero(self):
         self.switch(1000);self.switch(1600)
         with patch('rotation._fresh_ip',return_value=('1.1.1.1',443,{'connections_sampled':1750})):
@@ -96,6 +99,15 @@ class FixedPrimary(unittest.TestCase):
         rotation._run_rotation(self.connect,None,1,1766);self.change.assert_not_called()
     def refresh(self,now):
         with self.connect() as db:db.execute('UPDATE detection_runs SET updated=?,created=?',(now,now))
+    def test_failed_B_API_retry_does_not_wait_for_normal_TCP_threshold(self):
+        self.switch(1000);self.switch(1600);self.failed={2};self.count=50000
+        self.refresh(1751)
+        rotation._run_rotation(self.connect,None,1,1751)
+        self.change.assert_called_once()
+        self.refresh(1812)
+        rotation._run_rotation(self.connect,None,1,1812)
+        self.assertEqual(self.change.call_count,2)
+        self.assertEqual(self.row()['phase'],'waiting_ip')
     def test_A_failure_reclaims_B_before_B_action_is_submitted(self):
         self.switch(1000);self.switch(1600);self.failed={1};self.count=200
         self.refresh(1650)
@@ -107,7 +119,7 @@ class FixedPrimary(unittest.TestCase):
         self.switch(1000);self.failed={2};self.refresh(1100)
         rotation._run_rotation(self.connect,None,1,1100)
         self.assertEqual(self.row()['active_server_id'],1)
-        self.assertEqual(self.row()['drain_server_id'],2);self.change.assert_not_called()
+        self.assertEqual(self.row()['drain_server_id'],2);self.change.assert_called_once();self.assertEqual(self.change.call_args.args[1],2)
     def test_A_failure_during_B_action_finishes_B_before_repairing_A(self):
         self.switch(1000);self.switch(1600)
         with self.connect() as db:db.execute("UPDATE vps_rotations SET phase='waiting_ip',old_ip='1.1.1.1',action_started=1600")
@@ -115,7 +127,7 @@ class FixedPrimary(unittest.TestCase):
         rotation._run_rotation(self.connect,None,1,1700)
         self.assertEqual(self.row()['phase'],'waiting_probe');self.change.assert_not_called()
         self.refresh(1710);rotation._run_rotation(self.connect,None,1,1710)
-        self.assertEqual(self.row()['phase'],'active');self.change.assert_not_called()
+        self.assertEqual(self.row()['phase'],'draining');self.change.assert_not_called()
         self.refresh(1711);rotation._run_rotation(self.connect,None,1,1711)
         self.assertEqual(self.record['content'],'9.9.9.9')
         self.change.assert_called_once();self.assertEqual(self.change.call_args.args[1],1)
@@ -124,13 +136,10 @@ class FixedPrimary(unittest.TestCase):
         rotation._run_rotation(self.connect,None,1,1730)
         rotation._run_rotation(self.connect,None,1,1745)
         self.change.assert_not_called();self.assertIn('暂缓',self.row()['status'])
-    def test_both_failed_keeps_threshold_and_repairs_only_one_machine(self):
+    def test_both_failed_repairs_one_machine_without_waiting_for_TCP_threshold(self):
         self.failed={1,2};self.count=200
         rotation._run_rotation(self.connect,None,1,1000)
-        rotation._run_rotation(self.connect,None,1,1010);self.change.assert_not_called()
-        self.count=0;self.refresh(1025)
-        rotation._run_rotation(self.connect,None,1,1025)
-        self.refresh(1040);rotation._run_rotation(self.connect,None,1,1040)
+        rotation._run_rotation(self.connect,None,1,1010)
         self.change.assert_called_once();self.assertEqual(self.change.call_args.args[1],2)
     def test_pending_reboot_on_target_blocks_switch_even_if_TCP_works(self):
         with self.connect() as db:
@@ -167,6 +176,36 @@ class FixedPrimary(unittest.TestCase):
         for invalid in (None,True,-1,1.5,'0'):
             with self.subTest(value=invalid):
                 with self.assertRaises(IntegrationError):rotation._rotation_tcp_count({'tcp':invalid,'connections_sampled':1000},1000)
+    def test_paused_schedule_keeps_fault_DNS_failover_without_periodic_actions(self):
+        with self.connect() as db:db.execute('UPDATE vps_rotations SET enabled=0')
+        rotation._run_rotation(self.connect,None,1,1000)
+        self.assertEqual(self.record['content'],'8.8.8.8')
+        self.failed={1}
+        rotation._run_rotation(self.connect,None,1,1000)
+        self.assertEqual(self.record['content'],'1.1.1.1')
+        self.assertEqual(self.row()['enabled'],0);self.change.assert_called_once()
+        self.assertEqual(self.change.call_args.args[1],1)
+    def test_B_duration_then_A_bridge_then_immediate_B_return_ignores_A_count(self):
+        def fresh(db,sid,now,cipher):
+            return self.ips[sid],443,{'connections_sampled':now,'tcp':50000 if sid==1 else self.count}
+        with patch('rotation._fresh_ip',side_effect=fresh):
+            self.switch(1000);self.assertEqual(self.row()['next_switch_at'],8200)
+            self.refresh(8199);rotation._run_rotation(self.connect,None,1,8199)
+            self.assertEqual(self.row()['active_server_id'],2)
+            self.refresh(8200);rotation._run_rotation(self.connect,None,1,8200)
+            self.assertEqual(self.row()['active_server_id'],1);self.change.assert_not_called()
+            self.refresh(8321);rotation._run_rotation(self.connect,None,1,8321)
+            self.change.assert_not_called()
+            self.count=79
+            self.refresh(8336);rotation._run_rotation(self.connect,None,1,8336)
+            self.refresh(8351);rotation._run_rotation(self.connect,None,1,8351)
+            self.change.assert_called_once();self.assertEqual(self.change.call_args.args[1],2)
+            self.ips[2]='9.9.9.9';self.refresh(8360)
+            rotation._run_rotation(self.connect,None,1,8360)
+            self.refresh(8370);rotation._run_rotation(self.connect,None,1,8370)
+            self.assertEqual(self.row()['active_server_id'],2)
+            self.assertEqual(self.row()['next_switch_at'],15570)
+            self.assertEqual(self.record['content'],'9.9.9.9')
     def test_migration_keeps_old_mode_and_is_repeatable(self):
         rotation.initialize(self.connect)
         with self.connect() as db:

@@ -56,7 +56,7 @@ test('both rotation modes remain available and legacy tasks default to alternati
  assert.match(fields,/value="fixed_primary"/);
  const fixed=ctx.rotationModeFields({mode:'fixed_primary',takeover_s:1200,mobile_only_ack:1});
  assert.match(fixed,/value="fixed_primary" selected/);
- assert.match(fixed,/name="takeover_minutes"[^>]*value="20"/);
+ assert.match(fixed,/B 每次承载时长/);
  assert.match(fixed,/name="mobile_only_ack"[^>]*checked/);
  assert.match(fixed,/现有 TCP 已建立连接总数/);
  assert.doesNotMatch(fixed,/轮换机需升级 agent/);

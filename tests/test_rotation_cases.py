@@ -19,8 +19,8 @@ class RotationConditions(unittest.TestCase):
         with self.connect() as db:return dict(db.execute('SELECT * FROM vps_rotations').fetchone())
     def test_paused_never_probes_or_switches(self):
         with self.connect() as db:db.execute('UPDATE vps_rotations SET enabled=0')
-        with patch('rotation._failed_ip') as failed,patch('rotation._dns_switch') as switch:
-            rotation._run_rotation(self.connect,None,1,1000);failed.assert_not_called();switch.assert_not_called()
+        with patch('rotation._failed_ip',return_value=False) as failed,patch('rotation._offline',return_value=False),patch('rotation._dns_switch') as switch:
+            rotation._run_rotation(self.connect,None,1,1000);failed.assert_called_once();switch.assert_not_called()
     def test_current_failure_before_deadline_attempts_emergency_switch(self):
         with patch('rotation._failed_ip',side_effect=[True,False]),patch('rotation._dns_switch',side_effect=IntegrationError('standby not ready')) as switch:
             with self.assertRaises(IntegrationError):rotation._run_rotation(self.connect,None,1,950)

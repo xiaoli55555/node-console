@@ -57,7 +57,7 @@ def initialize(connect):
 
         if 'offline_after_s' not in {r[1] for r in db.execute('PRAGMA table_info(vps_rotations)')}:db.execute('ALTER TABLE vps_rotations ADD COLUMN offline_after_s INTEGER NOT NULL DEFAULT 15')
         columns={r[1] for r in db.execute('PRAGMA table_info(vps_rotations)')}
-        for name,definition in [('mode',"TEXT NOT NULL DEFAULT 'alternating'"),('takeover_s','INTEGER NOT NULL DEFAULT 600'),('first_switch_at','INTEGER'),('mobile_only_ack','INTEGER NOT NULL DEFAULT 0'),('dns_intent','TEXT')]:
+        for name,definition in [('mode',"TEXT NOT NULL DEFAULT 'alternating'"),('takeover_s','INTEGER NOT NULL DEFAULT 600'),('first_switch_at','INTEGER'),('mobile_only_ack','INTEGER NOT NULL DEFAULT 0'),('dns_intent','TEXT'),('fault_recovery','INTEGER NOT NULL DEFAULT 0')]:
             if name not in columns:db.execute(f'ALTER TABLE vps_rotations ADD COLUMN {name} {definition}')
         failover.initialize(db)
 
@@ -168,7 +168,7 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
                 takeover=d.get('takeover_s',rotation['takeover_s'] if rotation else 600)
                 first=d.get('first_switch_at',rotation['first_switch_at'] if rotation else None)
                 ack=d.get('mobile_only_ack',bool(rotation['mobile_only_ack']) if rotation else False)
-                if mode not in ('alternating','fixed_primary') or type(takeover)is not int or not 60<=takeover<=604800 or (mode=='fixed_primary' and takeover>=interval) or (first is not None and (type(first)is not int or not 0<=first<=253402300799)) or type(ack)is not bool:
+                if mode not in ('alternating','fixed_primary') or type(takeover)is not int or not 60<=takeover<=604800 or (first is not None and (type(first)is not int or not 0<=first<=253402300799)) or type(ack)is not bool:
                     return error('请检查轮换模式、接替时长（必须短于周期）和首次切入时间')
                 if mode=='fixed_primary' and not ack:return error('请确认所选记录仅服务移动线路，或为移动专用域名；不可选择所有运营商共用记录')
                 if rotation and mode!=rotation['mode'] and (rotation['enabled'] or rotation['phase']!='active' or rotation['active_server_id']!=sid or rotation['dns_intent']):
@@ -208,8 +208,8 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
                 db.execute('UPDATE vps_rotations SET lead_s=?,offline_after_s=? WHERE id=?',(lead,offline_after,rid))
                 db.execute('UPDATE vps_rotations SET mode=?,takeover_s=?,first_switch_at=?,mobile_only_ack=? WHERE id=?',(mode,takeover,first,int(ack),rid))
                 if mode=='fixed_primary' and (not rotation or not rotation['enabled'] or rotation['mode']!=mode):
-                    due=first if first and first>now else now+interval
-                    if rotation and rotation['active_server_id']==other:due=now+takeover
+                    due=first if first and first>now else now
+                    if rotation and rotation['active_server_id']==other:due=now+interval
                     db.execute('UPDATE vps_rotations SET next_switch_at=?,lead_s=0 WHERE id=?',(due,rid))
                 elif mode=='fixed_primary':
                     db.execute('UPDATE vps_rotations SET next_switch_at=?,lead_s=0 WHERE id=?',(rotation['next_switch_at'],rid))
@@ -267,7 +267,11 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
             if not _owned_server(db,sid,g.user['id']):return error('服务器不存在',404)
             rotation=db.execute('SELECT * FROM vps_rotations WHERE primary_server_id=? AND (? OR owner_id=?)',(sid,int(g.user['role']=='admin'),g.user['id'])).fetchone()
             if not rotation:return error('轮换计划不存在',404)
-            if rotation['enabled'] or rotation['phase']!='active' or rotation['dns_intent'] or db.execute('SELECT 1 FROM vps_failover_leases WHERE rotation_id=?',(rotation['id'],)).fetchone():return error('请先暂停轮换；正在排空或换 IP 的流程完成后才能删除',409)
+            if rotation['enabled']:return error('请先暂停轮换再删除',409)
+            if rotation['dns_intent']:return error('DNS 写入结果待核对，请确认实际解析后再删除',409)
+            if db.execute('SELECT 1 FROM vps_failover_leases WHERE rotation_id=?',(rotation['id'],)).fetchone():return error('C 正在接替解析，请等待安全切回 A 后再删除',409)
+            if rotation['phase'] not in ('active','draining') or rotation['action_started'] is not None:return error('换 IP 动作已发出，需完成状态核对后再删除',409)
+            if any(_pending_action(db,target) for target in (rotation['primary_server_id'],rotation['other_server_id'])):return error('服务器仍有未完成的重启或换 IP 动作，请核对后再删除',409)
             failover.stop_probe(db,rotation['id'],remove=True)
             db.execute('DELETE FROM vps_rotations WHERE id=?',(rotation['id'],));audit(db,'删除双 VPS 轮换计划 #'+str(rotation['id']))
         return jsonify(ok=True)
@@ -370,7 +374,7 @@ def _fixed_action_safe(db,cipher,r,old,now):
 
 def _begin_fixed_repair(db,cipher,r,sid,now,message):
     ip,_,_=_fresh_ip(db,sid,now,cipher)
-    emergency=int(sid==r['primary_server_id'])
+    emergency=1
     db.execute("UPDATE vps_rotations SET phase='draining',drain_server_id=?,drain_started=?,drain_grace_s=0,old_ip=?,new_ip=NULL,action_started=NULL,last_sample_at=NULL,low_samples=?,emergency=?,status=?,updated=? WHERE id=?",(sid,now,ip,2 if emergency else 0,emergency,message,now,r['id']))
     _event(db,r['id'],sid,message,now)
 
@@ -394,7 +398,7 @@ def _reconcile_fixed_dns(connect,cipher,rid,now):
         normal_takeover=target==r['other_server_id'] and not _fixed_failure(db,r['primary_server_id'],now)
         emergency=int(target==r['other_server_id'] and not normal_takeover)
         phase='active' if normal_takeover else 'draining'
-        delay=r['takeover_s'] if target==r['other_server_id'] else r['interval_s']-r['takeover_s']
+        delay=r['interval_s'] if target==r['other_server_id'] else 0
         message='已回读确认此前 DNS 切换结果，恢复固定主机协调流程'
         record_switch(db,rid,binding,intent['from'],intent['to'],intent['submitted'],now,ttl,bool(record.get('proxied',False)))
         db.execute('UPDATE dns_bindings SET expected_ip=?,status=?,updated=? WHERE id=?',(intent['to'],message,now,binding['id']))
@@ -461,7 +465,7 @@ def _offline(db,sid,now,timeout=15):
 def _dns_switch(connect,cipher,rotation,now,emergency=False,offline=False):
     with connect() as db:
         r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rotation,)).fetchone()
-        if not r or not r['enabled']:return
+        if not r or (not r['enabled'] and not emergency):return
         if not emergency and (r['phase']!='active' or r['next_switch_at']>now):return
         if emergency and r['phase'] in ('waiting_ip','waiting_probe'):raise IntegrationError('备用机正在换 IP 或复检，暂不能安全切回')
         binding=db.execute('SELECT * FROM dns_bindings WHERE id=?',(r['binding_id'],)).fetchone()
@@ -504,21 +508,40 @@ def _dns_switch(connect,cipher,rotation,now,emergency=False,offline=False):
         message=f"DNS 已从 {old_ip} 切换到 {target_ip}；等待旧 VPS #{r['active_server_id']} 连接降到阈值以下"
         if offline:message=f'承载 VPS 离线，DNS 已从 {old_ip} 切到 {target_ip}；旧机等待恢复，未执行换 IP'
         db.execute('UPDATE dns_bindings SET expected_ip=?,status=?,updated=? WHERE id=?',(target_ip,message,now,binding['id']))
+        db.execute('UPDATE detection_plans SET next_at=MIN(next_at,?) WHERE server_id=?',(now,target))
         if _fixed(r) and target==r['other_server_id'] and not _fixed_failure(db,r['primary_server_id'],now):
             # Scheduled takeover never drains or refreshes the fixed primary.
             message=f'移动解析已切入轮换 VPS #{target}；主 VPS 保持原 IP；到时切回主 VPS'
-            db.execute("UPDATE vps_rotations SET active_server_id=?,phase='active',drain_server_id=NULL,emergency=0,status=?,next_switch_at=?,updated=? WHERE id=?",(target,message,now+r['takeover_s'],now,rotation))
+            db.execute("UPDATE vps_rotations SET active_server_id=?,phase='active',drain_server_id=NULL,emergency=0,status=?,next_switch_at=?,updated=? WHERE id=?",(target,message,now+r['interval_s'],now,rotation))
             db.execute('UPDATE dns_bindings SET status=? WHERE id=?',(message,binding['id']))
             _event(db,rotation,target,message,now)
             return
         db.execute("UPDATE vps_rotations SET active_server_id=?,phase='draining',drain_server_id=?,drain_started=?,drain_grace_s=?,old_ip=?,new_ip=NULL,action_started=NULL,last_sample_at=NULL,low_samples=0,status=?,next_switch_at=?,updated=? WHERE id=?",(target,r['active_server_id'],now,grace,old_ip,message,now+r['interval_s']-r['lead_s'],now,rotation))
         db.execute('UPDATE vps_rotations SET emergency=?,low_samples=? WHERE id=?',(int(emergency and not offline),2 if emergency and not offline else 0,rotation))
         if _fixed(r):
-            delay=r['takeover_s'] if target==r['other_server_id'] else r['interval_s']-r['takeover_s']
+            delay=r['interval_s'] if target==r['other_server_id'] else 0
             db.execute('UPDATE vps_rotations SET next_switch_at=? WHERE id=?',(now+delay,rotation))
-            if r['active_server_id']==r['other_server_id']:
+            if r['active_server_id']==r['other_server_id'] and not (emergency and not offline):
                 db.execute('UPDATE vps_rotations SET emergency=0,low_samples=0,drain_grace_s=? WHERE id=?',(ttl+60,rotation))
+        if emergency:db.execute('UPDATE vps_rotations SET fault_recovery=1 WHERE id=?',(rotation,))
         _event(db,rotation,r['active_server_id'],message,now)
+
+def _paused_failover(connect,cipher,rid,now):
+    with connect() as db:
+        r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
+        if not r or r['enabled']:return
+        if r['dns_intent']:
+            db.commit();_reconcile_fixed_dns(connect,cipher,rid,now);return
+        current=r['active_server_id']
+        offline=_offline(db,current,now,r['offline_after_s'])
+        failed=_fixed_failure(db,current,now) if _fixed(r) else _failed_ip(db,current,now)
+        if not offline and not failed:return
+        target=r['other_server_id'] if current==r['primary_server_id'] else r['primary_server_id']
+        _request_probe(db,target,now)
+        db.commit()
+        _fixed_ready(db,cipher,r,target,now)
+        _dns_switch(connect,cipher,rid,now,emergency=True,offline=offline)
+
 
 def db_failover_active(connect,rid):
     with connect() as db:return bool(db.execute('SELECT 1 FROM vps_failover_leases WHERE rotation_id=?',(rid,)).fetchone())
@@ -529,11 +552,15 @@ def _run_rotation(connect,cipher,rid,now):
         current=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
     if current and (current['enabled'] or current['failover_server_id'] or db_failover_active(connect,rid)):
         if failover.step(connect,cipher,rid,now):return
+    if current and not current['enabled']:
+        _paused_failover(connect,cipher,rid,now)
+        with connect() as db:current=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
+        if not current or not current['fault_recovery']:return
     if current and current['enabled'] and _fixed(current):
         if _coordinate_fixed(connect,cipher,rid,now):return
     with connect() as db:
         r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
-        if not r or not r['enabled']:return
+        if not r or (not r['enabled'] and not r['fault_recovery']):return
         if not _fixed(r) and r['phase'] in ('active','draining') and _offline(db,r['active_server_id'],now,r['offline_after_s']):
             target=r['other_server_id'] if r['active_server_id']==r['primary_server_id'] else r['primary_server_id']
             if _offline(db,target,now,r['offline_after_s']):raise IntegrationError('当前机和备用机均离线，没有可用备用机；保持 DNS 并等待恢复')
@@ -552,7 +579,7 @@ def _run_rotation(connect,cipher,rid,now):
                 _dns_switch(connect,cipher,rid,now,emergency=True)
                 r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
         if r['phase']=='active':
-            if _fixed(r):return
+            if _fixed(r) or not r['enabled']:return
             standby=r['other_server_id'] if r['active_server_id']==r['primary_server_id'] else r['primary_server_id']
             if _failed_ip(db,standby,now):
                 address,_,_=_fresh_ip(db,standby,now,cipher)
@@ -577,7 +604,7 @@ def _run_rotation(connect,cipher,rid,now):
                 reason=boce_dns_gate(db,old,address,port,require_plan=True)
                 if reason:raise IntegrationError('等待主 VPS 恢复确认：'+reason)
                 db.execute("UPDATE vps_rotations SET phase='active',drain_server_id=NULL,emergency=0,next_switch_at=?,status=?,updated=? WHERE id=?",(now,'主 VPS 已恢复且保持原 IP，准备切回移动解析',now,rid));return
-            if not _fixed(r) and not r['emergency'] and _failed_ip(db,old,now):
+            if not r['emergency'] and (_fixed_failure(db,old,now) if _fixed(r) else _failed_ip(db,old,now)):
                 db.execute('UPDATE vps_rotations SET emergency=1,low_samples=2,drain_grace_s=0 WHERE id=?',(rid,))
                 r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
             try:_validated_plan(db,old,r['owner_id'])
@@ -590,7 +617,7 @@ def _run_rotation(connect,cipher,rid,now):
             if ip!=r['old_ip']:
                 db.execute("UPDATE vps_rotations SET phase='waiting_probe',new_ip=?,action_started=COALESCE(action_started,?),status=?,updated=? WHERE id=?",(ip,now,'旧 VPS IP 已变化，等待 BOCE 复检',now,rid));return
             stamp=metrics.get('connections_sampled');count=metrics.get('tcp')
-            if _fixed(r) and old==r['other_server_id']:
+            if _fixed(r) and old==r['other_server_id'] and not r['emergency']:
                 try:count,stamp=_rotation_tcp_count(metrics,now)
                 except IntegrationError as e:
                     db.execute('UPDATE vps_rotations SET status=?,updated=?,low_samples=0 WHERE id=?',(str(e),now,rid));return
@@ -641,7 +668,7 @@ def _run_rotation(connect,cipher,rid,now):
                 try:_fixed_action_safe(db,cipher,r,old,now)
                 except IntegrationError as e:
                     db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('换 IP 暂缓：'+str(e),now,rid));return
-            if _fixed(r) and old==r['other_server_id']:
+            if _fixed(r) and old==r['other_server_id'] and not r['emergency']:
                 db.execute("UPDATE vps_rotations SET phase='draining',emergency=0,low_samples=0,last_sample_at=NULL,action_started=NULL,status=?,updated=? WHERE id=?",('未观察到 IP 变化；重新确认轮换机连接数后再重试',now,rid));return
             action=load_connection(db,cipher,plan['action_connection_id']) if plan and plan['action_connection_id'] else None
             server=db.execute('SELECT name FROM servers WHERE id=?',(old,)).fetchone()
@@ -659,7 +686,7 @@ def _run_rotation(connect,cipher,rid,now):
             if reason:
                 if (_fixed_failure(db,old,now) if _fixed(r) else _failed_ip(db,old,now)):
                     db.execute("UPDATE vps_rotations SET phase='draining',old_ip=?,emergency=1,low_samples=2,drain_grace_s=0,action_started=NULL,status=?,updated=? WHERE id=?",(ip,'新 IP 国内探测仍不通，继续换 IP',now,rid))
-                    if _fixed(r) and old==r['other_server_id']:db.execute('UPDATE vps_rotations SET emergency=0,low_samples=0,last_sample_at=NULL WHERE id=?',(rid,))
+
                 else:db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('新 IP 尚未通过 BOCE 复检：'+reason,now,rid))
                 return
             try:
@@ -667,10 +694,15 @@ def _run_rotation(connect,cipher,rid,now):
             except OSError:
                 db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('BOCE 已通过，但新 IP 业务端口仍不可达',now,rid));return
             next_at=r['next_switch_at'] if r['next_switch_at']>now else now+max(60,r['interval_s']-r['lead_s'])
-            if _fixed(r) and old==r['primary_server_id']:next_at=min(r['next_switch_at'],now)
+            if _fixed(r):next_at=now
             message=f'旧 VPS #{old} 已换到 {ip}，业务端口及 BOCE 复检通过；已重新加入轮换'
             db.execute("UPDATE vps_rotations SET phase='active',emergency=0,drain_server_id=NULL,drain_started=NULL,drain_grace_s=0,old_ip=NULL,new_ip=NULL,action_started=NULL,last_sample_at=NULL,low_samples=0,next_switch_at=?,status=?,updated=? WHERE id=?",(next_at,message,now,rid))
-            _event(db,rid,old,message,now);return
+            db.execute('UPDATE vps_rotations SET fault_recovery=0 WHERE id=?',(rid,))
+            _event(db,rid,old,message,now)
+            if _fixed(r) and old==r['other_server_id'] and r['enabled'] and r['active_server_id']==r['primary_server_id']:
+                db.commit()
+                _dns_switch(connect,cipher,rid,now,emergency=_fixed_failure(db,r['primary_server_id'],now))
+            return
         else:
             db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('轮换状态异常，请暂停后检查',now,rid));return
     try:
@@ -698,7 +730,7 @@ def tick(connect,cipher):
     path=Path(db_path).with_suffix('.rotation.lock')
     with open(str(path),'a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        with connect() as db:ids=[r[0] for r in db.execute('SELECT id FROM vps_rotations WHERE enabled=1 OR failover_server_id IS NOT NULL OR EXISTS(SELECT 1 FROM vps_failover_leases l WHERE l.rotation_id=vps_rotations.id) ORDER BY id')]
+        with connect() as db:ids=[r[0] for r in db.execute('SELECT id FROM vps_rotations ORDER BY id')]
         for rid in ids:
             try:
                 with connect() as db:before=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()

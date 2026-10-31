@@ -455,6 +455,23 @@ class PanelTest(unittest.TestCase):
             self.assertEqual(pause_endpoint.status_code,200,pause_endpoint.json)
             self.assertEqual(self.alice.patch(f'/api/client/servers/{sid}/probe-config',json={'automatic':True},headers=headers).status_code,403)
 
+    def test_paused_draining_rotation_can_be_deleted_without_DNS_or_IP_actions(self):
+        from unittest.mock import patch
+        a=self.post('/api/servers',{'name':'delete A'}).json['id']
+        b=self.post('/api/servers',{'name':'delete B'}).json['id']
+        uid=self.admin.get('/api/me').json['id']
+        with server.connect() as db:
+            cid=db.execute("INSERT INTO ip_connections(name,kind,config,secret) VALUES('DNS','alidns','{}','test')").lastrowid
+            bid=db.execute("INSERT INTO dns_bindings(server_id,connection_id,domain,record_id,rr,line,expected_ip,port) VALUES(?,?,'example.com','delete-test','edge','mobile','1.1.1.1',443)",(a,cid)).lastrowid
+            db.execute("INSERT INTO vps_rotations(owner_id,primary_server_id,other_server_id,binding_id,active_server_id,enabled,phase,next_switch_at,updated,drain_server_id) VALUES(?,?,?,?,?,0,'draining',2000,1000,?)",(uid,a,b,bid,b,a))
+        with patch('rotation.update_dns_record') as dns,patch('rotation.invoke_change_ip_api') as change:
+            result=self.admin.delete(f'/api/admin/servers/{a}/rotation',headers={'X-CSRF-Token':self.tokens['admin']})
+            self.assertEqual(result.status_code,200,result.json)
+            dns.assert_not_called();change.assert_not_called()
+        with server.connect() as db:
+            self.assertFalse(db.execute('SELECT 1 FROM vps_rotations WHERE primary_server_id=?',(a,)).fetchone())
+            self.assertEqual(db.execute('SELECT expected_ip FROM dns_bindings WHERE id=?',(bid,)).fetchone()[0],'1.1.1.1')
+
     def test_fixed_primary_mode_save_pause_and_legacy_mode_selection(self):
         from unittest.mock import patch
         import rotation
