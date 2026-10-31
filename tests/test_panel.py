@@ -472,6 +472,47 @@ class PanelTest(unittest.TestCase):
             self.assertFalse(db.execute('SELECT 1 FROM vps_rotations WHERE primary_server_id=?',(a,)).fetchone())
             self.assertEqual(db.execute('SELECT expected_ip FROM dns_bindings WHERE id=?',(bid,)).fetchone()[0],'1.1.1.1')
 
+    def test_delete_stops_stuck_recovery_and_unissued_reboots_preserving_issued_history(self):
+        from unittest.mock import patch
+        a=self.post('/api/servers',{'name':'delete A'}).json['id']
+        b=self.post('/api/servers',{'name':'delete B'}).json['id']
+        uid=self.admin.get('/api/me').json['id']
+        with server.connect() as db:
+            cid=db.execute("INSERT INTO ip_connections(name,kind,config,secret) VALUES('DNS','alidns','{}','test')").lastrowid
+            bid=db.execute("INSERT INTO dns_bindings(server_id,connection_id,domain,record_id,rr,line,expected_ip,port) VALUES(?,?,'example.com','delete-test','edge','mobile','1.1.1.1',443)",(a,cid)).lastrowid
+            db.execute("INSERT INTO vps_rotations(owner_id,primary_server_id,other_server_id,binding_id,active_server_id,enabled,phase,next_switch_at,updated,drain_server_id) VALUES(?,?,?,?,?,0,'draining',2000,1000,?)",(uid,a,b,bid,b,a))
+        with server.connect() as db:
+            source=db.execute("INSERT INTO detection_sources(name,kind,secret) VALUES('delete-source','boce','test')").lastrowid
+            for target in (a,b):
+                db.execute('INSERT INTO detection_plans(server_id,source_id,action_enabled,automatic) VALUES(?,?,1,1)',(target,source))
+                for state in ('queued','issued','submitted','uncertain','verifying'):
+                    db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,action_status) VALUES(?,?,'8.8.8.8',443,'[]','complete',1,1,?)",(target,source,state))
+                for state in ('queued','issued','accepted','unconfirmed'):
+                    db.execute("INSERT INTO commands(server_id,user_id,action,status,created,updated) VALUES(?,?,'reboot',?,1,1)",(target,uid,state))
+            db.execute("UPDATE vps_rotations SET phase='waiting_ip',action_started=1000 WHERE primary_server_id=?",(a,))
+        import fcntl
+        from pathlib import Path
+        with server.connect() as db:db_file=db.execute('PRAGMA database_list').fetchone()[2]
+        with open(str(Path(db_file).with_suffix('.rotation.lock')),'a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            blocked=self.admin.delete(f'/api/admin/servers/{a}/rotation',headers={'X-CSRF-Token':self.tokens['admin']})
+            self.assertEqual(blocked.status_code,409)
+        with server.connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM detection_runs WHERE action_status='cancelled'").fetchone()[0],0)
+        with patch('rotation.update_dns_record') as dns,patch('rotation.invoke_change_ip_api') as change:
+            result=self.admin.delete(f'/api/admin/servers/{a}/rotation',headers={'X-CSRF-Token':self.tokens['admin']})
+            self.assertEqual(result.status_code,200,result.json)
+            dns.assert_not_called();change.assert_not_called()
+        with server.connect() as db:
+            self.assertFalse(db.execute('SELECT 1 FROM vps_rotations WHERE primary_server_id=?',(a,)).fetchone())
+            self.assertEqual(db.execute('SELECT expected_ip FROM dns_bindings WHERE id=?',(bid,)).fetchone()[0],'1.1.1.1')
+
+        with server.connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM detection_runs WHERE action_status='cancelled'").fetchone()[0],10)
+            self.assertEqual(db.execute('SELECT SUM(action_enabled) FROM detection_plans').fetchone()[0],0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM commands WHERE status='cancelled'").fetchone()[0],2)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM commands WHERE status IN ('issued','accepted','unconfirmed')").fetchone()[0],6)
+
     def test_fixed_primary_mode_save_pause_and_legacy_mode_selection(self):
         from unittest.mock import patch
         import rotation

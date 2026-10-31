@@ -263,17 +263,27 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
     @auth()
     def delete_rotation(sid):
         if g.user['role'] not in ('admin','client'):return error('无权管理轮换',403)
-        with connect() as db:
-            if not _owned_server(db,sid,g.user['id']):return error('服务器不存在',404)
-            rotation=db.execute('SELECT * FROM vps_rotations WHERE primary_server_id=? AND (? OR owner_id=?)',(sid,int(g.user['role']=='admin'),g.user['id'])).fetchone()
-            if not rotation:return error('轮换计划不存在',404)
-            if rotation['enabled']:return error('请先暂停轮换再删除',409)
-            if rotation['dns_intent']:return error('DNS 写入结果待核对，请确认实际解析后再删除',409)
-            if db.execute('SELECT 1 FROM vps_failover_leases WHERE rotation_id=?',(rotation['id'],)).fetchone():return error('C 正在接替解析，请等待安全切回 A 后再删除',409)
-            if rotation['phase'] not in ('active','draining') or rotation['action_started'] is not None:return error('换 IP 动作已发出，需完成状态核对后再删除',409)
-            if any(_pending_action(db,target) for target in (rotation['primary_server_id'],rotation['other_server_id'])):return error('服务器仍有未完成的重启或换 IP 动作，请核对后再删除',409)
-            failover.stop_probe(db,rotation['id'],remove=True)
-            db.execute('DELETE FROM vps_rotations WHERE id=?',(rotation['id'],));audit(db,'删除双 VPS 轮换计划 #'+str(rotation['id']))
+        with connect() as lookup:
+            db_file=lookup.execute('PRAGMA database_list').fetchone()[2]
+        with open(str(Path(db_file).with_suffix('.rotation.lock')),'a') as lock:
+            try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except BlockingIOError:return error('轮换动作正在提交，请稍后重试删除',409)
+            with connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                if not _owned_server(db,sid,g.user['id']):return error('服务器不存在',404)
+                rotation=db.execute('SELECT * FROM vps_rotations WHERE primary_server_id=? AND (? OR owner_id=?)',(sid,int(g.user['role']=='admin'),g.user['id'])).fetchone()
+                if not rotation:return error('轮换计划不存在',404)
+                if rotation['enabled']:return error('请先暂停轮换再删除',409)
+                if rotation['dns_intent']:return error('DNS 写入结果待核对，请确认实际解析后再删除',409)
+                if db.execute('SELECT 1 FROM vps_failover_leases WHERE rotation_id=?',(rotation['id'],)).fetchone():return error('C 正在接替解析，请等待安全切回 A 后再删除',409)
+                # Deleting stops recovery instead of waiting forever for historical jobs.
+                # Issued external requests cannot be recalled; retain their command history.
+                for target in (rotation['primary_server_id'],rotation['other_server_id']):
+                    db.execute('UPDATE detection_plans SET action_enabled=0 WHERE server_id=?',(target,))
+                    db.execute("UPDATE detection_runs SET action_status='cancelled',action_result='轮换计划已删除，停止自动换 IP 重试；已发出的外部请求无法撤回' WHERE server_id=? AND action_status IN ('queued','issued','submitted','uncertain','verifying')",(target,))
+                    db.execute("UPDATE commands SET status='cancelled',updated=? WHERE server_id=? AND action='reboot' AND status='queued'",(int(time.time()),target))
+                failover.stop_probe(db,rotation['id'],remove=True)
+                db.execute('DELETE FROM vps_rotations WHERE id=?',(rotation['id'],));audit(db,'删除双 VPS 轮换计划 #'+str(rotation['id']))
         return jsonify(ok=True)
     delete_rotation.__name__='client_delete_vps_rotation'
     app.add_url_rule('/api/client/servers/<int:sid>/rotation','client_delete_vps_rotation',delete_rotation,methods=['DELETE'])
