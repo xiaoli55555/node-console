@@ -45,6 +45,20 @@ class DetectorTest(unittest.TestCase):
   if kwargs.get('response_mode','none')!='none':
    with self.connect() as db:db.execute('UPDATE detection_sources SET verified_at=? WHERE id=?',(int(time.time()),source))
   r=self.post('/plans/1',{'source_id':source,'nodes':['1','2'],'interval_s':600,'daily_limit':1000,**kwargs});self.assertEqual(r.status_code,200,r.json)
+ def test_save_probe_without_monitor_or_dns(self):
+  source=self.source()['id']
+  with self.connect() as db:db.execute('DELETE FROM ip_monitors WHERE server_id=1')
+  self.plan(source,port=59218)
+  with self.connect() as db:
+   self.assertEqual(db.execute('SELECT port FROM ip_monitors WHERE server_id=1').fetchone()[0],59218)
+   self.assertEqual(db.execute('SELECT COUNT(*) FROM dns_bindings').fetchone()[0],0)
+  bad=self.post('/plans/999',{'source_id':source,'nodes':['1']})
+  self.assertEqual(bad.status_code,404)
+ def test_invalid_probe_does_not_create_monitor(self):
+  source=self.source()['id']
+  with self.connect() as db:db.execute('DELETE FROM ip_monitors WHERE server_id=1')
+  self.assertEqual(self.post('/plans/1',{'source_id':source,'nodes':[]}).status_code,400)
+  with self.connect() as db:self.assertIsNone(db.execute('SELECT 1 FROM ip_monitors').fetchone())
  def test_secret_encryption_and_admin_only(self):
   self.source();self.assertEqual(self.client.get('/api/detection').status_code,403)
   data=self.client.get('/api/detection',headers=self.headers).text;self.assertNotIn('testsecret',data)

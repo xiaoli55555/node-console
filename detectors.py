@@ -602,7 +602,7 @@ def register(app,connect,cipher,auth,body,error,audit):
         if response_mode=='change_api' and type(action_connection_id)is not int:return error('请选择换 IP API 连接')
         if response_mode!='change_api':action_connection_id=None
         with connect() as db:
-            if not db.execute('SELECT 1 FROM ip_monitors WHERE server_id=?',(sid,)).fetchone():return error('请先选择被监控的 VPS')
+            if not db.execute('SELECT 1 FROM servers WHERE id=?',(sid,)).fetchone():return error('所选 VPS 不存在',404)
             s=db.execute('SELECT * FROM detection_sources WHERE id=?',(d.get('source_id'),)).fetchone()
             if not s:return error('请选择检测来源')
             if response_mode!='none' and (not s['verified_at'] or time.time()-s['verified_at']>900):return error('启用自动重启或换 IP 前，请先测试探测来源；测试结果 15 分钟内有效')
@@ -612,6 +612,7 @@ def register(app,connect,cipher,auth,body,error,audit):
                 if not action or action['kind']!='change_ip' or action['owner_id'] is not None:return error('请选择管理员的换 IP API 连接')
             ids=sorted(set(map(str,ids))) if s['kind']=='boce' else ['self']
             if not ids:return error('请填写至少一个节点 ID')
+            db.execute('INSERT OR IGNORE INTO ip_monitors(server_id,port) VALUES(?,?)',(sid,port or 443))
             if port is not None:db.execute('UPDATE ip_monitors SET port=? WHERE server_id=?',(port,sid))
             existing=db.execute('SELECT next_at FROM detection_plans WHERE server_id=?',(sid,)).fetchone()
             db.execute("UPDATE detection_runs SET action_status='cancelled',action_result='检测配置已更新，未发送换 IP 请求' WHERE server_id=? AND action_status IN ('queued','issued','submitted','uncertain','verifying')",(sid,))
