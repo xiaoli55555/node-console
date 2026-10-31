@@ -78,7 +78,7 @@ class RotationConditions(unittest.TestCase):
             self.assertFalse(rotation._offline(db,1,1000,20))
             self.assertFalse(rotation._offline(db,2,1000,15))
 
-    def test_reboot_wait_does_not_call_api_or_repeat_reboot(self):
+    def test_reboot_with_unknown_result_does_not_overlap_or_call_API(self):
         with self.connect() as db:db.execute("UPDATE vps_rotations SET phase='waiting_ip',drain_server_id=2,old_ip='8.8.8.8',action_started=800,next_switch_at=2000")
         with patch('rotation._failed_ip',return_value=False),patch('rotation._fresh_ip',return_value=('8.8.8.8',443,{})),patch('rotation._validated_plan',return_value={'rotation_action':'reboot','action_connection_id':None}),patch('rotation.queue_reboot') as reboot,patch('rotation.invoke_change_ip_api') as api:
             rotation._run_rotation(self.connect,None,1,1000)
