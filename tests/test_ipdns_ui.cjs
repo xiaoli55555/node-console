@@ -132,7 +132,7 @@ test('per-server failover editor saves numeric settings and preserves failures f
  const elements={serverFailoverForm:{elements:{backup_id:{value:'9'},offline_s:{value:'30'},recovery_s:{value:'60'}}},serverFailoverError:{},modal:{close(){this.closed=true;}}};
  let html='',calls=[];ctx.$=id=>elements[id];ctx.modal=value=>{html=value;};ctx.notice=()=>{};
  ctx.api=async(path,method,body)=>{calls.push({path,method,body});if(method==='PUT')return {ok:true};return {config:{backup_id:9,status:'<waiting>'},servers:[{id:9,name:'<backup>'}]};};
- await ctx.editServerFailover(7);assert.match(html,/&lt;backup&gt;/);assert.match(html,/&lt;waiting&gt;/);assert.match(html,/待命时不拨测/);
+ await ctx.editServerFailover(7);assert.match(html,/&lt;backup&gt;/);assert.match(html,/&lt;waiting&gt;/);assert.match(html,/待命时不拨测/);assert.match(html,/多台主机可共享同一备用机/);assert.doesNotMatch(html,/只能分配给一个主机/);
  const submitter={disabled:false};await elements.serverFailoverForm.onsubmit({preventDefault(){},submitter,target:elements.serverFailoverForm});
  assert.equal(calls[1].path,'servers/7/failover');assert.deepEqual(JSON.parse(JSON.stringify(calls[1].body)),{backup_id:9,offline_s:30,recovery_s:60});assert.equal(elements.modal.closed,true);assert.equal(submitter.disabled,false);
  ctx.api=async(path,method)=>{if(method==='PUT')throw Error('解析尚由备用机承载');return {config:null,servers:[]};};elements.modal.closed=false;

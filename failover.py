@@ -36,7 +36,12 @@ def initialize(db):
     server_failover.initialize(db)
     for r in db.execute('SELECT * FROM vps_rotations WHERE failover_server_id IS NOT NULL').fetchall():
         state=_remember_probe(db,r['id'],r['failover_server_id'])
-        if not state['active']:db.execute("UPDATE detection_plans SET automatic=0,action_enabled=0,status='冷备用待命，不运行拨测' WHERE server_id=?",(r['failover_server_id'],))
+        if not state['active'] and not server_failover_shared_active(db,r['failover_server_id'],'rotation',r['id']):db.execute("UPDATE detection_plans SET automatic=0,action_enabled=0,status='冷备用待命，不运行拨测' WHERE server_id=?",(r['failover_server_id'],))
+
+
+def server_failover_shared_active(db,sid,kind,key):
+    import shared_failover
+    return shared_failover.active_other(db,sid,kind,key)
 
 
 def guarded(db,bid):
@@ -52,11 +57,14 @@ def reserved(db,sid):
 
 
 def probe_active(db,sid):
+    import shared_failover
+    if shared_failover.shared(db,sid):return shared_failover.budget_primary(db,sid) is not None
     import server_failover
     r=server_failover.parent(db,sid,active=True)
     if r:
-        p=db.execute('SELECT p.automatic,s.enabled,m.enabled AS monitor_enabled FROM detection_plans p JOIN detection_sources s ON s.id=p.source_id JOIN ip_monitors m ON m.server_id=p.server_id WHERE p.server_id=?',(r['server_id'],)).fetchone()
-        return bool(p and p['automatic'] and p['enabled'] and p['monitor_enabled'])
+        p=db.execute('SELECT p.automatic,p.source_id,p.nodes,m.port,s.enabled,m.enabled AS monitor_enabled FROM detection_plans p JOIN detection_sources s ON s.id=p.source_id JOIN ip_monitors m ON m.server_id=p.server_id WHERE p.server_id=?',(r['server_id'],)).fetchone()
+        current=db.execute('SELECT p.source_id,p.nodes,m.port FROM detection_plans p JOIN ip_monitors m ON m.server_id=p.server_id WHERE p.server_id=?',(sid,)).fetchone()
+        return bool(p and current and p['automatic'] and p['enabled'] and p['monitor_enabled'] and all(p[k]==current[k] for k in ('source_id','nodes','port')))
     if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vps_failover_probe_state'").fetchone():return False
     return bool(db.execute('SELECT 1 FROM vps_failover_probe_state s JOIN vps_rotations r ON r.id=s.rotation_id JOIN detection_plans p ON p.server_id=r.primary_server_id JOIN detection_sources d ON d.id=p.source_id JOIN ip_monitors m ON m.server_id=r.primary_server_id WHERE s.server_id=? AND s.active=1 AND p.automatic=1 AND d.enabled=1 AND m.enabled=1',(sid,)).fetchone())
 
@@ -73,6 +81,9 @@ def parent_probe_suspended(db,sid,now):
 
 
 def budget_primary(db,sid):
+    import shared_failover
+    shared_parent=shared_failover.budget_primary(db,sid)
+    if shared_parent is not None:return shared_parent
     import server_failover
     r=server_failover.parent(db,sid,active=True)
     if r:return r['server_id']
@@ -84,9 +95,11 @@ def budget_primary(db,sid):
 def _remember_probe(db,rid,sid):
     state=db.execute('SELECT * FROM vps_failover_probe_state WHERE rotation_id=?',(rid,)).fetchone()
     if state:return state
+    import shared_failover
+    shared=shared_failover.original(db,sid,('rotation',rid))
     plan=db.execute('SELECT * FROM detection_plans WHERE server_id=?',(sid,)).fetchone()
     monitor=db.execute('SELECT * FROM ip_monitors WHERE server_id=?',(sid,)).fetchone()
-    db.execute('INSERT INTO vps_failover_probe_state(rotation_id,server_id,original_plan,original_monitor) VALUES(?,?,?,?)',(rid,sid,json.dumps(dict(plan)) if plan else None,json.dumps(dict(monitor)) if monitor else None))
+    db.execute('INSERT INTO vps_failover_probe_state(rotation_id,server_id,original_plan,original_monitor) VALUES(?,?,?,?)',(rid,sid,shared['original_plan'] if shared else (json.dumps(dict(plan)) if plan else None),shared['original_monitor'] if shared else (json.dumps(dict(monitor)) if monitor else None)))
     return db.execute('SELECT * FROM vps_failover_probe_state WHERE rotation_id=?',(rid,)).fetchone()
 
 
@@ -105,11 +118,17 @@ def stop_probe(db,rid,remove=False):
     state=db.execute('SELECT * FROM vps_failover_probe_state WHERE rotation_id=?',(rid,)).fetchone()
     if not state:return
     sid=state['server_id']
+    import shared_failover
+    if shared_failover.active_other(db,sid,'rotation',rid):
+        if remove:db.execute('DELETE FROM vps_failover_probe_state WHERE rotation_id=?',(rid,))
+        else:db.execute('UPDATE vps_failover_probe_state SET active=0,signature=NULL,activated_at=NULL WHERE rotation_id=?',(rid,))
+        return
+    keep_paused=bool(remove and shared_failover.original(db,sid,('rotation',rid)))
     if state['active']:
         db.execute("UPDATE detection_runs SET status='接管结束，停止后续拨测' WHERE server_id=? AND id>? AND status IN ('creating','pending','queued','issued')",(sid,state['run_floor']))
         db.execute("UPDATE commands SET status='cancelled',updated=? WHERE server_id=? AND status='queued' AND id IN (SELECT action_command_id FROM detection_runs WHERE server_id=? AND id>?)",(int(time.time()),sid,sid,state['run_floor']))
         db.execute("UPDATE detection_runs SET action_status='cancelled',action_result='已切回 A；停止 C 后续动作和重试，已发出的请求不可撤回' WHERE server_id=? AND id>? AND action_status IN ('queued','issued','submitted','uncertain','verifying')",(sid,state['run_floor']))
-    _restore_row(db,'detection_plans',sid,state['original_plan'],not remove)
+    _restore_row(db,'detection_plans',sid,state['original_plan'],not remove or keep_paused)
     _restore_row(db,'ip_monitors',sid,state['original_monitor'],False)
     if remove:db.execute('DELETE FROM vps_failover_probe_state WHERE rotation_id=?',(rid,))
     else:db.execute('UPDATE vps_failover_probe_state SET active=0,signature=NULL,activated_at=NULL WHERE rotation_id=?',(rid,))
@@ -135,6 +154,11 @@ def _activate_probe(db,cipher,r,now):
     import rotation as rot
     sid=r['failover_server_id']
     if not rot._owned_server(db,sid,r['owner_id']):raise IntegrationError('故障转移 VPS 归属已变化')
+    import shared_failover
+    if shared_failover.shared(db,sid):
+        _remember_probe(db,r['id'],sid)
+        shared_failover.activate(db,'rotation',r['id'],now)
+        return db.execute('SELECT * FROM vps_failover_probe_state WHERE rotation_id=?',(r['id'],)).fetchone()
     try:a=probe_config(db,r['primary_server_id'],r['owner_id'])
     except IntegrationError:
         db.execute("UPDATE detection_plans SET automatic=0,action_enabled=0,status='A 的检测配置已暂停，继承拨测暂停' WHERE server_id=?",(sid,));raise
@@ -161,6 +185,8 @@ def _activate_probe(db,cipher,r,now):
 
 def backup_ready(db,cipher,r,now):
     import rotation as rot
+    import shared_failover
+    if shared_failover.shared(db,r['failover_server_id']):return shared_failover.ready(db,cipher,'rotation',r['id'],now,r['offline_after_s'])
     sid=r['failover_server_id'];state=db.execute('SELECT * FROM vps_failover_probe_state WHERE rotation_id=?',(r['id'],)).fetchone()
     plan=db.execute('SELECT * FROM detection_plans WHERE server_id=?',(sid,)).fetchone()
     run=db.execute("SELECT * FROM detection_runs WHERE server_id=? AND status NOT IN ('creating','pending','queued','issued') ORDER BY id DESC LIMIT 1",(sid,)).fetchone()
@@ -197,11 +223,14 @@ def configure(db,cipher,rid,body,now):
     if leases and changed:raise IntegrationError('故障转移记录尚未切回 A，不能修改或移除故障转移配置')
     if sid is not None:
         import server_failover
-        if server_failover.exists(db) and db.execute('SELECT 1 FROM server_failovers WHERE server_id IN (?,?) OR backup_id=? OR (cold=1 AND backup_id IN (?,?))',(sid,r['primary_server_id'],sid,r['primary_server_id'],r['other_server_id'])).fetchone():raise IntegrationError('A/B 或备用机已配置单机故障转移，请先移除冲突配置')
+        if server_failover.exists(db) and db.execute('SELECT 1 FROM server_failovers WHERE server_id IN (?,?) OR (cold=1 AND backup_id IN (?,?))',(sid,r['primary_server_id'],r['primary_server_id'],r['other_server_id'])).fetchone():raise IntegrationError('A/B 或备用机已配置单机故障转移，请先移除冲突配置')
+        import shared_failover
+        sharing=shared_failover.original(db,sid,('rotation',rid))
+        if sharing and (sharing['owner_id']!=r['owner_id'] or not sharing['cold']):raise IntegrationError('轮换冷备用仅能在同一账号内共享，不能覆盖在用备用机的配置')
         if not ids:raise IntegrationError('A 尚未绑定解析记录，无法启用故障转移')
         probe_config(db,r['primary_server_id'],r['owner_id'])
         if rot._pending_action(db,sid):raise IntegrationError('故障转移 VPS 有未结束的重启或换 IP 动作')
-        conflict=db.execute('SELECT 1 FROM vps_rotations WHERE id<>? AND (enabled=1 OR failover_server_id IS NOT NULL OR phase<>\'active\' OR dns_intent IS NOT NULL OR EXISTS(SELECT 1 FROM vps_failover_leases l WHERE l.rotation_id=vps_rotations.id)) AND (primary_server_id IN (?,?) OR other_server_id IN (?,?) OR failover_server_id IN (?,?,?))',(rid,sid,r['primary_server_id'],sid,r['other_server_id'],sid,r['primary_server_id'],r['other_server_id'])).fetchone()
+        conflict=db.execute('SELECT 1 FROM vps_rotations WHERE id<>? AND (enabled=1 OR failover_server_id IS NOT NULL OR phase<>\'active\' OR dns_intent IS NOT NULL OR EXISTS(SELECT 1 FROM vps_failover_leases l WHERE l.rotation_id=vps_rotations.id)) AND (primary_server_id IN (?,?) OR other_server_id IN (?,?) OR failover_server_id IN (?,?))',(rid,sid,r['primary_server_id'],sid,r['other_server_id'],r['primary_server_id'],r['other_server_id'])).fetchone()
         if conflict:raise IntegrationError('故障转移 VPS 或 A/B 已被其他活动轮换任务占用')
         ip,port=standby_ready(db,cipher,r,sid,now)
         if ip in {rot._fresh_ip(db,x,now,cipher)[0] for x in (r['primary_server_id'],r['other_server_id'])}:raise IntegrationError('故障转移 VPS 的公网 IP 不能与 A/B 相同')
@@ -217,7 +246,7 @@ def configure(db,cipher,rid,body,now):
     if r['failover_server_id']!=sid:stop_probe(db,rid,remove=True)
     if sid is not None:
         state=_remember_probe(db,rid,sid)
-        if not state['active']:db.execute("UPDATE detection_plans SET automatic=0,action_enabled=0,status='冷备用待命，不运行拨测' WHERE server_id=?",(sid,))
+        if not state['active'] and not shared_failover.active_other(db,sid,'rotation',rid):db.execute("UPDATE detection_plans SET automatic=0,action_enabled=0,status='冷备用待命，不运行拨测' WHERE server_id=?",(sid,))
     db.execute('UPDATE vps_rotations SET failover_server_id=?,failover_binding_ids=?,failover_recovery_s=?,failover_healthy_since=CASE WHEN ? THEN NULL ELSE failover_healthy_since END,failover_status=CASE WHEN ? THEN ? ELSE failover_status END WHERE id=?',(sid,json.dumps(sorted(ids)),recovery,int(changed),int(changed),'A 故障转移待命' if sid else '未配置 A 故障转移',rid))
 
 

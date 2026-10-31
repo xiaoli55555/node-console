@@ -20,7 +20,7 @@ def initialize(db):
     db.executescript('''
     CREATE TABLE IF NOT EXISTS server_failovers(
       server_id INTEGER PRIMARY KEY REFERENCES servers(id) ON DELETE RESTRICT,
-      backup_id INTEGER NOT NULL UNIQUE REFERENCES servers(id) ON DELETE RESTRICT,
+      backup_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE RESTRICT,
       owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
       recovery_s INTEGER NOT NULL DEFAULT 60, offline_s INTEGER NOT NULL DEFAULT 30,
       cold INTEGER NOT NULL DEFAULT 1,
@@ -34,6 +34,24 @@ def initialize(db):
       current_ip TEXT NOT NULL, target_ip TEXT, restoring INTEGER NOT NULL DEFAULT 0,
       updated INTEGER NOT NULL);
     ''')
+    # SQLite cannot drop the old inline UNIQUE constraint. Rebuild the parent
+    # atomically with foreign keys disabled, preserving all rows and DNS leases.
+    sql=db.execute("SELECT sql FROM sqlite_master WHERE name='server_failovers'").fetchone()[0]
+    if 'NOT NULL UNIQUE' in sql:
+        db.commit();db.execute('PRAGMA foreign_keys=OFF')
+        try:
+            db.execute('BEGIN IMMEDIATE')
+            db.execute(sql.replace('server_failovers','server_failovers_shared',1).replace('NOT NULL UNIQUE','NOT NULL'))
+            db.execute('INSERT INTO server_failovers_shared SELECT * FROM server_failovers')
+            db.execute('DROP TABLE server_failovers')
+            db.execute('ALTER TABLE server_failovers_shared RENAME TO server_failovers')
+            db.commit()
+        except Exception:
+            db.rollback();raise
+        finally:db.execute('PRAGMA foreign_keys=ON')
+        if db.execute('PRAGMA foreign_key_check').fetchone():raise RuntimeError('Failover migration foreign-key check failed')
+    import shared_failover
+    shared_failover.initialize(db)
     columns={r[1] for r in db.execute('PRAGMA table_info(server_failovers)')}
     for column,definition in [('cold','INTEGER NOT NULL DEFAULT 1'),('healthy_ip','TEXT')]:
         if column not in columns:db.execute('ALTER TABLE server_failovers ADD COLUMN '+column+' '+definition)
@@ -68,6 +86,9 @@ def _activate(db,r,now):
         failover.probe_config(db,r['backup_id'],r['owner_id'])
         db.execute('UPDATE server_failovers SET active=1 WHERE server_id=?',(r['server_id'],))
         return
+    import shared_failover
+    if shared_failover.shared(db,r['backup_id']):
+        shared_failover.activate(db,'server',r['server_id'],now);return
     p=failover.probe_config(db,r['server_id'],r['owner_id'])
     signature=json.dumps([p['source_id'],p['nodes'],p['interval_s'],p['daily_limit'],p['failure_threshold'],p['monitor_port']])
     current=db.execute('SELECT * FROM detection_plans WHERE server_id=?',(r['backup_id'],)).fetchone()
@@ -84,6 +105,10 @@ def _stop(db,r,remove=False):
     if not r['cold']:
         db.execute('UPDATE server_failovers SET active=0,healthy_since=NULL WHERE server_id=?',(r['server_id'],))
         return
+    import shared_failover
+    if shared_failover.active_other(db,r['backup_id'],'server',r['server_id']):
+        db.execute('UPDATE server_failovers SET active=0,signature=NULL,activated_at=NULL,healthy_since=NULL WHERE server_id=?',(r['server_id'],));return
+    if remove and shared_failover.original(db,r['backup_id'],('server',r['server_id'])):remove=False
     if r['active']:
         db.execute("UPDATE detection_runs SET status='接管结束，停止拨测' WHERE server_id=? AND id>? AND status IN ('creating','pending','queued','issued')",(r['backup_id'],r['run_floor']))
     _restore_row(db,'detection_plans',r['backup_id'],r['original_plan'],not remove)
@@ -98,6 +123,14 @@ def _ready(db,cipher,r,sid,now,backup=False):
     if rotation._offline(db,sid,now,r['offline_s']):raise IntegrationError('agent 心跳超时')
     if _pending(db,sid):raise IntegrationError('仍有未完成的重启或 DHCP 任务')
     address=public_v4(candidate_ip(db,{'server_id':sid,'source_id':None},cipher))
+    import shared_failover
+    if backup and r['cold'] and shared_failover.shared(db,sid):
+        address,port,_=shared_failover.ready(db,cipher,'server',r['server_id'],now,r['offline_s'])
+        for b in bindings(db,r['server_id']):
+            try:
+                with rotation.socket.create_connection((address,b['port']),timeout=4):pass
+            except OSError:raise IntegrationError('共享备用机未提供业务端口：'+str(b['port'])) from None
+        return address
     p=db.execute('SELECT p.*,m.port,m.enabled FROM detection_plans p JOIN ip_monitors m ON m.server_id=p.server_id JOIN detection_sources s ON s.id=p.source_id WHERE p.server_id=? AND s.enabled=1',(sid,)).fetchone()
     if not p or not p['automatic'] or not p['enabled']:raise IntegrationError('定时探测或 IP 监控已暂停')
     if backup and r['cold']:
@@ -281,7 +314,9 @@ def register(app,connect,cipher,auth,body,error,audit):
                 try:
                     failover.probe_config(db,sid,g.user['id'])
                     if not rotation._owned_server(db,backup,g.user['id']):raise IntegrationError('备用机不属于当前账号')
-                    if db.execute('SELECT 1 FROM server_failovers WHERE server_id<>? AND backup_id=?',(sid,backup)).fetchone():raise IntegrationError('备用机已被另一故障转移配置占用，不允许重复分配')
+                    import shared_failover
+                    shared=shared_failover.original(db,backup,('server',sid))
+                    if shared and shared['owner_id']!=g.user['id']:raise IntegrationError('只能在同一账号范围内共享备用机')
                     node=backup;seen={sid}
                     while node not in seen:
                         seen.add(node)
@@ -289,11 +324,11 @@ def register(app,connect,cipher,auth,body,error,audit):
                         if not link:break
                         node=link['backup_id']
                     else:raise IntegrationError('不能组成循环故障转移')
-                    if failover.reserved(db,backup):raise IntegrationError('此备用机已作为冷备用被占用')
+                    if failover.reserved(db,backup) and not shared:raise IntegrationError('此备用机的占用状态需要核对')
                     if failover.reserved(db,sid):raise IntegrationError('当前服务器是冷备用，不能配置循环故障转移')
                     live=db.execute("SELECT 1 FROM detection_plans WHERE server_id=? AND automatic=1 AND response_mode IN ('reboot','change_api')",(backup,)).fetchone()
                     live=live or db.execute('SELECT 1 FROM vps_rotations WHERE primary_server_id=? OR other_server_id=?',(backup,backup)).fetchone() or db.execute('SELECT 1 FROM server_failovers WHERE server_id=?',(backup,)).fetchone()
-                    cold=0 if live else 1
+                    cold=shared['cold'] if shared else (0 if live else 1)
                     if not cold:failover.probe_config(db,backup,g.user['id'])
                     if rotation._pending_action(db,backup):raise IntegrationError('备用机有未完成动作，请先处理')
                     if not bindings(db,sid) and not db.execute('SELECT 1 FROM vps_rotations WHERE primary_server_id=? OR other_server_id=?',(sid,sid)).fetchone():raise IntegrationError('请先给主机绑定解析记录')
@@ -310,10 +345,12 @@ def register(app,connect,cipher,auth,body,error,audit):
                 _stop(db,r,remove=True)
                 db.execute('DELETE FROM server_failovers WHERE server_id=?',(sid,))
             if backup is not None:
+                import shared_failover
+                shared=shared_failover.original(db,backup)
                 plan=db.execute('SELECT * FROM detection_plans WHERE server_id=?',(backup,)).fetchone()
                 monitor=db.execute('SELECT * FROM ip_monitors WHERE server_id=?',(backup,)).fetchone()
-                db.execute('INSERT INTO server_failovers(server_id,backup_id,owner_id,recovery_s,offline_s,cold,original_plan,original_monitor) VALUES(?,?,?,?,?,?,?,?)',(sid,backup,g.user['id'],recovery,offline,cold,json.dumps(dict(plan)) if plan else None,json.dumps(dict(monitor)) if monitor else None))
+                db.execute('INSERT INTO server_failovers(server_id,backup_id,owner_id,recovery_s,offline_s,cold,original_plan,original_monitor) VALUES(?,?,?,?,?,?,?,?)',(sid,backup,g.user['id'],recovery,offline,cold,shared['original_plan'] if shared else (json.dumps(dict(plan)) if plan else None),shared['original_monitor'] if shared else (json.dumps(dict(monitor)) if monitor else None)))
                 db.execute('UPDATE server_failovers SET status=? WHERE server_id=?',('冷备用待命，不运行额外拨测' if cold else '在用备用机待命，保留自身检测配置',sid))
-                if cold:db.execute("UPDATE detection_plans SET automatic=0,action_enabled=0,status='冷备用待命，不运行拨测' WHERE server_id=?",(backup,))
+                if cold and not shared_failover.active_other(db,backup,'server',sid):db.execute("UPDATE detection_plans SET automatic=0,action_enabled=0,status='冷备用待命，不运行拨测' WHERE server_id=?",(backup,))
             audit(db,'配置单机故障转移 #'+str(sid))
         return jsonify(ok=True)

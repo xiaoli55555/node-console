@@ -98,11 +98,12 @@ class ServerFailover(unittest.TestCase):
             self.assertIsNotNone(sf.before_action(db,self.sid('A'),self.clock[0],server.CIPHER))
             self.assertFalse(db.execute('SELECT 1 FROM commands').fetchone())
 
-    def test_live_takeover_cannot_be_removed_and_backup_cannot_be_shared(self):
+    def test_live_takeover_cannot_be_removed_and_unbound_host_is_rejected(self):
         self.request();self.tick()
         self.assertEqual(self.config(backup_id=None).status_code,409)
         response=self.admin.put(f'/api/servers/{self.sid("B")}/failover',json={'backup_id':self.sid('C')},headers={'X-CSRF-Token':self.tokens['admin']})
         self.assertEqual(response.status_code,409)
+        self.assertIn('绑定解析',response.json['error'])
         self.assertEqual(self.admin.delete(f'/api/servers/{self.sid("C")}',headers={'X-CSRF-Token':self.tokens['admin']}).status_code,409)
 
     def test_DNS_write_uncertainty_is_reconciled_without_duplicate_write(self):
