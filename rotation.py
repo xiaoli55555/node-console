@@ -358,6 +358,7 @@ def _request_probe(db,sid,now):
 
 
 def _fixed_ready(db,cipher,r,sid,now,verified_candidate=None):
+    if _offline(db,sid,now,r['offline_after_s']):raise IntegrationError('目标 VPS 心跳已超时，不能接替')
     if r['phase'] in ('waiting_ip','waiting_probe') and r['drain_server_id']==sid:raise IntegrationError('目标 VPS 的换 IP / 复检尚未结束，不能接替')
     if _pending_action(db,sid,verified_candidate):raise IntegrationError('目标 VPS 有未结束的重启或换 IP 动作，不能接替')
     ip,port,metrics=_fresh_ip(db,sid,now,cipher)
@@ -406,13 +407,14 @@ def _reconcile_fixed_dns(connect,cipher,rid,now):
             db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',(message,now,rid));return True
         target=intent['target'];old=r['active_server_id'];ttl=intent['ttl']
         normal_takeover=target==r['other_server_id'] and not _fixed_failure(db,r['primary_server_id'],now)
-        emergency=int(target==r['other_server_id'] and not normal_takeover)
+        emergency=int(bool(intent.get('emergency',target==r['other_server_id'] and not normal_takeover)) and not intent.get('offline',False))
         phase='active' if normal_takeover else 'draining'
         delay=r['interval_s'] if target==r['other_server_id'] else 0
         message='已回读确认此前 DNS 切换结果，恢复固定主机协调流程'
         record_switch(db,rid,binding,intent['from'],intent['to'],intent['submitted'],now,ttl,bool(record.get('proxied',False)))
         db.execute('UPDATE dns_bindings SET expected_ip=?,status=?,updated=? WHERE id=?',(intent['to'],message,now,binding['id']))
         db.execute('UPDATE vps_rotations SET active_server_id=?,phase=?,drain_server_id=?,drain_started=?,drain_grace_s=?,old_ip=?,new_ip=NULL,action_started=NULL,last_sample_at=NULL,low_samples=?,emergency=?,next_switch_at=?,dns_intent=NULL,status=?,updated=? WHERE id=?',(target,phase,None if normal_takeover else old,None if normal_takeover else now,0 if emergency or normal_takeover else ttl+60,None if normal_takeover else intent['from'],2 if emergency else 0,emergency,now+delay,message,now,rid))
+        if emergency:db.execute('UPDATE vps_rotations SET fault_recovery=1 WHERE id=?',(rid,))
         _event(db,rid,target,message,now)
         return True
 
@@ -434,6 +436,14 @@ def _coordinate_fixed(connect,cipher,rid,now):
         if r['phase'] in ('waiting_ip','waiting_probe'):
             _request_probe(db,r['drain_server_id'],now)
             if failed:_request_probe(db,active,now)
+            return False
+        if _offline(db,active,now,r['offline_after_s']):
+            _request_probe(db,target,now)
+            try:_fixed_ready(db,cipher,r,target,now)
+            except IntegrationError as e:
+                db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('离线接替等待：'+str(e),now,rid));return True
+            db.commit()
+            _dns_switch(connect,cipher,rid,now,emergency=True,offline=True)
             return False
         if failed and not (bf if target==b else af):
             _request_probe(db,target,now)
@@ -506,7 +516,7 @@ def _dns_switch(connect,cipher,rotation,now,emergency=False,offline=False):
         submitted=int(time.time())
         if _fixed(r):
             if r['dns_intent']:raise IntegrationError('上一次 DNS 写入结果未确认，暂停新切换')
-            intent={'from':old_ip,'to':target_ip,'target':target,'submitted':submitted,'ttl':ttl}
+            intent={'from':old_ip,'to':target_ip,'target':target,'submitted':submitted,'ttl':ttl,'emergency':bool(emergency),'offline':bool(offline)}
             db.execute('UPDATE vps_rotations SET dns_intent=? WHERE id=?',(json.dumps(intent),rotation))
             db.commit() # Durable intent survives provider timeouts and worker exits.
         update_dns_record(conn,binding,record,target_ip)

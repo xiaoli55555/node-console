@@ -388,3 +388,32 @@ class PrimaryFailover(unittest.TestCase):
         with server.connect() as db:
             self.assertEqual(db.execute('SELECT automatic FROM detection_plans WHERE server_id=?',(self.sid('C'),)).fetchone()[0],1)
             self.assertFalse(db.execute('SELECT 1 FROM vps_failover_probe_state WHERE rotation_id=?',(self.rid,)).fetchone())
+
+    def test_fixed_A_offline_without_C_immediately_uses_healthy_B(self):
+        self.assertEqual(self.save(failover_server_id=None,failover_binding_ids=[]).status_code,200)
+        self.down('A');self.tick()
+        self.assertEqual(self.value('mobile'),'1.1.1.1')
+        self.assertEqual(self.row()['active_server_id'],self.sid('B'))
+        self.change.assert_not_called()
+        self.assertEqual(self.value('telecom'),'8.8.8.8')
+
+    def test_fixed_B_offline_before_deadline_immediately_returns_to_A(self):
+        self.assertEqual(self.save(failover_server_id=None,failover_binding_ids=[]).status_code,200)
+        with server.connect() as db:db.execute('UPDATE vps_rotations SET next_switch_at=? WHERE id=?',(self.clock[0],self.rid))
+        self.tick();self.assertEqual(self.value('mobile'),'1.1.1.1')
+        self.down('B');self.tick()
+        self.assertEqual(self.value('mobile'),'8.8.8.8')
+        self.change.assert_not_called()
+
+    def test_fixed_both_offline_without_C_preserves_DNS_and_issues_no_IP_action(self):
+        self.assertEqual(self.save(failover_server_id=None,failover_binding_ids=[]).status_code,200)
+        self.down('A');self.down('B');self.tick()
+        self.assertEqual(self.value('mobile'),'8.8.8.8')
+        self.change.assert_not_called()
+        self.assertIn('离线接替等待',self.row()['status'])
+
+    def test_fixed_offline_A_does_not_publish_failed_B(self):
+        self.assertEqual(self.save(failover_server_id=None,failover_binding_ids=[]).status_code,200)
+        self.health[self.sid('B')]=False;self.refresh('B');self.down('A');self.tick()
+        self.assertEqual(self.value('mobile'),'8.8.8.8')
+        self.change.assert_not_called()

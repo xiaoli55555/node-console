@@ -66,3 +66,36 @@ test('live rotation status shows C failover and freezes timer instead of claimin
  const html=ctx.rotationLiveMarkup({phase:'active',mode:'fixed_primary',primary_server_id:1,active_server_id:1,active_name:'C（故障转移）',enabled:1,next_switch_at:2000000000,failover_leases:[{binding_id:3}],status:'A 下线，全部解析接替'});
  assert.match(html,/A 故障转移接替中/);assert.match(html,/故障接替期间暂停定时轮换/);assert.match(html,/C（故障转移）/);
 });
+
+test('admin rotation form prechecks and saves the selected telecom record without switching lines',async()=>{
+ const appSource=fs.readFileSync('web/app.js','utf8');
+ vm.runInContext(appSource.match(/function rotationModeFields\([\s\S]*?\n}/)[0],ctx);
+ vm.runInContext(appSource.match(/function rotationModePayload\([^\n]+/)[0],ctx);
+ const form={mode:{value:'fixed_primary'},takeover_minutes:{value:'10'},first_switch:{value:''},mobile_only_ack:{checked:true},failover_server_id:{value:''},failover_recovery_s:{value:'60'},primary_server_id:{value:'1'},other_server_id:{value:'2'},binding_id:{value:'12'},interval_minutes:{value:'120'},lead_minutes:{value:'2'},offline_after_s:{value:'15'},connection_threshold:{value:'80'},enabled:{checked:true}};
+ const elements={adminRotationForm:form,backAdminRotations:{},checkAdminRotation:{},adminRotationChecks:{},adminRotationError:{}};
+ let html='',refreshed=0;const calls=[];
+ ctx.$=id=>elements[id];ctx.modal=value=>{html=value;};ctx.bindFailoverChoices=()=>{};ctx.notice=()=>{};ctx.loadAdminRotations=async()=>{refreshed++;};
+ ctx.api=async(path,method,body)=>{calls.push({path,method,body});return {checks:[{ok:true,name:'线路',message:'telecom'}],recommended_lead_s:660};};
+ ctx.editAdminRotation({servers:[{id:1,name:'A'},{id:2,name:'B'}],bindings:[{id:11,server_id:1,rr:'edge',domain:'example.com',line:'mobile',expected_ip:'8.8.8.8',credential_owner:null},{id:12,server_id:1,rr:'edge',domain:'example.com',line:'telecom',expected_ip:'8.8.8.8',credential_owner:null}]},null);
+ assert.match(html,/固定主机＋定时线路轮换/);assert.match(form.binding_id.innerHTML,/电信（telecom）/);
+ await elements.checkAdminRotation.onclick();assert.equal(calls[0].path,'admin/servers/1/rotation/readiness');assert.equal(calls[0].body.binding_id,12);
+ const submitter={disabled:false};await form.onsubmit({preventDefault(){},submitter});
+ assert.equal(calls[1].method,'PUT');assert.equal(calls[1].body.binding_id,12);assert.equal(calls[1].body.mode,'fixed_primary');assert.equal(calls[1].body.interval_s,7200);assert.equal(refreshed,1);assert.equal(submitter.disabled,false);
+});
+
+test('admin lifecycle buttons submit pause resume delete and recover after a failed delete',async()=>{
+ // Fresh VM avoids replacing the form test's loader.
+ const env=vm.createContext({esc:ctx.esc,console});vm.runInContext(source,env);
+ const r={id:5,primary_server_id:1,other_server_id:2,binding_id:12,primary_name:'A',other_name:'B',active_name:'B',mode:'fixed_primary',enabled:1,interval_s:7200,lead_s:0,offline_after_s:15,connection_threshold:80,events:[]};
+ const buttons=['edit','toggle','delete'].map(name=>({dataset:{['rotation'+name[0].toUpperCase()+name.slice(1)]:String(r.id)},name}));
+ const message={};let rejectDelete=true,removed=false;const calls=[];
+ env.document={querySelectorAll(selector){return buttons.filter(b=>selector.includes('-'+b.name+']'));}};
+ env.$=()=>message;env.modal=()=>{};env.startAdminRotationLive=()=>{};env.confirm=()=>true;
+ env.api=async(path,method,body)=>{calls.push({path,method,body});if(path==='admin/rotations')return {rotations:removed?[]:[r]};if(method==='PUT'){r.enabled=body.enabled;return {};}if(method==='DELETE'){if(rejectDelete)throw Error('轮换动作正在提交，请稍后重试删除');removed=true;return {};}};
+ await env.loadAdminRotations();await buttons[1].onclick();assert.equal(r.enabled,false);
+ await buttons[1].onclick();assert.equal(r.enabled,true);
+ await buttons[1].onclick();assert.equal(r.enabled,false);
+ await buttons[2].onclick();assert.match(message.textContent,/稍后重试/);assert.equal(buttons[2].disabled,false);
+ rejectDelete=false;await buttons[2].onclick();assert.equal(removed,true);
+ assert.equal(calls.filter(c=>c.method==='PUT').length,3);assert.equal(calls.filter(c=>c.method==='DELETE').length,2);
+});

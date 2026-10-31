@@ -185,6 +185,36 @@ class FixedPrimary(unittest.TestCase):
         self.assertEqual(self.record['content'],'1.1.1.1')
         self.assertEqual(self.row()['enabled'],0);self.change.assert_called_once()
         self.assertEqual(self.change.call_args.args[1],1)
+    def test_paused_fault_DNS_timeout_reconciles_then_finishes_repair(self):
+        with self.connect() as db:db.execute('UPDATE vps_rotations SET enabled=0')
+        self.failed={1}
+        def applied(c,b,r,ip):
+            self.record['content']=ip
+            raise IntegrationError('provider timed out after applying DNS')
+        with patch('rotation.update_dns_record',side_effect=applied):
+            with self.assertRaises(IntegrationError):rotation._run_rotation(self.connect,None,1,1000)
+        rotation._run_rotation(self.connect,None,1,1001)
+        self.assertIsNone(self.row()['dns_intent'])
+        self.assertEqual(self.row()['active_server_id'],2)
+        rotation._run_rotation(self.connect,None,1,1002)
+        self.change.assert_called_once()
+        self.assertEqual(self.change.call_args.args[1],1)
+        self.assertEqual(self.row()['enabled'],0)
+    def test_paused_B_fault_DNS_timeout_returns_to_A_and_repairs_B(self):
+        self.switch(1000);self.refresh(1100)
+        with self.connect() as db:db.execute('UPDATE vps_rotations SET enabled=0')
+        self.failed={2};self.count=50000
+        def applied(c,b,r,ip):
+            self.record['content']=ip
+            raise IntegrationError('provider timed out after applying DNS')
+        with patch('rotation.update_dns_record',side_effect=applied):
+            with self.assertRaises(IntegrationError):rotation._run_rotation(self.connect,None,1,1100)
+        rotation._run_rotation(self.connect,None,1,1101)
+        self.assertIsNone(self.row()['dns_intent'])
+        self.assertEqual(self.row()['active_server_id'],1)
+        rotation._run_rotation(self.connect,None,1,1102)
+        self.change.assert_called_once();self.assertEqual(self.change.call_args.args[1],2)
+        self.assertEqual(self.row()['enabled'],0)
     def test_B_duration_then_A_bridge_then_immediate_B_return_ignores_A_count(self):
         def fresh(db,sid,now,cipher):
             return self.ips[sid],443,{'connections_sampled':now,'tcp':50000 if sid==1 else self.count}
