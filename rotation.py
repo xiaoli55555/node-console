@@ -179,7 +179,8 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
                 failover_changed=rotation and any(k in d and d[k]!=(json.loads(rotation[k]) if k=='failover_binding_ids' else rotation[k]) for k in ('failover_server_id','failover_binding_ids','failover_recovery_s'))
                 if rotation and failover_changed and db.execute('SELECT 1 FROM vps_failover_leases WHERE rotation_id=?',(rotation['id'],)).fetchone():raise IntegrationError('A 故障转移正在接替，解析切回前不能修改备用机或接替记录')
                 if rotation and not enabled and (rotation['enabled'] or mode==rotation['mode']) and not failover_changed:
-                    db.execute("UPDATE vps_rotations SET enabled=0,status='轮换已暂停',updated=? WHERE id=?",(now,rotation['id']))
+                    kept_threshold=d.get('connection_threshold',rotation['connection_threshold'])
+                    db.execute("UPDATE vps_rotations SET enabled=0,status='轮换已暂停',interval_s=?,low_samples=CASE WHEN connection_threshold<>? THEN 0 ELSE low_samples END,last_sample_at=CASE WHEN connection_threshold<>? THEN NULL ELSE last_sample_at END,connection_threshold=?,lead_s=?,offline_after_s=?,takeover_s=?,first_switch_at=?,mobile_only_ack=?,updated=? WHERE id=?",(d.get('interval_s',rotation['interval_s']),kept_threshold,kept_threshold,kept_threshold,0 if mode=='fixed_primary' else d.get('lead_s',rotation['lead_s']),d.get('offline_after_s',rotation['offline_after_s']),takeover,first,int(ack),now,rotation['id']))
                     audit(db,'暂停双 VPS 定时轮换 #'+str(rotation['id']))
                     return jsonify(ok=True,rotation=_rotation_json(db,db.execute('SELECT * FROM vps_rotations WHERE id=?',(rotation['id'],)).fetchone()))
                 conflicts=db.execute('SELECT id FROM vps_rotations WHERE enabled=1 AND (primary_server_id IN (?,?) OR other_server_id IN (?,?)) AND id<>?',(sid,other,sid,other,rotation['id'] if rotation else -1)).fetchone()
@@ -207,6 +208,8 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
                     rid=db.execute("INSERT INTO vps_rotations(owner_id,primary_server_id,other_server_id,binding_id,active_server_id,enabled,interval_s,connection_threshold,phase,next_switch_at,status,updated) VALUES(?,?,?,?,?,1,?,?,'active',?,'轮换已开启',?)",(g.user['id'],sid,other,binding_id,sid,interval,threshold,now+interval-lead,now)).lastrowid
                 db.execute('UPDATE vps_rotations SET lead_s=?,offline_after_s=? WHERE id=?',(lead,offline_after,rid))
                 db.execute('UPDATE vps_rotations SET mode=?,takeover_s=?,first_switch_at=?,mobile_only_ack=? WHERE id=?',(mode,takeover,first,int(ack),rid))
+                if rotation and threshold!=rotation['connection_threshold']:
+                    db.execute('UPDATE vps_rotations SET low_samples=0,last_sample_at=NULL WHERE id=?',(rid,))
                 if mode=='fixed_primary' and (not rotation or not rotation['enabled'] or rotation['mode']!=mode):
                     due=first if first and first>now else now
                     if rotation and rotation['active_server_id']==other:due=now+interval
@@ -493,7 +496,7 @@ def _dns_switch(connect,cipher,rotation,now,emergency=False,offline=False):
         conn=load_connection(db,cipher,binding['connection_id'])
         target=r['other_server_id'] if r['active_server_id']==r['primary_server_id'] else r['primary_server_id']
         _validated_plan(db,target,r['owner_id'])
-        if _fixed(r):_fixed_ready(db,cipher,r,target,now)
+        _fixed_ready(db,cipher,r,target,now)
         if offline:old_ip,port=binding['expected_ip'],binding['port']
         else:old_ip,port,_=_fresh_ip(db,r['active_server_id'],now,cipher)
         target_ip,target_port,_=_fresh_ip(db,target,now,cipher)
@@ -637,13 +640,11 @@ def _run_rotation(connect,cipher,rid,now):
             if ip!=r['old_ip']:
                 db.execute("UPDATE vps_rotations SET phase='waiting_probe',new_ip=?,action_started=COALESCE(action_started,?),status=?,updated=? WHERE id=?",(ip,now,'旧 VPS IP 已变化，等待 BOCE 复检',now,rid));return
             stamp=metrics.get('connections_sampled');count=metrics.get('tcp')
-            if _fixed(r) and old==r['other_server_id'] and not r['emergency']:
+            if not r['emergency']:
                 try:count,stamp=_rotation_tcp_count(metrics,now)
                 except IntegrationError as e:
                     db.execute('UPDATE vps_rotations SET status=?,updated=?,low_samples=0 WHERE id=?',(str(e),now,rid));return
 
-            if not r['emergency'] and (type(count)is not int or type(stamp)is not int or not 0<=now-stamp<=45):
-                db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('等待旧 VPS 新鲜 TCP 连接数',now,rid));return
             if not r['emergency'] and stamp>(r['last_sample_at'] or 0):
                 lows=r['low_samples']+1 if count<r['connection_threshold'] else 0
                 db.execute('UPDATE vps_rotations SET low_samples=?,last_sample_at=?,status=?,updated=? WHERE id=?',(lows,stamp,f'旧 VPS 当前 {count} 条 TCP 连接；阈值 < {r["connection_threshold"]}，连续低值采样 {lows}/2',now,rid))
@@ -653,9 +654,8 @@ def _run_rotation(connect,cipher,rid,now):
                 try:_fixed_action_safe(db,cipher,r,old,now)
                 except IntegrationError as e:
                     db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('换 IP 暂缓：'+str(e),now,rid));return
-            pending=db.execute("SELECT 1 FROM detection_runs WHERE server_id=? AND action_status IN ('queued','issued','submitted','uncertain','verifying') LIMIT 1",(old,)).fetchone()
-            if pending:
-                db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('连接数已达标，但旧 VPS 另有换 IP 任务处理中；等待其完成',now,rid));return
+            if _pending_action(db,old) or _pending_action(db,r['active_server_id']):
+                db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('连接数已达标，但承载机或旧 VPS 仍有重启或换 IP 任务；等待其完成',now,rid));return
             plan=_validated_plan(db,old,r['owner_id'])
             if not plan or (plan.get('rotation_action')!='reboot' and not plan['action_connection_id']):
                 db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('旧机连接已降至阈值，但未配置换 IP API',now,rid));return
@@ -688,7 +688,7 @@ def _run_rotation(connect,cipher,rid,now):
                 try:_fixed_action_safe(db,cipher,r,old,now)
                 except IntegrationError as e:
                     db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('换 IP 暂缓：'+str(e),now,rid));return
-            if _fixed(r) and old==r['other_server_id'] and not r['emergency']:
+            if not r['emergency']:
                 db.execute("UPDATE vps_rotations SET phase='draining',emergency=0,low_samples=0,last_sample_at=NULL,action_started=NULL,status=?,updated=? WHERE id=?",('未观察到 IP 变化；重新确认轮换机连接数后再重试',now,rid));return
             action=load_connection(db,cipher,plan['action_connection_id']) if plan and plan['action_connection_id'] else None
             server=db.execute('SELECT name FROM servers WHERE id=?',(old,)).fetchone()

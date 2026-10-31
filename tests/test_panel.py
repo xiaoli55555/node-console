@@ -533,7 +533,12 @@ class PanelTest(unittest.TestCase):
             row=result.json['rotation'];self.assertEqual(row['mode'],'fixed_primary');self.assertEqual(row['next_switch_at'],now+120);self.assertEqual(row['lead_s'],0)
             blocked=self.admin.put(url,json=dict(payload,mode='alternating'),headers={'X-CSRF-Token':self.tokens['admin']})
             self.assertEqual(blocked.status_code,409)
-            self.assertEqual(self.admin.put(url,json=dict(payload,enabled=False),headers={'X-CSRF-Token':self.tokens['admin']}).status_code,200)
+            with server.connect() as db:db.execute('UPDATE vps_rotations SET low_samples=2,last_sample_at=? WHERE primary_server_id=?',(now,a))
+            paused=self.admin.put(url,json=dict(payload,enabled=False,connection_threshold=20),headers={'X-CSRF-Token':self.tokens['admin']})
+            self.assertEqual(paused.status_code,200)
+            self.assertEqual(paused.json['rotation']['connection_threshold'],20)
+            self.assertEqual(paused.json['rotation']['low_samples'],0)
+            self.assertIsNone(paused.json['rotation']['last_sample_at'])
             result=self.admin.put(url,json=dict(payload,mode='alternating',enabled=False),headers={'X-CSRF-Token':self.tokens['admin']})
             self.assertEqual(result.status_code,200,result.json);self.assertEqual(result.json['rotation']['mode'],'alternating');self.assertEqual(result.json['rotation']['enabled'],0)
 

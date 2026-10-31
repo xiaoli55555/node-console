@@ -78,6 +78,49 @@ class FixedPrimary(unittest.TestCase):
         self.change.assert_not_called();self.assertIn('TCP',self.row()['status'])
         for stamp in (1,2000):
             with self.assertRaises(IntegrationError):rotation._rotation_tcp_count({'connections_sampled':stamp,'tcp':0},1751)
+    def test_threshold_20_requires_two_distinct_consecutive_samples_in_both_modes(self):
+        for mode in ('fixed_primary','alternating'):
+            with self.subTest(mode=mode):
+                self.change.reset_mock()
+                with self.connect() as db:
+                    db.execute("UPDATE vps_rotations SET mode=?,phase='draining',active_server_id=1,drain_server_id=2,old_ip='1.1.1.1',drain_started=1600,drain_grace_s=0,emergency=0,low_samples=0,last_sample_at=NULL,connection_threshold=20,action_started=NULL",(mode,))
+                for now,count,expected in ((1751,20,0),(1752,19,1),(1752,19,1),(1753,20,0),(1754,19,1)):
+                    self.count=count;self.refresh(now);rotation._run_rotation(self.connect,None,1,now)
+                    self.assertEqual(self.row()['low_samples'],expected);self.change.assert_not_called()
+                self.count=19;self.refresh(1755);rotation._run_rotation(self.connect,None,1,1755)
+                self.change.assert_called_once();self.assertEqual(self.change.call_args.args[1],2)
+
+    def test_invalid_TCP_breaks_consecutive_low_samples_in_both_modes(self):
+        for mode in ('fixed_primary','alternating'):
+            for count,stamp in ((None,1751),(-1,1751),(True,1751),('0',1751),(1.5,1751),(0,None),(0,1700),(0,1800)):
+                with self.subTest(mode=mode,count=count,stamp=stamp):
+                    self.change.reset_mock();self.refresh(1751)
+                    with self.connect() as db:
+                        db.execute("UPDATE vps_rotations SET mode=?,phase='draining',active_server_id=1,drain_server_id=2,old_ip='1.1.1.1',drain_started=1600,drain_grace_s=0,emergency=0,low_samples=1,last_sample_at=1750,connection_threshold=20,action_started=NULL",(mode,))
+                    with patch('rotation._fresh_ip',return_value=('1.1.1.1',443,{'tcp':count,'connections_sampled':stamp})):
+                        rotation._run_rotation(self.connect,None,1,1751)
+                    self.change.assert_not_called();self.assertEqual(self.row()['low_samples'],0)
+
+    def test_alternating_does_not_publish_a_target_with_pending_reboot(self):
+        with self.connect() as db:
+            db.execute("UPDATE vps_rotations SET mode='alternating'")
+            db.execute('CREATE TABLE commands(server_id INTEGER,action TEXT,status TEXT)')
+            db.execute("INSERT INTO commands VALUES(2,'reboot','queued')")
+        with self.assertRaises(IntegrationError):rotation._dns_switch(self.connect,None,1,1000)
+        self.assertEqual(self.record['content'],'8.8.8.8');self.change.assert_not_called()
+
+    def test_alternating_does_not_change_IP_during_another_reboot(self):
+        with self.connect() as db:db.execute('CREATE TABLE commands(server_id INTEGER,action TEXT,status TEXT)')
+        for pending_sid in (1,2):
+            with self.subTest(pending_server=pending_sid):
+                self.change.reset_mock();self.refresh(1751)
+                with self.connect() as db:
+                    db.execute('DELETE FROM commands')
+                    db.execute("INSERT INTO commands VALUES(?,'reboot','accepted')",(pending_sid,))
+                    db.execute("UPDATE vps_rotations SET mode='alternating',phase='draining',active_server_id=1,drain_server_id=2,old_ip='1.1.1.1',drain_started=1600,drain_grace_s=0,emergency=0,low_samples=1,last_sample_at=1750,connection_threshold=20,action_started=NULL")
+                self.count=19;rotation._run_rotation(self.connect,None,1,1751)
+                self.change.assert_not_called();self.assertIn('重启',self.row()['status'])
+
     def test_primary_refresh_only_after_confirmed_failure(self):
         self.failed={1}
         rotation._run_rotation(self.connect,None,1,1000)
@@ -91,12 +134,13 @@ class FixedPrimary(unittest.TestCase):
         self.change.assert_not_called()
     def test_api_retry_rechecks_connection_threshold(self):
         self.switch(1000);self.switch(1600)
-        with self.connect() as db:db.execute("UPDATE vps_rotations SET phase='waiting_ip',action_started=1600,old_ip='1.1.1.1'")
-        self.count=100
-        with self.connect() as db:db.execute('UPDATE detection_runs SET updated=1750,created=1750')
-        rotation._run_rotation(self.connect,None,1,1751)
-        self.assertEqual(self.row()['phase'],'draining');self.assertEqual(self.row()['low_samples'],0)
-        rotation._run_rotation(self.connect,None,1,1766);self.change.assert_not_called()
+        for mode in ('fixed_primary','alternating'):
+            with self.subTest(mode=mode):
+                with self.connect() as db:db.execute("UPDATE vps_rotations SET mode=?,phase='waiting_ip',action_started=1600,old_ip='1.1.1.1',emergency=0",(mode,))
+                self.count=100;self.refresh(1750)
+                rotation._run_rotation(self.connect,None,1,1751)
+                self.assertEqual(self.row()['phase'],'draining');self.assertEqual(self.row()['low_samples'],0)
+                rotation._run_rotation(self.connect,None,1,1766);self.change.assert_not_called()
     def refresh(self,now):
         with self.connect() as db:db.execute('UPDATE detection_runs SET updated=?,created=?',(now,now))
     def test_failed_B_API_retry_does_not_wait_for_normal_TCP_threshold(self):
