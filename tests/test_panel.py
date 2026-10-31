@@ -873,8 +873,7 @@ class PanelTest(unittest.TestCase):
     def test_reboot_expired_and_late_ack_revocation(self):
         from unittest.mock import patch
         r=self.post('/api/servers',{'name':'expire-test'}).json;sid=r['id'];h={'Authorization':'Bearer '+r['token']}
-        # Keep these samples in one hour/day; midnight splitting has its own test.
-        base=int(time.time())//3600*3600+120
+        base=int(time.time())
         uid=self.alice.get('/api/me').json['id']
         self.admin.patch(f'/api/servers/{sid}',json={'owner_id':uid},headers={'X-CSRF-Token':self.tokens['admin']})
         self.admin.post('/api/agent/report',json={'uptime':100,'capabilities':['reboot']},headers=h)
