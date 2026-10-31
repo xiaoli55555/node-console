@@ -96,6 +96,48 @@ class HKTAPI(unittest.TestCase):
         self.report(n,uptime=1)
         with server.connect() as db:self.assertEqual(db.execute('SELECT status FROM commands WHERE id=?',(cid,)).fetchone()[0],'accepted')
 
+    def test_admin_single_test_preserves_key_and_verifies_real_report(self):
+        n=self.node();cfg=self.generate(n);path=f'/api/admin/servers/{n["id"]}/hkt-dhcp/test'
+        with server.connect() as db:before=tuple(db.execute('SELECT * FROM hkt_dhcp_apis WHERE server_id=?',(n['id'],)).fetchone())
+        self.assertEqual(self.post(path).status_code,400)
+        response=self.post(path,{'confirm':True});self.assertEqual(response.status_code,202,response.json)
+        cid=response.json['command_id']
+        self.assertEqual(self.post(path,{'confirm':True}).json['command_id'],cid)
+        status=self.admin.get(f'/api/admin/servers/{n["id"]}/hkt-dhcp/status').json
+        self.assertFalse(status['verified_ip_change']);self.assertEqual(status['current_ip'],'8.8.8.8')
+        self.report(n)
+        self.admin.post(f'/api/agent/commands/{cid}/ack',json={},headers={'Authorization':'Bearer '+n['token']})
+        self.report(n,dhcp_result={'id':cid,'state':'changed','old_ip':'8.8.8.8','new_ip':'1.1.1.1','attempts':1},public_ips=['1.1.1.1'])
+        status=self.admin.get(f'/api/admin/servers/{n["id"]}/hkt-dhcp/status').json
+        self.assertTrue(status['verified_ip_change']);self.assertEqual(status['current_ip'],'1.1.1.1')
+        self.assertNotIn(cfg['token'],json.dumps(status));self.assertNotIn(cfg['token'],json.dumps(response.json))
+        with server.connect() as db:self.assertEqual(tuple(db.execute('SELECT * FROM hkt_dhcp_apis WHERE server_id=?',(n['id'],)).fetchone()),before)
+
+    def test_admin_single_test_requires_admin_CSRF_and_honors_standby_guard(self):
+        n=self.node();cfg=self.generate(n);path=f'/api/admin/servers/{n["id"]}/hkt-dhcp/test'
+        self.assertEqual(self.alice.post(path,json={'confirm':True},headers={'X-CSRF-Token':self.tokens['alice']}).status_code,403)
+        self.assertEqual(self.admin.post(path,json={'confirm':True}).status_code,403)
+        a=self.node('A');b=self.node('B')
+        with server.connect() as db:
+            dns=db.execute("INSERT INTO ip_connections(name,kind,config,secret) VALUES('dns','alidns','{}','test')").lastrowid
+            bid=db.execute("INSERT INTO dns_bindings(server_id,connection_id,domain,record_id,rr,line,expected_ip,port) VALUES(?,?,'example.com','manual-test','edge','mobile','8.8.8.8',443)",(a['id'],dns)).lastrowid
+            uid=db.execute("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1").fetchone()[0]
+            rid=db.execute("INSERT INTO vps_rotations(owner_id,primary_server_id,other_server_id,binding_id,active_server_id,next_switch_at,updated,failover_server_id) VALUES(?,?,?,?,?,?,?,?)",(uid,a['id'],b['id'],bid,a['id'],int(time.time())+600,int(time.time()),n['id'])).lastrowid
+        blocked=self.post(path,{'confirm':True});self.assertEqual(blocked.status_code,409,blocked.json)
+        self.assertIn('冷备用',blocked.json['error'])
+        with server.connect() as db:
+            self.assertFalse(db.execute('SELECT 1 FROM commands WHERE server_id=?',(n['id'],)).fetchone())
+            db.execute('DELETE FROM vps_rotations WHERE id=?',(rid,))
+
+    def test_status_does_not_trust_changed_label_when_IPs_do_not_match(self):
+        n=self.node();cfg=self.generate(n);cid=self.trigger(n,cfg).json['command_id'];self.report(n)
+        self.admin.post(f'/api/agent/commands/{cid}/ack',json={},headers={'Authorization':'Bearer '+n['token']})
+        for old,new in [('8.8.8.8','8.8.8.8'),('8.8.8.8','1.1.1.1')]:
+            with server.connect() as db:db.execute("UPDATE commands SET status='accepted' WHERE id=?",(cid,))
+            self.report(n,dhcp_result={'id':cid,'state':'changed','old_ip':old,'new_ip':new,'attempts':1})
+            status=self.admin.get(f'/api/admin/servers/{n["id"]}/hkt-dhcp/status').json
+            self.assertFalse(status['verified_ip_change'])
+
 class DHCPExecutor(unittest.TestCase):
     def test_process_selection_never_kills_IPv6_other_interfaces_or_other_programs(self):
         with tempfile.TemporaryDirectory() as d:

@@ -101,7 +101,7 @@ test('admin lifecycle buttons submit pause resume delete and recover after a fai
 });
 
 test('HKT DHCP form generates scoped API without executing DHCP and shows results',async()=>{
- const elements={hktEnableCommand:{},hktDHCPMessage:{},hktDHCPAPI:{},hktDHCPResult:{},hktDHCPStatus:{},hktDHCPForm:{server_id:{value:'7'}}};let html='';const calls=[];
+ const elements={hktEnableCommand:{},hktDHCPMessage:{},hktDHCPAPI:{},hktDHCPResult:{},hktDHCPStatus:{},hktDHCPTest:{},hktDHCPForm:{server_id:{value:'7'}}};let html='';const calls=[];
  ctx.$=id=>elements[id];ctx.location={origin:'https://panel.example.com'};ctx.modal=v=>{html=v;};
  ctx.api=async(path,method)=>{calls.push({path,method});return path.endsWith('/status')?{job:{id:1,status:'failed'},result:{state:'unchanged'}}:{path:'/api/hkt-dhcp/7',token:'dummy-scope-token',connection_id:12,message:'仅生成 API'};};
  ctx.hktDHCPForm([{id:7,name:'HKT <node>'}],7);
@@ -142,4 +142,14 @@ test('per-server failover editor saves numeric settings and preserves failures f
 test('existing A standby redirects to rotation configuration without creating another policy',async()=>{
  let html='',calls=0;ctx.modal=value=>{html=value;};ctx.api=async()=>{calls++;return {rotation_failover:{failover_server_id:9,failover_status:'<active>'},servers:[]};};
  await ctx.editServerFailover(7);assert.equal(calls,1);assert.match(html,/轮换设置|配置中管理/);assert.match(html,/&lt;active&gt;/);assert.doesNotMatch(html,/serverFailoverForm/);
+});
+
+test('HKT one-shot test uses admin session without reading or rotating API keys',async()=>{
+ const elements={hktDHCPForm:{server_id:{value:'4'}},hktEnableCommand:{},hktDHCPMessage:{},hktDHCPStatus:{},hktDHCPTest:{},hktDHCPResult:{},hktDHCPAPI:{}};
+ let calls=[];ctx.$=id=>elements[id];ctx.modal=()=>{};ctx.location={origin:'https://panel.example.com'};ctx.confirm=()=>true;
+ ctx.api=async(path,method,body)=>{calls.push({path,method,body});return method==='POST'?{message:'单次测试已排队'}:{job:{id:1,status:'queued'},current_ip:'8.8.8.8',verified_ip_change:false};};
+ ctx.hktDHCPForm([{id:4,name:'hkt'}],4);assert.equal(calls.length,0);
+ await elements.hktDHCPTest.onclick();assert.equal(calls.length,2);assert.equal(calls[0].path,'admin/servers/4/hkt-dhcp/test');assert.equal(calls[0].body.confirm,true);assert.equal(calls[1].path,'admin/servers/4/hkt-dhcp/status');assert.equal(elements.hktDHCPAPI.textContent,undefined);assert.equal(elements.hktDHCPTest.disabled,false);assert.match(elements.hktDHCPResult.textContent,/verified_ip_change/);
+ calls=[];ctx.confirm=()=>false;await elements.hktDHCPTest.onclick();assert.equal(calls.length,0);
+ ctx.confirm=()=>true;ctx.api=async()=>{throw Error('冷备用不接受此动作');};await elements.hktDHCPTest.onclick();assert.match(elements.hktDHCPMessage.textContent,/冷备用/);assert.equal(elements.hktDHCPTest.disabled,false);
 });

@@ -94,13 +94,31 @@ def register(app,connect,cipher,auth,body,error,audit):
             db.execute('INSERT OR REPLACE INTO hkt_dhcp_apis VALUES(?,?,?,?)',(sid,cid,hashlib.sha256(token.encode()).hexdigest(),floor))
             audit(db,'生成 HKT DHCP 专属 API VPS #'+str(sid))
         return jsonify(ok=True,connection_id=cid,path=f'/api/hkt-dhcp/{sid}',token=token,message='已保存为换 IP API；生成不会执行动作。重新生成会撤销旧令牌并解除失败锁定。')
+    @app.post('/api/admin/servers/<int:sid>/hkt-dhcp/test')
+    @auth(admin=True)
+    def test_once(sid):
+        if body().get('confirm') is not True:return error('请确认此测试会实际执行 DHCP 换 IP，并可能短暂中断网络')
+        try:cid=queue(sid)
+        except IntegrationError as e:return error(str(e),409)
+        with connect() as db:audit(db,'单次 HKT DHCP 换 IP 测试 VPS #'+str(sid)+'，命令 #'+str(cid))
+        return jsonify(ok=True,command_id=cid,status='queued',message='单次测试已排队；等待 agent 执行及新 IP 上报，不代表换 IP 已成功'),202
+
     @app.get('/api/admin/servers/<int:sid>/hkt-dhcp/status')
     @auth(admin=True)
     def status(sid):
         with connect() as db:
             job=db.execute("SELECT id,status,created,updated FROM commands WHERE server_id=? AND action='hkt_dhcp' ORDER BY id DESC LIMIT 1",(sid,)).fetchone()
             result=db.execute('SELECT result FROM hkt_dhcp_results WHERE command_id=?',(job['id'],)).fetchone() if job else None
-        return jsonify(job=dict(job) if job else None,result=json.loads(result['result']) if result else None)
+            outcome=json.loads(result['result']) if result else None
+            address=None;verified=False
+            from ip_dns import candidate_ip,public_v4
+            try:
+                address=public_v4(candidate_ip(db,{'server_id':sid,'source_id':None},cipher))
+                if job and job['status']=='completed' and outcome and outcome.get('state')=='changed':
+                    old=public_v4(outcome.get('old_ip'));new=public_v4(outcome.get('new_ip'))
+                    verified=old!=new and address==new
+            except IntegrationError:pass
+        return jsonify(job=dict(job) if job else None,result=outcome,current_ip=address,verified_ip_change=verified)
     @app.post('/api/hkt-dhcp/<int:sid>')
     def trigger(sid):
         bearer=request.headers.get('Authorization','')
