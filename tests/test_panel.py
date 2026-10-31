@@ -280,7 +280,9 @@ class PanelTest(unittest.TestCase):
         r=self.post('/api/servers',{'name':'network-node'}).json;sid=r['id']
         uid=self.alice.get('/api/me').json['id']
         self.admin.patch('/api/servers/'+str(sid),json={'owner_id':uid},headers={'X-CSRF-Token':self.tokens['admin']})
-        h={'Authorization':'Bearer '+r['token']};base=int(time.time())
+        h={'Authorization':'Bearer '+r['token']}
+        # Keep these samples in one hour/day; midnight splitting has its own test.
+        base=int(time.time())//3600*3600+120
         with patch('server.time.time',return_value=base):
             self.assertEqual(self.admin.post('/api/agent/report',json={'rx_bytes':1000,'tx_bytes':2000,'uptime':100,'public_ips':['8.8.8.8']},headers=h).status_code,200)
         with patch('server.time.time',return_value=base+15):
@@ -870,7 +872,9 @@ class PanelTest(unittest.TestCase):
 
     def test_reboot_expired_and_late_ack_revocation(self):
         from unittest.mock import patch
-        r=self.post('/api/servers',{'name':'expire-test'}).json;sid=r['id'];h={'Authorization':'Bearer '+r['token']};base=int(time.time())
+        r=self.post('/api/servers',{'name':'expire-test'}).json;sid=r['id'];h={'Authorization':'Bearer '+r['token']}
+        # Keep these samples in one hour/day; midnight splitting has its own test.
+        base=int(time.time())//3600*3600+120
         uid=self.alice.get('/api/me').json['id']
         self.admin.patch(f'/api/servers/{sid}',json={'owner_id':uid},headers={'X-CSRF-Token':self.tokens['admin']})
         self.admin.post('/api/agent/report',json={'uptime':100,'capabilities':['reboot']},headers=h)
