@@ -56,14 +56,26 @@ class PrimaryFailover(unittest.TestCase):
         result=self.admin.post('/api/agent/report',json={'public_ips':[self.ips[sid]],'egress_ips':[self.ips[sid]],'egress_checked':self.clock[0],'tcp':25,'tcp_by_port':{'443':25},'connections_sampled':self.clock[0],'capabilities':['reboot'],'uptime':1000,'rx_bytes':0,'tx_bytes':0},headers={'Authorization':'Bearer '+self.nodes[name]['token']})
         self.assertEqual(result.status_code,200,result.json)
         with server.connect() as db:
-            source=db.execute('SELECT source_id FROM detection_plans WHERE server_id=?',(sid,)).fetchone()[0]
-            db.execute('INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details,scheduled) VALUES(?,?,?,443,?,\'completed\',?,?,?,1)',(sid,source,self.ips[sid],'["13"]',self.clock[0],self.clock[0],json.dumps([{'node_id':'13','state':'reachable' if self.health.get(sid) else 'unreachable'}])))
+            plan=db.execute('SELECT p.source_id,p.nodes,m.port FROM detection_plans p JOIN ip_monitors m ON m.server_id=p.server_id WHERE p.server_id=?',(sid,)).fetchone()
+            source=plan['source_id']
+            db.execute('INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details,scheduled) VALUES(?,?,?,?,?,\'completed\',?,?,?,1)',(sid,source,self.ips[sid],plan['port'],plan['nodes'],self.clock[0],self.clock[0],json.dumps([{'node_id':str(n),'state':'reachable' if self.health.get(sid) else 'unreachable'} for n in json.loads(plan['nodes'])])))
     def advance(self,seconds=15,online=('B','C')):
         self.clock[0]+=seconds
         for name in online:self.refresh(name)
     def down(self,name='A'):
         with server.connect() as db:db.execute('UPDATE servers SET seen=? WHERE id=?',(self.clock[0]-30,self.sid(name)))
-    def tick(self):rotation.tick(server.connect,server.CIPHER)
+    def tick(self):
+        rotation.tick(server.connect,server.CIPHER)
+        with server.connect() as db:
+            state=db.execute('SELECT * FROM vps_failover_probe_state WHERE rotation_id=?',(self.rid,)).fetchone()
+            plan=db.execute('SELECT source_id,nodes FROM detection_plans WHERE server_id=?',(self.sid('C'),)).fetchone()
+            c_online=not rotation._offline(db,self.sid('C'),self.clock[0],self.row()['offline_after_s'])
+            last=db.execute('SELECT id,source_id,nodes FROM detection_runs WHERE server_id=? ORDER BY id DESC LIMIT 1',(self.sid('C'),)).fetchone()
+        if c_online and state and state['active'] and (not last or last['id']<=state['run_floor'] or last['source_id']!=plan['source_id'] or last['nodes']!=plan['nodes']):
+            # Simulate the asynchronous detector completing the inherited task.
+            self.refresh('C')
+            rotation.tick(server.connect,server.CIPHER)
+
     def row(self):
         with server.connect() as db:return dict(db.execute('SELECT * FROM vps_rotations WHERE id=?',(self.rid,)).fetchone())
     def value(self,line):return self.records[self.bindings[line]]['Value']
@@ -254,3 +266,125 @@ class PrimaryFailover(unittest.TestCase):
         self.advance(30,('A','B','C'));self.tick()
         for line in self.bindings:self.assertEqual(self.value(line),'8.8.4.4')
         self.change.assert_not_called()
+    def test_cold_backup_requires_no_separate_C_plan_or_monitor(self):
+        with server.connect() as db:
+            failover.stop_probe(db,self.rid,remove=True)
+            db.execute('DELETE FROM detection_plans WHERE server_id=?',(self.sid('C'),))
+            db.execute('DELETE FROM ip_monitors WHERE server_id=?',(self.sid('C'),))
+        with patch('detectors.boce') as billed:
+            result=self.save();self.assertEqual(result.status_code,200,result.json)
+            preflight=self.post(f'/api/admin/servers/{self.sid("A")}/rotation/readiness',self.payload)
+            self.assertTrue(preflight.json['ok'],preflight.json);billed.assert_not_called()
+        with server.connect() as db:self.assertFalse(db.execute('SELECT 1 FROM detection_plans WHERE server_id=?',(self.sid('C'),)).fetchone())
+    def test_idle_C_scheduler_and_manual_probe_never_bill(self):
+        import detectors
+        with server.connect() as db:db.execute('UPDATE detection_plans SET automatic=1,next_at=? WHERE server_id=?',(self.clock[0],self.sid('C')))
+        with patch('detectors.boce') as billed:
+            detectors.tick(server.connect,server.CIPHER)
+            with self.assertRaisesRegex(IntegrationError,'冷备用'):detectors.start_run(server.connect,server.CIPHER,self.sid('C'))
+            billed.assert_not_called()
+    def test_activation_copies_A_probe_profile_and_requires_new_C_result(self):
+        with server.connect() as db:
+            db.execute('UPDATE detection_plans SET nodes=?,interval_s=180,daily_limit=17,failure_threshold=4 WHERE server_id=?',('["13","42"]',self.sid('A')))
+            db.execute('UPDATE ip_monitors SET port=8443 WHERE server_id=?',(self.sid('A'),))
+            source=db.execute('SELECT source_id FROM detection_plans WHERE server_id=?',(self.sid('A'),)).fetchone()[0]
+        self.down();rotation.tick(server.connect,server.CIPHER)
+        self.write.assert_not_called()
+        with server.connect() as db:
+            c=db.execute('SELECT * FROM detection_plans WHERE server_id=?',(self.sid('C'),)).fetchone()
+            self.assertEqual((c['source_id'],c['nodes'],c['interval_s'],c['daily_limit'],c['failure_threshold']),(source,'["13","42"]',180,17,4))
+            self.assertEqual(db.execute('SELECT port FROM ip_monitors WHERE server_id=?',(self.sid('C'),)).fetchone()[0],8443)
+        self.refresh('C');rotation.tick(server.connect,server.CIPHER)
+        self.assertEqual(self.value('telecom'),'9.9.9.9')
+    def test_return_to_A_stops_C_probes_and_does_not_duplicate_secrets(self):
+        with server.connect() as db:count=db.execute('SELECT COUNT(*) FROM detection_sources').fetchone()[0]
+        self.down();self.tick();self.advance(15,('A','B','C'));self.tick();self.advance(30,('A','B','C'));self.tick()
+        with server.connect() as db:
+            self.assertFalse(failover.probe_active(db,self.sid('C')))
+            self.assertEqual(db.execute('SELECT automatic FROM detection_plans WHERE server_id=?',(self.sid('C'),)).fetchone()[0],0)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM detection_sources').fetchone()[0],count)
+        with patch('detectors.boce') as billed:
+            import detectors
+            detectors.tick(server.connect,server.CIPHER);billed.assert_not_called()
+    def test_inherited_probe_tasks_share_A_daily_budget(self):
+        import detectors
+        with server.connect() as db:db.execute('UPDATE detection_plans SET daily_limit=1 WHERE server_id=?',(self.sid('A'),))
+        self.down();rotation.tick(server.connect,server.CIPHER)
+        with patch('detectors.boce',return_value={'data':{'id':'cold-task-1'}}) as billed:
+            run=detectors.start_run(server.connect,server.CIPHER,self.sid('C'),scheduled=True)
+            with server.connect() as db:
+                self.assertEqual(db.execute('SELECT primary_server_id FROM vps_failover_probe_costs WHERE run_id=?',(run,)).fetchone()[0],self.sid('A'))
+                db.execute("UPDATE detection_runs SET status='completed' WHERE id=?",(run,))
+                db.execute('UPDATE detection_plans SET next_at=?',(self.clock[0],))
+            with self.assertRaisesRegex(IntegrationError,'每日'):detectors.start_run(server.connect,server.CIPHER,self.sid('C'),scheduled=True)
+            with self.assertRaisesRegex(IntegrationError,'每日'):detectors.start_run(server.connect,server.CIPHER,self.sid('A'))
+            self.assertEqual(billed.call_count,1)
+    def test_offline_A_does_not_waste_scheduled_probe_budget(self):
+        import detectors
+        self.down()
+        with server.connect() as db:db.execute('UPDATE detection_plans SET next_at=? WHERE server_id=?',(self.clock[0],self.sid('A')))
+        with patch('detectors.boce') as billed:
+            detectors.tick(server.connect,server.CIPHER);billed.assert_not_called()
+    def test_A_API_is_never_reused_for_C_without_C_specific_API(self):
+        self.down();self.tick()
+        with server.connect() as db:
+            c=db.execute('SELECT * FROM detection_plans WHERE server_id=?',(self.sid('C'),)).fetchone()
+            self.assertEqual(c['response_mode'],'none');self.assertIsNone(c['action_connection_id']);self.assertEqual(c['action_enabled'],0)
+        self.change.assert_not_called()
+    def test_inherited_API_policy_uses_only_C_specific_action(self):
+        import detectors
+        with server.connect() as db:
+            action=db.execute("INSERT INTO ip_connections(name,kind,config,secret,server_id) VALUES('C only','change_ip',?, ?,?)",(json.dumps({'url':'https://example.com/change','method':'POST','body_json':'{}'}),server.CIPHER.encrypt(b'c-specific').decode(),self.sid('C'))).lastrowid
+        self.down();self.tick()
+        with server.connect() as db:
+            p=db.execute('SELECT * FROM detection_plans WHERE server_id=?',(self.sid('C'),)).fetchone()
+            self.assertEqual(p['action_connection_id'],action)
+            for _ in range(2):
+                run=db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details,scheduled) VALUES(?,?,?,443,?,'pending',?,?,?,1)",(self.sid('C'),p['source_id'],'9.9.9.9',p['nodes'],self.clock[0],self.clock[0],'[]')).lastrowid
+                row=db.execute('SELECT * FROM detection_runs WHERE id=?',(run,)).fetchone()
+                detectors.finish(db,row,'complete',[{'node_id':'13','state':'unreachable'}])
+        with patch('detectors.invoke_change_ip_api',return_value='accepted') as change:
+            detectors.execute_change_ip_actions(server.connect,server.CIPHER)
+            change.assert_called_once();self.assertEqual(change.call_args.args[1],self.sid('C'))
+    def test_inherited_reboot_policy_targets_C_not_A(self):
+        import detectors
+        with server.connect() as db:db.execute("UPDATE detection_plans SET response_mode='reboot' WHERE server_id=?",(self.sid('A'),))
+        self.down();self.tick()
+        with server.connect() as db:
+            p=db.execute('SELECT * FROM detection_plans WHERE server_id=?',(self.sid('C'),)).fetchone()
+            self.assertEqual(p['response_mode'],'reboot')
+            for _ in range(2):
+                run=db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details,scheduled) VALUES(?,?,?,443,?,'pending',?,?,?,1)",(self.sid('C'),p['source_id'],'9.9.9.9',p['nodes'],self.clock[0],self.clock[0],'[]')).lastrowid
+                detectors.finish(db,db.execute('SELECT * FROM detection_runs WHERE id=?',(run,)).fetchone(),'complete',[{'node_id':'13','state':'unreachable'}])
+            commands=db.execute('SELECT server_id FROM commands').fetchall()
+            self.assertEqual([x[0] for x in commands],[self.sid('C')])
+
+    def test_live_A_node_changes_are_inherited_without_old_result_reuse(self):
+        self.down();self.tick()
+        with server.connect() as db:
+            old_floor=db.execute('SELECT run_floor FROM vps_failover_probe_state WHERE rotation_id=?',(self.rid,)).fetchone()[0]
+            db.execute('UPDATE detection_plans SET nodes=?,failure_threshold=4 WHERE server_id=?',('["42"]',self.sid('A')))
+        rotation.tick(server.connect,server.CIPHER)
+        with server.connect() as db:
+            self.assertEqual(db.execute('SELECT nodes FROM detection_plans WHERE server_id=?',(self.sid('C'),)).fetchone()[0],'["42"]')
+            self.assertGreater(db.execute('SELECT run_floor FROM vps_failover_probe_state WHERE rotation_id=?',(self.rid,)).fetchone()[0],old_floor)
+        self.assertIn('本次接管拨测',self.row()['status'])
+        self.refresh('C');rotation.tick(server.connect,server.CIPHER)
+        self.assertEqual(self.value('mobile'),'9.9.9.9')
+    def test_pausing_A_probes_pauses_inherited_C_and_resume_revalidates(self):
+        import detectors
+        self.down();self.tick()
+        with server.connect() as db:
+            db.execute('UPDATE detection_plans SET automatic=0 WHERE server_id=?',(self.sid('A'),))
+            db.execute('UPDATE detection_plans SET next_at=? WHERE server_id=?',(self.clock[0],self.sid('C')))
+        with patch('detectors.boce') as billed:detectors.tick(server.connect,server.CIPHER);billed.assert_not_called()
+        with server.connect() as db:
+            self.assertEqual(db.execute('SELECT automatic FROM detection_plans WHERE server_id=?',(self.sid('C'),)).fetchone()[0],0)
+            db.execute('UPDATE detection_plans SET automatic=1 WHERE server_id=?',(self.sid('A'),))
+        self.tick()
+        with server.connect() as db:self.assertEqual(db.execute('SELECT automatic FROM detection_plans WHERE server_id=?',(self.sid('C'),)).fetchone()[0],1)
+    def test_removing_cold_role_restores_original_C_settings(self):
+        result=self.save(failover_server_id=None);self.assertEqual(result.status_code,200,result.json)
+        with server.connect() as db:
+            self.assertEqual(db.execute('SELECT automatic FROM detection_plans WHERE server_id=?',(self.sid('C'),)).fetchone()[0],1)
+            self.assertFalse(db.execute('SELECT 1 FROM vps_failover_probe_state WHERE rotation_id=?',(self.rid,)).fetchone())

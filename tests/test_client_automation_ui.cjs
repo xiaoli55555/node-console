@@ -66,6 +66,8 @@ test('primary outage failover exposes a distinct C and all-A scope without a par
  const html=ctx.rotationModeFields({mode:'fixed_primary',other_server_id:2,failover_server_id:3,failover_recovery_s:45,failover_status:'<waiting>'},[{id:1,name:'A'},{id:2,name:'B'},{id:3,name:'<C>'}],[],1);
  for(const value of ['name="failover_server_id"','name="failover_recovery_s"','A 的全部绑定解析','A、B 都下线'])assert.ok(html.includes(value),value);
  assert.doesNotMatch(html,/name="failover_binding_ids"/);
+ assert.match(html,/备用机闲时不拨测/);
+ assert.match(html,/临时继承 A 的探测点/);
  assert.match(html,/value="1" disabled/);assert.match(html,/value="2" disabled/);assert.match(html,/value="3"\s+selected/);
  assert.match(html,/&lt;C&gt;/);assert.match(html,/&lt;waiting&gt;/);
 });

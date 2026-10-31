@@ -499,7 +499,7 @@ def assign(sid):
         current=db.execute('SELECT id,owner_id FROM servers WHERE id=?',(sid,)).fetchone()
         if not current:return error('服务器不存在',404)
         if owner is not None and not db.execute("SELECT id FROM users WHERE id=? AND role='client'",(owner,)).fetchone():return error('客户不存在')
-        if current['owner_id']!=owner and db.execute('SELECT 1 FROM vps_rotations r WHERE (r.primary_server_id=? OR r.other_server_id=? OR r.failover_server_id=?) AND EXISTS(SELECT 1 FROM vps_failover_leases l WHERE l.rotation_id=r.id)',(sid,sid,sid)).fetchone():return error('故障转移仍在接替，解析切回前不能变更服务器归属',409)
+        if current['owner_id']!=owner and db.execute('SELECT 1 FROM vps_rotations r WHERE (r.primary_server_id=? OR r.other_server_id=? OR r.failover_server_id=?) AND r.failover_server_id IS NOT NULL',(sid,sid,sid)).fetchone():return error('服务器已配置冷备用，请先安全停用故障转移再变更归属',409)
         if current['owner_id']!=owner and current['owner_id'] is not None:
             # Customer-owned DNS/action credentials must never transfer with a VPS.
             if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vps_rotations'").fetchone():
@@ -545,7 +545,7 @@ def create_install_ticket(sid):
 @auth(True)
 def delete(sid):
     with connect() as db:
-        if db.execute('SELECT 1 FROM vps_rotations r WHERE r.failover_server_id=? OR ((r.primary_server_id=? OR r.other_server_id=?) AND EXISTS(SELECT 1 FROM vps_failover_leases l WHERE l.rotation_id=r.id))',(sid,sid,sid)).fetchone():return error('该服务器参与 A 故障转移，请先安全切回解析并移除故障转移配置',409)
+        if db.execute('SELECT 1 FROM vps_rotations r WHERE r.failover_server_id IS NOT NULL AND (r.failover_server_id=? OR r.primary_server_id=? OR r.other_server_id=?)',(sid,sid,sid)).fetchone():return error('该服务器参与 A 故障转移，请先安全切回解析并移除故障转移配置',409)
         db.execute('DELETE FROM servers WHERE id=?',(sid,));audit(db,f'移除服务器 #{sid}')
     return jsonify(ok=True)
 

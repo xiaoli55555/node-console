@@ -129,8 +129,8 @@ def finish(db,run,status,rows):
         scheduled=bool(run['scheduled']) if 'scheduled' in run.keys() else False
         streak=plan['failure_streak']
         rotation_managed=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vps_rotations'").fetchone() and db.execute('SELECT 1 FROM vps_rotations WHERE enabled=1 AND (primary_server_id=? OR other_server_id=?)',(run['server_id'],run['server_id'])).fetchone()
-        from failover import reserved
-        rotation_managed=rotation_managed or reserved(db,run['server_id'])
+        from failover import reserved, probe_active
+        rotation_managed=rotation_managed or (reserved(db,run['server_id']) and not probe_active(db,run['server_id']))
         if scheduled and plan['action_enabled'] and run['id']>plan['action_after_run'] and not rotation_managed:
             recovering=db.execute("SELECT 1 FROM detection_runs WHERE server_id=? AND action_status='verifying' LIMIT 1",(run['server_id'],)).fetchone()
             complete_failure=bool(rows) and (all(r.get('state')=='unreachable' for r in rows) or (recovering and all(r.get('state') in ('reachable','unreachable') for r in rows) and any(r.get('state')=='unreachable' for r in rows)))
@@ -175,6 +175,9 @@ def start_run(connect,cipher,sid,scheduled=False):
     # Hold the SQLite write lock across creation. Ambiguous POST failure is NOT retried automatically.
     with connect() as db:
         db.execute('BEGIN IMMEDIATE')
+        from failover import probe_blocked, parent_probe_suspended
+        if probe_blocked(db,sid):raise IntegrationError('冷备用待命，不运行拨测、不占用探测额度')
+        if scheduled and parent_probe_suspended(db,sid,int(time.time())):raise IntegrationError('A 已下线，拨测配置已交给冷备用接管')
         p=db.execute('SELECT p.*,s.kind,s.secret,s.enabled FROM detection_plans p JOIN detection_sources s ON s.id=p.source_id WHERE p.server_id=?',(sid,)).fetchone()
         m=db.execute('SELECT * FROM ip_monitors WHERE server_id=?',(sid,)).fetchone()
         if not p or not m:raise IntegrationError('请先配置 VPS 的检测来源')
@@ -188,9 +191,14 @@ def start_run(connect,cipher,sid,scheduled=False):
         from datetime import datetime
         from zoneinfo import ZoneInfo
         z=ZoneInfo('Asia/Shanghai');today=datetime.now(z).replace(hour=0,minute=0,second=0,microsecond=0).timestamp()
-        used=db.execute('SELECT COALESCE(SUM(cost),0) FROM detection_runs WHERE server_id=? AND created>=?',(sid,today)).fetchone()[0]
+        from failover import budget_primary
+        primary=budget_primary(db,sid)
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vps_failover_probe_costs'").fetchone():
+            used=db.execute('SELECT COALESCE(SUM(cost),0) FROM detection_runs WHERE created>=? AND (server_id=? OR id IN (SELECT run_id FROM vps_failover_probe_costs WHERE primary_server_id=?))',(today,primary,primary)).fetchone()[0]
+        else:used=db.execute('SELECT COALESCE(SUM(cost),0) FROM detection_runs WHERE server_id=? AND created>=?',(sid,today)).fetchone()[0]
         if used+cost>p['daily_limit']:raise IntegrationError('已达到此 VPS 的每日节点检测次数上限')
         rid=db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,poll_at,cost,scheduled) VALUES(?,?,?,?,?,'creating',?,?,?,?,?)",(sid,p['source_id'],ip,m['port'],json.dumps(nodes),now,now,now+10,cost,int(scheduled))).lastrowid
+        if primary!=sid:db.execute('INSERT INTO vps_failover_probe_costs(run_id,primary_server_id) VALUES(?,?)',(rid,primary))
         db.execute('UPDATE detection_plans SET next_at=?,status=? WHERE server_id=?',(now+p['interval_s'],'检测中',sid))
         try:
             if p['kind']=='boce':
@@ -232,6 +240,12 @@ def tick(connect,cipher):
     with connect() as db:
         due=[r[0] for r in db.execute('SELECT p.server_id FROM detection_plans p JOIN ip_monitors m ON m.server_id=p.server_id JOIN detection_sources s ON s.id=p.source_id WHERE p.automatic=1 AND m.enabled=1 AND s.enabled=1 AND p.next_at<=?',(now,))]
     for sid in due:
+        from failover import probe_blocked, parent_probe_suspended
+        with connect() as db:
+            if parent_probe_suspended(db,sid,now):
+                db.execute("UPDATE detection_plans SET next_at=?,status='A 已下线，等待冷备用接管' WHERE server_id=?",(now+15,sid));continue
+            if probe_blocked(db,sid):
+                db.execute("UPDATE detection_plans SET automatic=0,status='冷备用待命，不运行拨测' WHERE server_id=?",(sid,));continue
         try:start_run(connect,cipher,sid,scheduled=True)
         except IntegrationError as e:
             retry_after=5 if '已有检测任务进行中' in str(e) else 60
@@ -260,8 +274,8 @@ def execute_change_ip_actions(connect,cipher):
                 if p and p['response_mode']=='reboot':continue
                 db.execute("UPDATE detection_runs SET action_status='cancelled',action_result='换 IP 计划已移除或更换' WHERE id=?",(rid,));continue
             rotation_managed=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vps_rotations'").fetchone() and db.execute('SELECT 1 FROM vps_rotations WHERE enabled=1 AND (primary_server_id=? OR other_server_id=?)',(r['server_id'],r['server_id'])).fetchone()
-            from failover import reserved
-            rotation_managed=rotation_managed or reserved(db,r['server_id'])
+            from failover import reserved, probe_active
+            rotation_managed=rotation_managed or (reserved(db,r['server_id']) and not probe_active(db,r['server_id']))
             valid=not rotation_managed and p['automatic'] and p['action_enabled'] and p['source_enabled'] and p['monitor_enabled'] and r['scheduled'] and r['id']>p['action_after_run'] and p['source_id']==r['source_id'] and p['nodes']==r['nodes'] and p['monitor_port']==r['port'] and p['action_connection_id']
             if not valid:
                 db.execute("UPDATE detection_runs SET action_status='cancelled',action_result='监控或动作已暂停，或检测目标/计划已变更' WHERE id=?",(rid,));continue
@@ -411,6 +425,9 @@ def register(app,connect,cipher,auth,body,error,audit):
             personal=plan['owner_id']==g.user['id'] and plan['source_owner']==g.user['id'] and plan['source_server']==sid
             safe_plan={'source_id':plan['source_id'] if personal else None,'nodes':json.loads(plan['nodes']) if personal else [],'interval_s':plan['interval_s'] if personal else 600,'daily_limit':plan['daily_limit'] if personal else 1000,'automatic':bool(plan['automatic']) if personal else False,'actions_locked':bool(not personal and plan['action_enabled'] and plan['response_mode'] in ('reboot','change_api'))}
             if personal:safe_plan.update(response_mode=plan['response_mode'],action_enabled=bool(plan['action_enabled']),failure_threshold=plan['failure_threshold'],action_connection_id=plan['action_connection_id'] if plan['action_owner']==g.user['id'] and plan['action_server']==sid else None)
+        if safe_plan:
+            with connect() as db:inherited=db.execute('SELECT r.primary_server_id FROM vps_failover_probe_state f JOIN vps_rotations r ON r.id=f.rotation_id WHERE f.server_id=? AND f.active=1 AND r.owner_id=?',(sid,g.user['id'])).fetchone()
+            if inherited:safe_plan.update(inherited_from=inherited['primary_server_id'],nodes=json.loads(plan['nodes']),interval_s=plan['interval_s'],daily_limit=plan['daily_limit'],automatic=bool(plan['automatic']),actions_locked=True)
         run=dict(latest) if latest else None
         if run:run['details']=json.loads(run['details'])
         status={'run':run,'failure_streak':plan['failure_streak'] if plan else 0,'failure_ip':plan['failure_ip'] if plan else None,'failure_port':plan['failure_port'] if plan else None,'next_at':plan['next_at'] if plan else None,'plan_status':plan['status'] if plan else '尚未配置探测','checked':plan['checked'] if plan else None}

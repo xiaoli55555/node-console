@@ -242,10 +242,10 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
             if backup is not None:
                 try:
                     if type(backup)is not int or backup in (sid,other):raise IntegrationError('A 故障转移必须选择不同于 A/B 的第三台 VPS')
-                    failover.probe_config(db,backup,effective_uid)
-                    _fixed_ready(db,cipher,{'phase':'active','drain_server_id':None},backup,now)
+                    failover.probe_config(db,sid,effective_uid)
+                    failover.standby_ready(db,cipher,{'primary_server_id':sid,'owner_id':effective_uid,'offline_after_s':d.get('offline_after_s',15)},backup,now)
                     if not db.execute('SELECT 1 FROM dns_bindings WHERE server_id=?',(sid,)).fetchone():raise IntegrationError('A 尚未绑定解析记录')
-                    checks.append({'name':'A 故障转移 VPS','ok':True,'message':'所选检测点、当前 IP、端口和动作状态可接替；未修改 DNS'})
+                    checks.append({'name':'A 故障转移 VPS','ok':True,'message':'冷备用就绪；故障时继承 A 的探测点，待命不拨测、不消耗额度'})
                 except IntegrationError as e:checks.append({'name':'A 故障转移 VPS','ok':False,'message':str(e)})
             binding=db.execute('SELECT b.*,c.owner_id AS credential_owner FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id WHERE b.id=? AND b.server_id=?',(bid,sid)).fetchone()
             try:
@@ -268,6 +268,7 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
             rotation=db.execute('SELECT * FROM vps_rotations WHERE primary_server_id=? AND (? OR owner_id=?)',(sid,int(g.user['role']=='admin'),g.user['id'])).fetchone()
             if not rotation:return error('轮换计划不存在',404)
             if rotation['enabled'] or rotation['phase']!='active' or rotation['dns_intent'] or db.execute('SELECT 1 FROM vps_failover_leases WHERE rotation_id=?',(rotation['id'],)).fetchone():return error('请先暂停轮换；正在排空或换 IP 的流程完成后才能删除',409)
+            failover.stop_probe(db,rotation['id'],remove=True)
             db.execute('DELETE FROM vps_rotations WHERE id=?',(rotation['id'],));audit(db,'删除双 VPS 轮换计划 #'+str(rotation['id']))
         return jsonify(ok=True)
     delete_rotation.__name__='client_delete_vps_rotation'
