@@ -335,7 +335,7 @@ def step(connect,cipher,rid,now):
                 work.append(bid)
             db.commit()
             for bid in work:_move(connect,cipher,rid,bid,address,now)
-            with connect() as saved:_status(saved,rid,'A 心跳超时，A 的全部解析由故障转移 VPS 接替（健康 B 的移动记录保持 B）；A/B 定时动作暂停',now)
+            with connect() as saved:_status(saved,rid,'A 心跳超时，A 的全部解析由故障转移 VPS 接替（健康 B 的所选轮换记录保持 B）；A/B 定时动作暂停',now)
             return True
         # A returned: verify selected nodes and current IP, then apply hysteresis.
         rot._request_probe(db,r['primary_server_id'],now)

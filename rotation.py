@@ -170,7 +170,7 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
                 ack=d.get('mobile_only_ack',bool(rotation['mobile_only_ack']) if rotation else False)
                 if mode not in ('alternating','fixed_primary') or type(takeover)is not int or not 60<=takeover<=604800 or (first is not None and (type(first)is not int or not 0<=first<=253402300799)) or type(ack)is not bool:
                     return error('请检查轮换模式、接替时长（必须短于周期）和首次切入时间')
-                if mode=='fixed_primary' and not ack:return error('请确认所选记录仅服务移动线路，或为移动专用域名；不可选择所有运营商共用记录')
+                if mode=='fixed_primary' and not ack:return error('请确认仅轮换选定的 DNS 记录；选择默认线路时，该记录覆盖的所有运营商都会切换')
                 if rotation and mode!=rotation['mode'] and (rotation['enabled'] or rotation['phase']!='active' or rotation['active_server_id']!=sid or rotation['dns_intent']):
                     return error('切换模式前请暂停任务，并确认流程已完成且解析已回到主 VPS',409)
 
@@ -373,7 +373,7 @@ def _fixed_ready(db,cipher,r,sid,now,verified_candidate=None):
 
 
 def _fixed_action_safe(db,cipher,r,old,now):
-    if old==r['active_server_id']:raise IntegrationError('此 VPS 当前仍承载移动解析，禁止换 IP')
+    if old==r['active_server_id']:raise IntegrationError('此 VPS 当前仍承载所选线路解析，禁止换 IP')
     active=r['active_server_id']
     _request_probe(db,active,now)
     if _pending_action(db,active):raise IntegrationError('承载 VPS 有未完成动作，禁止同时更换两台 IP')
@@ -454,7 +454,7 @@ def _coordinate_fixed(connect,cipher,rid,now):
                 try:_fixed_ready(db,cipher,r,active,now)
                 except IntegrationError as e:
                     db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('故障修复等待：'+str(e),now,rid));return True
-            message='所选检测点确认主 VPS 不通，移动保持轮换机，协调主 VPS 自动换 IP' if target==a else '轮换 VPS 所选检测点不通，保持当前解析，等待连接阈值后修复'
+            message='所选检测点确认主 VPS 不通，所选记录保持轮换机，协调主 VPS 自动换 IP' if target==a else '轮换 VPS 所选检测点不通，保持当前解析，立即修复故障 IP'
             _begin_fixed_repair(db,cipher,r,target,now,message)
             return True
         if r['next_switch_at']-now<=60:
@@ -521,7 +521,7 @@ def _dns_switch(connect,cipher,rotation,now,emergency=False,offline=False):
         db.execute('UPDATE detection_plans SET next_at=MIN(next_at,?) WHERE server_id=?',(now,target))
         if _fixed(r) and target==r['other_server_id'] and not _fixed_failure(db,r['primary_server_id'],now):
             # Scheduled takeover never drains or refreshes the fixed primary.
-            message=f'移动解析已切入轮换 VPS #{target}；主 VPS 保持原 IP；到时切回主 VPS'
+            message=f'所选线路解析已切入轮换 VPS #{target}；主 VPS 保持原 IP；到时切回主 VPS'
             db.execute("UPDATE vps_rotations SET active_server_id=?,phase='active',drain_server_id=NULL,emergency=0,status=?,next_switch_at=?,updated=? WHERE id=?",(target,message,now+r['interval_s'],now,rotation))
             db.execute('UPDATE dns_bindings SET status=? WHERE id=?',(message,binding['id']))
             _event(db,rotation,target,message,now)
@@ -613,7 +613,7 @@ def _run_rotation(connect,cipher,rid,now):
                 address,port,_=_fresh_ip(db,old,now,cipher)
                 reason=boce_dns_gate(db,old,address,port,require_plan=True)
                 if reason:raise IntegrationError('等待主 VPS 恢复确认：'+reason)
-                db.execute("UPDATE vps_rotations SET phase='active',drain_server_id=NULL,emergency=0,next_switch_at=?,status=?,updated=? WHERE id=?",(now,'主 VPS 已恢复且保持原 IP，准备切回移动解析',now,rid));return
+                db.execute("UPDATE vps_rotations SET phase='active',drain_server_id=NULL,emergency=0,next_switch_at=?,status=?,updated=? WHERE id=?",(now,'主 VPS 已恢复且保持原 IP，准备切回所选线路解析',now,rid));return
             if not r['emergency'] and (_fixed_failure(db,old,now) if _fixed(r) else _failed_ip(db,old,now)):
                 db.execute('UPDATE vps_rotations SET emergency=1,low_samples=2,drain_grace_s=0 WHERE id=?',(rid,))
                 r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()

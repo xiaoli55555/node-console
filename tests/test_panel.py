@@ -521,7 +521,7 @@ class PanelTest(unittest.TestCase):
         now=int(time.time())
         with server.connect() as db:
             cid=db.execute("INSERT INTO ip_connections(name,kind,config,secret) VALUES('DNS','alidns','{}','test')").lastrowid
-            bid=db.execute("INSERT INTO dns_bindings(server_id,connection_id,domain,record_id,rr,line,expected_ip,port,automatic) VALUES(?,?,'example.com','mobile-record','edge','mobile','8.8.8.8',443,0)",(a,cid)).lastrowid
+            bid=db.execute("INSERT INTO dns_bindings(server_id,connection_id,domain,record_id,rr,line,expected_ip,port,automatic) VALUES(?,?,'example.com','telecom-record','edge','telecom','8.8.8.8',443,0)",(a,cid)).lastrowid
         def snapshot(db,sid,now,cipher):return {'ip':'8.8.8.8' if sid==a else '1.1.1.1','port':443,'metrics':{'tcp':25,'connections_sampled':now}}
         payload={'other_server_id':b,'binding_id':bid,'interval_s':7200,'takeover_s':600,'first_switch_at':now+120,'mode':'fixed_primary','mobile_only_ack':True,'enabled':True}
         url=f'/api/admin/servers/{a}/rotation'

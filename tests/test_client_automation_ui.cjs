@@ -57,6 +57,9 @@ test('both rotation modes remain available and legacy tasks default to alternati
  const fixed=ctx.rotationModeFields({mode:'fixed_primary',takeover_s:1200,mobile_only_ack:1});
  assert.match(fixed,/value="fixed_primary" selected/);
  assert.match(fixed,/B 每次承载时长/);
+ assert.match(fixed,/固定主机＋定时线路轮换/);
+ assert.match(fixed,/移动、电信、联通、默认/);
+ assert.doesNotMatch(fixed,/确认所选记录是移动线路/);
  assert.match(fixed,/name="mobile_only_ack"[^>]*checked/);
  assert.match(fixed,/现有 TCP 已建立连接总数/);
  assert.doesNotMatch(fixed,/轮换机需升级 agent/);
