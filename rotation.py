@@ -183,6 +183,8 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
                     db.execute("UPDATE vps_rotations SET enabled=0,status='轮换已暂停',interval_s=?,low_samples=CASE WHEN connection_threshold<>? THEN 0 ELSE low_samples END,last_sample_at=CASE WHEN connection_threshold<>? THEN NULL ELSE last_sample_at END,connection_threshold=?,lead_s=?,offline_after_s=?,takeover_s=?,first_switch_at=?,mobile_only_ack=?,updated=? WHERE id=?",(d.get('interval_s',rotation['interval_s']),kept_threshold,kept_threshold,kept_threshold,0 if mode=='fixed_primary' else d.get('lead_s',rotation['lead_s']),d.get('offline_after_s',rotation['offline_after_s']),takeover,first,int(ack),now,rotation['id']))
                     audit(db,'暂停双 VPS 定时轮换 #'+str(rotation['id']))
                     return jsonify(ok=True,rotation=_rotation_json(db,db.execute('SELECT * FROM vps_rotations WHERE id=?',(rotation['id'],)).fetchone()))
+                import server_failover
+                if server_failover.reserved(db,sid) or server_failover.reserved(db,other):return error('冷备用已被单机故障转移占用，不能参与轮换',409)
                 conflicts=db.execute('SELECT id FROM vps_rotations WHERE enabled=1 AND (primary_server_id IN (?,?) OR other_server_id IN (?,?)) AND id<>?',(sid,other,sid,other,rotation['id'] if rotation else -1)).fetchone()
                 if enabled and (conflicts or db.execute('SELECT 1 FROM vps_rotations WHERE id<>? AND failover_server_id IN (?,?) AND (enabled=1 OR failover_server_id IS NOT NULL OR EXISTS(SELECT 1 FROM vps_failover_leases l WHERE l.rotation_id=vps_rotations.id))',(rotation['id'] if rotation else -1,sid,other)).fetchone()):return error('其中一台 VPS 已参加其他启用中的轮换或故障转移任务',409)
                 binding=db.execute('SELECT b.*,c.kind,c.owner_id AS connection_owner,c.server_id AS connection_server FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id WHERE b.id=?',(binding_id,)).fetchone()
@@ -659,8 +661,12 @@ def _run_rotation(connect,cipher,rid,now):
             plan=_validated_plan(db,old,r['owner_id'])
             if not plan or (plan.get('rotation_action')!='reboot' and not plan['action_connection_id']):
                 db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('旧机连接已降至阈值，但未配置换 IP API',now,rid));return
+            from server_failover import before_action
+            reason=before_action(db,old,now,cipher)
+            if reason:
+                db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',(reason,now,rid));return
             if plan.get('rotation_action')=='reboot':
-                message=queue_reboot(db,old,now)
+                message=queue_reboot(db,old,now,cipher)
                 if not message.startswith('已排队'):
                     db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',(message,now,rid));return
                 command=db.execute("SELECT id FROM commands WHERE server_id=? AND action='reboot' AND status='queued' ORDER BY id DESC LIMIT 1",(old,)).fetchone()
@@ -708,6 +714,10 @@ def _run_rotation(connect,cipher,rid,now):
                     db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('换 IP 暂缓：'+str(e),now,rid));return
             if not r['emergency']:
                 db.execute("UPDATE vps_rotations SET phase='draining',emergency=0,low_samples=0,last_sample_at=NULL,action_started=NULL,status=?,updated=? WHERE id=?",('未观察到 IP 变化；重新确认轮换机连接数后再重试',now,rid));return
+            from server_failover import before_action
+            reason=before_action(db,old,now,cipher)
+            if reason:
+                db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',(reason,now,rid));return
             action=load_connection(db,cipher,plan['action_connection_id']) if plan and plan['action_connection_id'] else None
             server=db.execute('SELECT name FROM servers WHERE id=?',(old,)).fetchone()
             if not action:db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('等待有效的旧 VPS 换 IP API',now,rid));return

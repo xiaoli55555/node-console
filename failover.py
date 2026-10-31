@@ -32,6 +32,8 @@ def initialize(db):
     for name,definition in [('failover_server_id','INTEGER REFERENCES servers(id) ON DELETE RESTRICT'),('failover_binding_ids',"TEXT NOT NULL DEFAULT '[]'"),('failover_recovery_s','INTEGER NOT NULL DEFAULT 60'),('failover_healthy_since','INTEGER'),('failover_status',"TEXT NOT NULL DEFAULT '未配置 A 故障转移'")]:
         if name not in columns:db.execute(f'ALTER TABLE vps_rotations ADD COLUMN {name} {definition}')
     db.executescript(SCHEMA)
+    import server_failover
+    server_failover.initialize(db)
     for r in db.execute('SELECT * FROM vps_rotations WHERE failover_server_id IS NOT NULL').fetchall():
         state=_remember_probe(db,r['id'],r['failover_server_id'])
         if not state['active']:db.execute("UPDATE detection_plans SET automatic=0,action_enabled=0,status='冷备用待命，不运行拨测' WHERE server_id=?",(r['failover_server_id'],))
@@ -39,15 +41,22 @@ def initialize(db):
 
 def guarded(db,bid):
     exists=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vps_failover_leases'").fetchone()
-    return bool(exists and db.execute('SELECT 1 FROM vps_failover_leases WHERE binding_id=?',(bid,)).fetchone())
+    import server_failover
+    return bool(exists and db.execute('SELECT 1 FROM vps_failover_leases WHERE binding_id=?',(bid,)).fetchone()) or bool(server_failover.exists(db) and db.execute('SELECT 1 FROM server_failover_leases WHERE binding_id=?',(bid,)).fetchone())
 
 
 def reserved(db,sid):
     exists=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vps_failover_leases'").fetchone()
-    return bool(exists and db.execute('SELECT 1 FROM vps_rotations r WHERE r.failover_server_id=?',(sid,)).fetchone())
+    import server_failover
+    return bool(exists and db.execute('SELECT 1 FROM vps_rotations r WHERE r.failover_server_id=?',(sid,)).fetchone()) or server_failover.reserved(db,sid)
 
 
 def probe_active(db,sid):
+    import server_failover
+    r=server_failover.parent(db,sid,active=True)
+    if r:
+        p=db.execute('SELECT p.automatic,s.enabled,m.enabled AS monitor_enabled FROM detection_plans p JOIN detection_sources s ON s.id=p.source_id JOIN ip_monitors m ON m.server_id=p.server_id WHERE p.server_id=?',(r['server_id'],)).fetchone()
+        return bool(p and p['automatic'] and p['enabled'] and p['monitor_enabled'])
     if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vps_failover_probe_state'").fetchone():return False
     return bool(db.execute('SELECT 1 FROM vps_failover_probe_state s JOIN vps_rotations r ON r.id=s.rotation_id JOIN detection_plans p ON p.server_id=r.primary_server_id JOIN detection_sources d ON d.id=p.source_id JOIN ip_monitors m ON m.server_id=r.primary_server_id WHERE s.server_id=? AND s.active=1 AND p.automatic=1 AND d.enabled=1 AND m.enabled=1',(sid,)).fetchone())
 
@@ -64,6 +73,9 @@ def parent_probe_suspended(db,sid,now):
 
 
 def budget_primary(db,sid):
+    import server_failover
+    r=server_failover.parent(db,sid,active=True)
+    if r:return r['server_id']
     if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vps_failover_probe_state'").fetchone():return sid
     row=db.execute('SELECT r.primary_server_id FROM vps_failover_probe_state s JOIN vps_rotations r ON r.id=s.rotation_id WHERE s.server_id=? AND s.active=1',(sid,)).fetchone()
     return row['primary_server_id'] if row else sid
@@ -184,6 +196,8 @@ def configure(db,cipher,rid,body,now):
     leases=db.execute('SELECT 1 FROM vps_failover_leases WHERE rotation_id=?',(rid,)).fetchone()
     if leases and changed:raise IntegrationError('故障转移记录尚未切回 A，不能修改或移除故障转移配置')
     if sid is not None:
+        import server_failover
+        if server_failover.exists(db) and db.execute('SELECT 1 FROM server_failovers WHERE server_id IN (?,?) OR backup_id=? OR (cold=1 AND backup_id IN (?,?))',(sid,r['primary_server_id'],sid,r['primary_server_id'],r['other_server_id'])).fetchone():raise IntegrationError('A/B 或备用机已配置单机故障转移，请先移除冲突配置')
         if not ids:raise IntegrationError('A 尚未绑定解析记录，无法启用故障转移')
         probe_config(db,r['primary_server_id'],r['owner_id'])
         if rot._pending_action(db,sid):raise IntegrationError('故障转移 VPS 有未结束的重启或换 IP 动作')
@@ -285,7 +299,16 @@ def step(connect,cipher,rid,now):
         if not r or not r['failover_server_id']:return False
         leases=db.execute('SELECT 1 FROM vps_failover_leases WHERE rotation_id=?',(rid,)).fetchone()
         if not rot._owned_server(db,r['primary_server_id'],r['owner_id']):raise IntegrationError('主 VPS 归属已变化，故障转移暂停')
-        down=rot._offline(db,r['primary_server_id'],now,r['offline_after_s'])
+        offline=rot._offline(db,r['primary_server_id'],now,r['offline_after_s'])
+        protecting_change=(r['active_server_id']==r['other_server_id'] and r['drain_server_id']==r['primary_server_id'] and r['phase'] in ('draining','waiting_ip','waiting_probe'))
+        if protecting_change and not offline and r['phase'] in ('waiting_ip','waiting_probe'):
+            try:
+                address,_,_=rot._fresh_ip(db,r['primary_server_id'],now,cipher)
+                if address!=r['old_ip']:
+                    rot._fixed_ready(db,cipher,dict(r,phase='active',drain_server_id=None),r['primary_server_id'],now,verified_candidate=address)
+                    protecting_change=False
+            except IntegrationError:pass
+        down=offline or protecting_change
         if not down and not leases:
             stop_probe(db,rid)
             if r['failover_status'].startswith('A 心跳超时'):_status(db,rid,'A 已在线，故障转移待命',now)
@@ -335,8 +358,8 @@ def step(connect,cipher,rid,now):
                 work.append(bid)
             db.commit()
             for bid in work:_move(connect,cipher,rid,bid,address,now)
-            with connect() as saved:_status(saved,rid,'A 心跳超时，A 的全部解析由故障转移 VPS 接替（健康 B 的所选轮换记录保持 B）；A/B 定时动作暂停',now)
-            return True
+            with connect() as saved:_status(saved,rid,'A 心跳超时，A 的全部解析由故障转移 VPS 接替（健康 B 的所选轮换记录保持 B）；A/B 定时动作暂停' if offline else 'A 换 IP 期间，其他解析由故障转移 VPS 接替；轮换记录保持健康 B',now)
+            return bool(offline)
         # A returned: verify selected nodes and current IP, then apply hysteresis.
         rot._request_probe(db,r['primary_server_id'],now)
         try:

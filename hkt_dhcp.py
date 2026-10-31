@@ -7,6 +7,7 @@ from flask import jsonify, request, g
 from ip_dns import IntegrationError
 
 _connect=None
+_cipher=None
 
 def initialize(connect):
     global _connect
@@ -42,6 +43,11 @@ def queue(server_id,connection_id=None,managed=False):
         if r and (r['active_server_id']==server_id or r['drain_server_id']!=server_id or r['phase'] not in ('draining','waiting_ip','waiting_probe')):
             raise IntegrationError('此机器仍承载轮换解析，或未进入换 IP 阶段')
         if db.execute('SELECT 1 FROM vps_rotations WHERE failover_server_id=?',(server_id,)).fetchone():raise IntegrationError('冷备用 C 不接受此 DHCP API 动作')
+        from server_failover import before_action
+        reason=before_action(db,server_id,now,_cipher)
+        if reason:
+            db.commit() # Persist the takeover request even when the API returns a wait error.
+            raise IntegrationError(reason)
         pending=db.execute("SELECT id,action,status FROM commands WHERE server_id=? AND status IN ('queued','issued','accepted','unconfirmed') ORDER BY id DESC LIMIT 1",(server_id,)).fetchone()
         if pending:
             if pending['action']!='hkt_dhcp':raise IntegrationError('服务器另有未完成动作')
@@ -65,6 +71,8 @@ def apply_result(db,sid,result,now):
     db.execute('UPDATE detection_plans SET next_at=MIN(next_at,?) WHERE server_id=?',(now,sid))
 
 def register(app,connect,cipher,auth,body,error,audit):
+    global _cipher
+    _cipher=cipher
     initialize(connect)
     @app.post('/api/admin/servers/<int:sid>/hkt-dhcp/api')
     @auth(admin=True)

@@ -499,6 +499,7 @@ def assign(sid):
         current=db.execute('SELECT id,owner_id FROM servers WHERE id=?',(sid,)).fetchone()
         if not current:return error('服务器不存在',404)
         if owner is not None and not db.execute("SELECT id FROM users WHERE id=? AND role='client'",(owner,)).fetchone():return error('客户不存在')
+        if current['owner_id']!=owner and db.execute('SELECT 1 FROM server_failovers WHERE server_id=? OR backup_id=?',(sid,sid)).fetchone():return error('请先安全移除该服务器的故障转移配置再变更归属',409)
         if current['owner_id']!=owner and db.execute('SELECT 1 FROM vps_rotations r WHERE (r.primary_server_id=? OR r.other_server_id=? OR r.failover_server_id=?) AND r.failover_server_id IS NOT NULL',(sid,sid,sid)).fetchone():return error('服务器已配置冷备用，请先安全停用故障转移再变更归属',409)
         if current['owner_id']!=owner and current['owner_id'] is not None:
             # Customer-owned DNS/action credentials must never transfer with a VPS.
@@ -545,6 +546,7 @@ def create_install_ticket(sid):
 @auth(True)
 def delete(sid):
     with connect() as db:
+        if db.execute('SELECT 1 FROM server_failovers WHERE server_id=? OR backup_id=?',(sid,sid)).fetchone():return error('请先安全切回解析并移除该服务器的故障转移配置',409)
         if db.execute('SELECT 1 FROM vps_rotations r WHERE r.failover_server_id IS NOT NULL AND (r.failover_server_id=? OR r.primary_server_id=? OR r.other_server_id=?)',(sid,sid,sid)).fetchone():return error('该服务器参与 A 故障转移，请先安全切回解析并移除故障转移配置',409)
         db.execute('DELETE FROM servers WHERE id=?',(sid,));audit(db,f'移除服务器 #{sid}')
     return jsonify(ok=True)
@@ -798,6 +800,8 @@ register_detectors(app,connect,CIPHER,auth,body,error,audit)
 from rotation import initialize as initialize_rotations, register as register_rotations
 initialize_rotations(connect)
 register_rotations(app,connect,CIPHER,auth,body,error,audit)
+from server_failover import register as register_server_failover
+register_server_failover(app,connect,CIPHER,auth,body,error,audit)
 from rotation_dns import register as register_rotation_dns
 register_rotation_dns(app,connect,CIPHER,auth,body,error,audit)
 from rotation_insights import initialize as initialize_insights, register as register_insights

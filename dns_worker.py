@@ -12,6 +12,9 @@ def tick():
     for sid in monitors:
         try:check_monitor(server.connect,sid,server.CIPHER)
         except Exception:print('IP monitor: check failed for server #'+str(sid),flush=True)
+    from server_failover import tick as failover_tick
+    try:failover_tick(server.connect,server.CIPHER)
+    except BlockingIOError:pass
     with server.connect() as db:
         ids=[r[0] for r in db.execute('SELECT dns_bindings.id FROM dns_bindings JOIN ip_monitors ON ip_monitors.server_id=dns_bindings.server_id WHERE automatic=1 AND ip_monitors.enabled=1')]
     for bid in ids:

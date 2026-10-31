@@ -127,3 +127,19 @@ test('generic API editor saves GET and parameter-only auth without sending an ac
  const submitter={disabled:false};await fields.ipAPIForm.onsubmit({preventDefault(){},submitter,target:{values:{name:'custom',method:'GET',auth_mode:'none',url:'https://provider.example/change?key={{api_token}}',header:'Authorization',prefix:'Bearer ',secret:'dummy',body_json:'{}',success_path:'code',success_json:'0'}}});
  assert.equal(calls.length,1);assert.equal(calls[0][0],'ip-dns/connections');assert.equal(calls[0][2].config.method,'GET');assert.equal(calls[0][2].config.header,'');assert.equal(calls[0][2].config.success_path,'code');assert.equal(submitter.disabled,false);
 });
+
+test('per-server failover editor saves numeric settings and preserves failures for review',async()=>{
+ const elements={serverFailoverForm:{elements:{backup_id:{value:'9'},offline_s:{value:'30'},recovery_s:{value:'60'}}},serverFailoverError:{},modal:{close(){this.closed=true;}}};
+ let html='',calls=[];ctx.$=id=>elements[id];ctx.modal=value=>{html=value;};ctx.notice=()=>{};
+ ctx.api=async(path,method,body)=>{calls.push({path,method,body});if(method==='PUT')return {ok:true};return {config:{backup_id:9,status:'<waiting>'},servers:[{id:9,name:'<backup>'}]};};
+ await ctx.editServerFailover(7);assert.match(html,/&lt;backup&gt;/);assert.match(html,/&lt;waiting&gt;/);assert.match(html,/待命时不拨测/);
+ const submitter={disabled:false};await elements.serverFailoverForm.onsubmit({preventDefault(){},submitter,target:elements.serverFailoverForm});
+ assert.equal(calls[1].path,'servers/7/failover');assert.deepEqual(JSON.parse(JSON.stringify(calls[1].body)),{backup_id:9,offline_s:30,recovery_s:60});assert.equal(elements.modal.closed,true);assert.equal(submitter.disabled,false);
+ ctx.api=async(path,method)=>{if(method==='PUT')throw Error('解析尚由备用机承载');return {config:null,servers:[]};};elements.modal.closed=false;
+ await ctx.editServerFailover(7);await elements.serverFailoverForm.onsubmit({preventDefault(){},submitter,target:elements.serverFailoverForm});assert.match(elements.serverFailoverError.textContent,/尚由备用机承载/);assert.equal(elements.modal.closed,false);assert.equal(submitter.disabled,false);
+});
+
+test('existing A standby redirects to rotation configuration without creating another policy',async()=>{
+ let html='',calls=0;ctx.modal=value=>{html=value;};ctx.api=async()=>{calls++;return {rotation_failover:{failover_server_id:9,failover_status:'<active>'},servers:[]};};
+ await ctx.editServerFailover(7);assert.equal(calls,1);assert.match(html,/轮换设置|配置中管理/);assert.match(html,/&lt;active&gt;/);assert.doesNotMatch(html,/serverFailoverForm/);
+});

@@ -104,7 +104,7 @@ def summarize(rows,node_ids):
     else:status='部分检测点 TCP 不通（待复核）'
     return status,result
 
-def queue_reboot(db,sid,now):
+def queue_reboot(db,sid,now,cipher=None):
     node=db.execute('SELECT metrics,seen FROM servers WHERE id=?',(sid,)).fetchone()
     if not node or not node['seen'] or now-node['seen']>60:return '未执行自动重启：服务器 agent 离线或上报已过期'
     try:metrics=json.loads(node['metrics'] or '{}')
@@ -112,6 +112,9 @@ def queue_reboot(db,sid,now):
     if 'reboot' not in metrics.get('capabilities',[]):return '未执行自动重启：服务器 agent 不支持重启，请先更新 agent'
     if db.execute("SELECT 1 FROM commands WHERE server_id=? AND action IN ('reboot','hkt_dhcp') AND status IN ('queued','issued','accepted','unconfirmed')",(sid,)).fetchone():
         return '未重复排队：此服务器最近已有重启任务'
+    from server_failover import before_action
+    reason=before_action(db,sid,now,cipher)
+    if reason:return reason
     admin=db.execute("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1").fetchone()
     if not admin:return '未执行自动重启：找不到管理员账号'
     cur=db.execute("INSERT INTO commands(server_id,user_id,action,status,created,updated) VALUES(?,?,'reboot','queued',?,?)",(sid,admin['id'],now,now))
@@ -303,6 +306,10 @@ def execute_change_ip_actions(connect,cipher):
                 continue
             # Explicit failures re-enter here on the next worker cycle. Ambiguous or
             # accepted requests are reconciled against the fresh IP before retrying.
+            from server_failover import before_action
+            reason=before_action(db,r['server_id'],now,cipher)
+            if reason:
+                db.execute('UPDATE detection_runs SET action_result=? WHERE id=?',(reason,rid));continue
             claimed=db.execute("UPDATE detection_runs SET action_status='issued',action_attempts=action_attempts+1,action_attempted=? WHERE id=? AND action_status IN "+active,(now,rid)).rowcount
             if not claimed:continue
             try:connection=load_connection(db,cipher,p['action_connection_id'])
@@ -427,6 +434,10 @@ def register(app,connect,cipher,auth,body,error,audit):
             if personal:safe_plan.update(response_mode=plan['response_mode'],action_enabled=bool(plan['action_enabled']),failure_threshold=plan['failure_threshold'],action_connection_id=plan['action_connection_id'] if plan['action_owner']==g.user['id'] and plan['action_server']==sid else None)
         if safe_plan:
             with connect() as db:inherited=db.execute('SELECT r.primary_server_id FROM vps_failover_probe_state f JOIN vps_rotations r ON r.id=f.rotation_id WHERE f.server_id=? AND f.active=1 AND r.owner_id=?',(sid,g.user['id'])).fetchone()
+            if not inherited:
+                import server_failover
+                generic=server_failover.parent(db,sid,active=True)
+                if generic and generic['owner_id']==g.user['id']:inherited={'primary_server_id':generic['server_id']}
             if inherited:safe_plan.update(inherited_from=inherited['primary_server_id'],nodes=json.loads(plan['nodes']),interval_s=plan['interval_s'],daily_limit=plan['daily_limit'],automatic=bool(plan['automatic']),actions_locked=True)
         run=dict(latest) if latest else None
         if run:run['details']=json.loads(run['details'])
