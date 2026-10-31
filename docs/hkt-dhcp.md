@@ -5,7 +5,7 @@
 ## 接入
 
 1. 在面板宿主机更新代码：`cd /opt/hk-sdan && bash scripts/update.sh`。
-2. 在后台“IP 监控与解析”点击“生成 HKT DHCP 换 IP API”，选择正确的 HKT VPS。
+2. 管理员可为未分配或已分配给客户的 VPS 生成后台专属 API；不改变服务器归属，也不向客户暴露令牌。在后台“IP 监控与解析”点击“生成 HKT DHCP 换 IP API”，选择正确的 HKT VPS。
 3. 在 HKT 机器执行弹窗中的 agent 更新命令及本机授权命令。授权脚本仅写配置并重启 agent，不立即释放租约；确认网卡为 ens18。
 4. 等待在线上报后生成 API。面板保存一个绑定此 VPS 的 HKT 换 IP API；在后台检测计划中选择该连接。生成/重置本身不换 IP。
 5. 外部调用格式为 `POST https://面板域名/api/hkt-dhcp/VPS编号`，请求头 `Authorization: Bearer 专属令牌`。不需额外端口，不把密钥写进 URL。202 只代表排队成功，不代表换 IP 成功。

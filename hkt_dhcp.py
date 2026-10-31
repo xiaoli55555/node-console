@@ -74,7 +74,8 @@ def register(app,connect,cipher,auth,body,error,audit):
             db.execute('BEGIN IMMEDIATE')
             node=db.execute('SELECT * FROM servers WHERE id=?',(sid,)).fetchone()
             if not node:return error('服务器不存在',404)
-            if node['owner_id'] is not None:return error('此版本仅支持后台管理的 VPS',409)
+            # Administrators manage both assigned and unassigned VPS. The generated
+            # credential remains admin-owned and pinned to this server.
             if 'hkt_dhcp' not in json.loads(node['metrics'] or '{}').get('capabilities',[]):return error('请先更新 agent，并在 HKT 本机启用 ens18 DHCP 动作',409)
             old=db.execute('SELECT connection_id FROM hkt_dhcp_apis WHERE server_id=?',(sid,)).fetchone()
             config=json.dumps({'provider':'agent_dhcp','server_id':sid})

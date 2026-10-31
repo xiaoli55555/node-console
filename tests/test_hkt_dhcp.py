@@ -33,6 +33,28 @@ class HKTAPI(unittest.TestCase):
         with server.connect() as db:self.assertEqual(db.execute('SELECT status FROM commands WHERE id=?',(cid,)).fetchone()[0],'accepted')
         self.report(n,dhcp_result={'id':cid,'state':'changed','old_ip':'8.8.8.8','new_ip':'1.1.1.1','attempts':1},public_ips=['1.1.1.1'])
         with server.connect() as db:self.assertEqual(db.execute('SELECT status FROM commands WHERE id=?',(cid,)).fetchone()[0],'completed')
+    def test_admin_can_generate_for_customer_assigned_server_without_exposing_key(self):
+        n=self.node();alice_id=self.alice.get('/api/me').json['id']
+        assigned=self.admin.patch(f'/api/servers/{n["id"]}',json={'owner_id':alice_id},headers={'X-CSRF-Token':self.tokens['admin']})
+        self.assertEqual(assigned.status_code,200,assigned.json)
+        response=self.post(f'/api/admin/servers/{n["id"]}/hkt-dhcp/api')
+        self.assertEqual(response.status_code,200,response.json)
+        cfg=response.json
+        with server.connect() as db:
+            self.assertEqual(db.execute('SELECT owner_id FROM servers WHERE id=?',(n['id'],)).fetchone()[0],alice_id)
+            conn=db.execute('SELECT * FROM ip_connections WHERE id=?',(cfg['connection_id'],)).fetchone()
+            self.assertIsNone(conn['owner_id']);self.assertEqual(conn['server_id'],n['id'])
+            self.assertNotEqual(conn['secret'],cfg['token'])
+            self.assertFalse(db.execute('SELECT 1 FROM commands WHERE server_id=?',(n['id'],)).fetchone())
+        visible=self.alice.get(f'/api/client/servers/{n["id"]}/dns-bindings').json
+        self.assertFalse(any(c['id']==cfg['connection_id'] for c in visible['connections']))
+        self.assertNotIn(cfg['token'],json.dumps(visible))
+        self.assertEqual(self.alice.post(f'/api/admin/servers/{n["id"]}/hkt-dhcp/api',json={},headers={'X-CSRF-Token':self.tokens['alice']}).status_code,403)
+        queued=self.trigger(n,cfg);self.assertEqual(queued.status_code,202,queued.json)
+        command=self.report(n).json['command'];self.assertEqual(command['action'],'hkt_dhcp')
+        ack=self.admin.post(f'/api/agent/commands/{command["id"]}/ack',json={},headers={'Authorization':'Bearer '+n['token']})
+        self.assertEqual(ack.status_code,200,ack.json)
+
     def test_unchanged_result_stops_further_automatic_jobs_until_reset(self):
         n=self.node();cfg=self.generate(n);cid=self.trigger(n,cfg).json['command_id'];self.report(n)
         self.admin.post(f'/api/agent/commands/{cid}/ack',json={},headers={'Authorization':'Bearer '+n['token']})
