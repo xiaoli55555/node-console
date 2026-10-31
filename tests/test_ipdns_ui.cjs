@@ -111,3 +111,19 @@ test('HKT DHCP form generates scoped API without executing DHCP and shows result
  await elements.hktDHCPStatus.onclick();assert.match(elements.hktDHCPResult.textContent,/unchanged/);
  assert.ok(calls.every(x=>x.path.startsWith('admin/')));
 });
+
+test('unified change-IP entry routes MoonVM generic and HKT to their respective setup',()=>{
+ const env=vm.createContext({esc:ctx.esc,console});vm.runInContext(source,env);
+ const form={},calls=[];let html='';env.$=()=>form;env.modal=x=>{html=x;};env.editIPConnection=(...args)=>calls.push(args);env.hktDHCPForm=()=>calls.push(['hkt']);
+ env.chooseChangeIPAPI();for(const value of ['moonvm','agent_dhcp','generic'])assert.match(html,new RegExp('value="'+value+'"'));
+ for(const provider of ['moonvm','generic','agent_dhcp'])form.onsubmit({preventDefault(){},target:{provider:{value:provider}}});
+ assert.deepEqual(calls,[[null,'change_ip','moonvm'],[null,'change_ip','generic'],['hkt']]);
+});
+
+test('generic API editor saves GET and parameter-only auth without sending an action',async()=>{
+ const env=vm.createContext({esc:ctx.esc,console,FormData:class{constructor(form){return new Map(Object.entries(form.values));}}});vm.runInContext(source,env);
+ const fields={ipAPIForm:{},ipAPIError:{},modal:{close(){}}};const calls=[];let html='';env.$=id=>fields[id];env.modal=x=>{html=x;};env.notice=()=>{};env.loadIPDNS=async()=>{};env.api=async(...args)=>{calls.push(args);return {id:1};};
+ env.editIPConnection(null,'change_ip','generic');assert.match(html,/name="method"/);assert.match(html,/name="success_path"/);assert.match(html,/name="auth_mode"/);assert.doesNotMatch(html,/MoonVM API 完整链接/);
+ const submitter={disabled:false};await fields.ipAPIForm.onsubmit({preventDefault(){},submitter,target:{values:{name:'custom',method:'GET',auth_mode:'none',url:'https://provider.example/change?key={{api_token}}',header:'Authorization',prefix:'Bearer ',secret:'dummy',body_json:'{}',success_path:'code',success_json:'0'}}});
+ assert.equal(calls.length,1);assert.equal(calls[0][0],'ip-dns/connections');assert.equal(calls[0][2].config.method,'GET');assert.equal(calls[0][2].config.header,'');assert.equal(calls[0][2].config.success_path,'code');assert.equal(submitter.disabled,false);
+});

@@ -115,7 +115,7 @@ def invoke_change_ip_api(connection,server_id,server_name,current_ip):
         return 'MoonVM 已接受换 IP 请求；请等待新 IP 上报。'+(('上游响应：'+response) if response else '')
     try:template=json.loads(config['body_json'])
     except (KeyError,TypeError,ValueError):raise IntegrationError('换 IP API 请求 JSON 无效') from None
-    values={'server_id':str(server_id),'server_name':str(server_name),'current_ip':str(current_ip)}
+    values={'server_id':str(server_id),'server_name':str(server_name),'current_ip':str(current_ip),'api_token':connection.get('secret','')}
     def expand(value):
         if isinstance(value,str):
             for key,item in values.items():value=value.replace('{{'+key+'}}',item)
@@ -124,10 +124,20 @@ def invoke_change_ip_api(connection,server_id,server_name,current_ip):
         if isinstance(value,dict):return {k:expand(v) for k,v in value.items()}
         return value
     headers={'Accept':'application/json','Content-Type':'application/json'}
-    if connection['secret']:headers[config['header']]=config['prefix']+connection['secret']
-    try:response=request_json(config['url'],headers,json.dumps(expand(template),ensure_ascii=False,separators=(',',':')))
+    if connection['secret'] and config.get('header','Authorization'):headers[config['header']]=config['prefix']+connection['secret']
+    url=config['url']
+    for key,item in values.items():url=url.replace('{{'+key+'}}',urllib.parse.quote(item,safe=''))
+    method=config.get('method','POST')
+    if method not in ('GET','POST'):raise IntegrationError('换 IP API 请求方式无效')
+    try:
+        if method=='GET':response=request_json(url,headers,method='GET')
+        else:response=request_json(url,headers,json.dumps(expand(template),ensure_ascii=False,separators=(',',':')))
     except IntegrationError as e:raise ChangeIPUncertain(str(e)) from None
     if isinstance(response,dict) and response.get('success') is False:raise IntegrationError('换 IP API 返回失败；请核对供应商 API 参数')
+    if config.get('success_path'):
+        try:actual=field(response,config['success_path']);expected=json.loads(config.get('success_json','true'))
+        except (IntegrationError,ValueError,TypeError):raise ChangeIPUncertain('接口结果无法按成功条件核对，先等待 IP 上报，避免重复请求') from None
+        if type(actual) is not type(expected) or actual!=expected:raise ChangeIPUncertain('接口返回不符合配置的成功条件，先等待 IP 上报核对')
     return '换 IP API 已接受请求；等待服务器上报新 IP 后进行国内复检'
 
 def parse_moonvm_url(url):
@@ -720,13 +730,26 @@ def register(app,connect,cipher,auth,body,error,audit):
                 url=config.get('url','');endpoint(url)
                 header=config.get('header','Authorization');prefix=config.get('prefix','Bearer ');body_json=config.get('body_json','{}')
                 import re
-                if not re.fullmatch(r'[A-Za-z0-9-]{1,64}',header) or header.lower() in ('host','content-length','connection','transfer-encoding') or any(x in prefix+secret for x in '\r\n') or len(prefix)>64:raise IntegrationError('认证头或凭证前缀格式无效')
+                if (header!='' and not re.fullmatch(r'[A-Za-z0-9-]{1,64}',header)) or header.lower() in ('host','content-length','connection','transfer-encoding') or any(x in prefix+secret for x in '\r\n') or len(prefix)>64:raise IntegrationError('认证头或凭证前缀格式无效')
                 if len(url)>2048 or not isinstance(body_json,str) or len(body_json)>6000:raise IntegrationError('API 地址或请求 JSON 过长')
                 try:
                     parsed=json.loads(body_json)
                     if not isinstance(parsed,dict):raise ValueError()
                 except ValueError:raise IntegrationError('换 IP API 请求体必须是有效 JSON 对象') from None
+                if '{{' in urllib.parse.urlsplit(url).netloc:raise IntegrationError('地址占位符只能用于路径或查询参数')
+                method=config.get('method','POST');success_path=config.get('success_path','');success_json=config.get('success_json','true')
+                if method not in ('GET','POST'):raise IntegrationError('通用换 IP API 仅支持 GET 或 POST')
+                if not isinstance(success_path,str) or (success_path and not re.fullmatch(r'[A-Za-z0-9_.-]{1,160}',success_path)):raise IntegrationError('成功字段路径格式无效')
+                if not isinstance(success_json,str) or len(success_json)>500:raise IntegrationError('成功值必须是有效 JSON')
+                if success_path:
+                    try:
+                        expected=json.loads(success_json)
+                        if isinstance(expected,(dict,list)):raise ValueError()
+                        json.dumps(expected,allow_nan=False)
+                    except (ValueError,TypeError):raise IntegrationError('成功值必须是 JSON 字符串、数字、布尔值或 null') from None
                 config={'url':url,'header':header,'prefix':prefix,'body_json':body_json}
+                if method=='GET':config['method']=method
+                if success_path:config.update(success_path=success_path,success_json=json.dumps(expected,ensure_ascii=False,separators=(',',':')))
             with connect() as db:
                 cid=d.get('id')
                 if cid:

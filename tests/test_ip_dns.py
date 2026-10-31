@@ -128,6 +128,39 @@ class IPDNSTest(unittest.TestCase):
         with self.connect() as db:
             row=db.execute('SELECT * FROM ip_connections WHERE id=?',(saved.json['id'],)).fetchone()
             self.assertNotIn('secret',row['secret'])
+    def test_generic_GET_API_uses_encoded_secret_parameter_and_custom_success(self):
+        config={'provider':'generic','url':'https://provider.example/change/{{server_id}}?key={{api_token}}&ip={{current_ip}}','method':'GET','header':'','prefix':'','body_json':'{}','success_path':'data.code','success_json':'0'}
+        with patch('ip_dns.request_json') as request:
+            saved=self.post('/connections',{'kind':'change_ip','name':'Generic GET','config':config,'secret':'test&key'})
+            self.assertEqual(saved.status_code,200,saved.json)
+            self.assertEqual(self.post('/connections/'+str(saved.json['id'])+'/test',{}).status_code,200)
+            request.assert_not_called()
+        with self.connect() as db:conn=ip_dns.load_connection(db,self.cipher,saved.json['id'])
+        with patch('ip_dns.request_json',return_value={'data':{'code':0}}) as request:
+            ip_dns.invoke_change_ip_api(conn,7,'edge / 7','8.8.8.8')
+            self.assertEqual(request.call_args.args[0],'https://provider.example/change/7?key=test%26key&ip=8.8.8.8')
+            self.assertEqual(request.call_args.kwargs,{'method':'GET'})
+            self.assertNotIn('Authorization',request.call_args.args[1])
+        with patch('ip_dns.request_json',return_value={'data':{'code':1}}):
+            with self.assertRaises(ip_dns.ChangeIPUncertain):ip_dns.invoke_change_ip_api(conn,7,'edge','8.8.8.8')
+        with patch('ip_dns.request_json',return_value={'pending':True}):
+            with self.assertRaises(ip_dns.ChangeIPUncertain):ip_dns.invoke_change_ip_api(conn,7,'edge','8.8.8.8')
+
+    def test_generic_API_rejects_unsupported_method_success_condition_and_host_placeholder(self):
+        base={'url':'https://provider.example/change','header':'Authorization','prefix':'Bearer ','body_json':'{}'}
+        for changes in ({'method':'DELETE'},{'success_path':'data.code','success_json':'not-json'},{'success_path':'code','success_json':'NaN'},{'success_path':'code','success_json':'{}'},{'success_path':'bad/path'},{'url':'https://{{api_token}}.example/change'}):
+            with self.subTest(config=changes),patch('ip_dns.request_json') as request:
+                response=self.post('/connections',{'kind':'change_ip','name':'invalid','config':dict(base,**changes),'secret':'test'})
+                self.assertEqual(response.status_code,400,response.json);request.assert_not_called()
+
+    def test_legacy_generic_POST_edit_preserves_existing_secret_without_migration(self):
+        config={'url':'https://provider.example/change','header':'X-Key','prefix':'','body_json':'{}'}
+        saved=self.post('/connections',{'kind':'change_ip','name':'legacy','config':config,'secret':'saved-key'})
+        changed=self.post('/connections',{'id':saved.json['id'],'kind':'change_ip','name':'renamed','config':dict(config,provider='generic',method='POST',success_path='',success_json='true')})
+        self.assertEqual(changed.status_code,200,changed.json)
+        with self.connect() as db:conn=ip_dns.load_connection(db,self.cipher,saved.json['id'])
+        self.assertEqual(conn['secret'],'saved-key');self.assertEqual(conn['config'],config)
+
     def test_change_ip_api_expands_placeholders_and_posts_json(self):
         connection={'config':{'url':'https://provider.example/change','header':'X-Token','prefix':'Token ','body_json':'{"instance":"{{server_name}}","ip":"{{current_ip}}","id":"{{server_id}}"}'},'secret':'abc'}
         with patch('ip_dns.request_json',return_value={'success':True}) as request:

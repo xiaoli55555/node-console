@@ -489,3 +489,7 @@ bash /tmp/hksdan-agent-update.sh
 ### HKT DHCP 换 IP API
 
 后台“IP 监控与解析”新增“生成 HKT DHCP 换 IP API”。HKT 本机先更新 agent 并授权 ens18；生成 API 不执行换 IP。通过面板队列向 agent 下发固定 DHCP 动作，避免公网 IP 变化后无法连接旧 API 地址。每个任务最多尝试 3 次；无变化/失败后停止自动重复，结果可在弹窗查看。支持接入现有换 IP API 检测计划与 A/B 轮换；固定 A、排空条件及检测点复检继续生效。详见 [HKT 接入与限制](docs/hkt-dhcp.md)。
+
+### 统一添加换 IP API
+
+后台“添加换 IP API”可选择 MoonVM、HKT DHCP 或通用网站接口。MoonVM 保留完整链接识别；HKT 使用绑定 VPS 的本地动作通道。通用接口支持 HTTPS 443 的 GET / POST JSON、可选认证头及 `{{api_token}}` 等路径/参数/JSON 占位符，可配置成功字段和值。GET 不发送请求体，成功结果不明时先核对 IP；保存和配置检查均不发送换 IP 请求。旧版通用 POST 配置继续可用；动态签名、表单、纯文本响应等协议需另行适配。
