@@ -155,14 +155,30 @@ def dhcp_acquire(iface,background=False):
 
 def dhcp_lease_path(iface):return Path(f'/var/lib/dhcp/dhclient.{iface}.leases')
 
+def dhcp_client_unit(iface):return 'hksdan-dhcp-client-'+iface
+
 def dhcp_background(iface,cfg):
-    if not dhcp_clients(iface,cfg.get('cleanup_unscoped') is True):
-        dhcp_run(dhcp_acquire(iface,background=True),timeout=15)
+    # The lease owner must outlive both the action and recovery transient units.
+    if dhcp_clients(iface,cfg.get('cleanup_unscoped') is True):return
+    unit=dhcp_client_unit(iface)
+    subprocess.run(['systemctl','reset-failed',unit],capture_output=True,timeout=10,check=False)
+    subprocess.run(['systemd-run','--unit='+unit,'--collect','--property=Type=exec',
+        '--property=Restart=always','--property=RestartSec=5',
+        shutil.which('dhclient'),'-4','-d','-v','-cf','/etc/dhcp/dhclient.conf',
+        '-pf',f'/run/dhclient.{iface}.pid','-lf',str(dhcp_lease_path(iface)),iface],
+        check=True,capture_output=True,timeout=15)
+
+def dhcp_stable(iface,address):
+    for _ in range(6):
+        if dhcp_address(iface)!=address or not dhcp_clients(iface):return False
+        route=subprocess.run(['ip','-4','route','show','default','dev',iface],capture_output=True,text=True,timeout=5,check=True).stdout.strip()
+        if not route:return False
+        time.sleep(2)
+    return True
 
 def dhcp_recover():
     cfg=dhcp_config();iface=cfg['interface']
-    route=subprocess.run(['ip','-4','route','show','default','dev',iface],capture_output=True,text=True,timeout=5,check=True).stdout.strip()
-    if dhcp_address(iface) and route:return
+    # An address alone is insufficient: renewals need a surviving client too.
     dhcp_background(iface,cfg)
 
 def dhcp_task(cid):
@@ -181,6 +197,7 @@ def dhcp_task(cid):
             for attempt in range(1,4):
                 result['attempts']=attempt
                 clients=dhcp_clients(iface,cfg.get('cleanup_unscoped') is True)
+                subprocess.run(['systemctl','stop',dhcp_client_unit(iface)],capture_output=True,timeout=15,check=False)
                 dhcp_run([shutil.which('dhclient'),'-4','-r','-pf',f'/run/dhclient.{iface}.pid','-lf',f'/var/lib/dhcp/dhclient.{iface}.leases',iface],timeout=10)
                 for pid,args in clients:
                     try:
@@ -194,10 +211,13 @@ def dhcp_task(cid):
                 if lease.exists():
                     backup=DHCP_STATE/'dhcp-lease.backup';backup.write_bytes(lease.read_bytes());backup.chmod(0o600)
                     lease.unlink()
-                dhcp_run(dhcp_acquire(iface),timeout=45)
-                time.sleep(5)
+                dhcp_background(iface,cfg)
+                for _ in range(15):
+                    time.sleep(2)
+                    if dhcp_address(iface):break
                 new=dhcp_address(iface);result['new_ip']=new
                 if new and new!=old:
+                    if not dhcp_stable(iface,new):raise ValueError('新 IP、默认路由或 DHCP 续租进程未通过稳定检查')
                     result['state']='changed';break
                 if not new:dhcp_background(iface,cfg)
                 time.sleep(5)
@@ -206,7 +226,7 @@ def dhcp_task(cid):
             result['state']='failed';result['error']=type(e).__name__+': '+str(e)[:180]
         finally:
             try:
-                if not dhcp_address(iface):dhcp_background(iface,cfg)
+                dhcp_background(iface,cfg)
             except Exception:pass
             result['finished_at']=int(time.time());dhcp_write(result)
 

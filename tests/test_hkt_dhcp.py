@@ -150,7 +150,7 @@ class DHCPExecutor(unittest.TestCase):
     def run_task(self,addresses):
         folder=tempfile.TemporaryDirectory();self.addCleanup(folder.cleanup)
         state=Path(folder.name);lease=state/'ens18.leases';lease.write_text('old lease')
-        patches=[patch.object(agent,'DHCP_STATE',state),patch.object(agent,'dhcp_config',return_value={'enabled':True,'interface':'ens18','cleanup_unscoped':True}),patch.object(agent,'dhcp_address',side_effect=addresses if isinstance(addresses,list) else None,return_value=addresses if isinstance(addresses,str) else None),patch.object(agent,'dhcp_clients',return_value=[]),patch.object(agent,'dhcp_lease_path',return_value=lease),patch.object(agent,'dhcp_run',return_value=True),patch.object(agent.time,'sleep'),patch.object(agent.shutil,'which',return_value='/sbin/dhclient')]
+        patches=[patch.object(agent,'DHCP_STATE',state),patch.object(agent,'dhcp_config',return_value={'enabled':True,'interface':'ens18','cleanup_unscoped':True}),patch.object(agent,'dhcp_address',side_effect=addresses if isinstance(addresses,list) else None,return_value=addresses if isinstance(addresses,str) else None),patch.object(agent,'dhcp_clients',return_value=[]),patch.object(agent,'dhcp_lease_path',return_value=lease),patch.object(agent,'dhcp_run',return_value=True),patch.object(agent.time,'sleep'),patch.object(agent.shutil,'which',return_value='/sbin/dhclient'),patch.object(agent,'dhcp_background'),patch.object(agent,'dhcp_stable',return_value=True),patch.object(agent.subprocess,'run')]
         mocks=[p.start() for p in patches]
         for p in patches:self.addCleanup(p.stop)
         return state,mocks[5]
@@ -163,7 +163,7 @@ class DHCPExecutor(unittest.TestCase):
     def test_unchanged_IP_stops_after_three_attempts_without_false_success(self):
         state,run=self.run_task('8.8.8.8');agent.dhcp_task(11)
         result=json.loads((state/'dhcp-result.json').read_text());self.assertEqual(result['state'],'unchanged');self.assertEqual(result['attempts'],3)
-        self.assertEqual(sum('-1' in c.args[0] for c in run.call_args_list),3)
+        self.assertEqual(sum('-r' in c.args[0] for c in run.call_args_list),3)
         self.assertFalse(any('-6' in c.args[0] for c in run.call_args_list))
     def test_watchdog_is_scheduled_before_network_task_and_existing_client_is_not_duplicated(self):
         with patch.object(agent,'dhcp_config',return_value={'enabled':True,'interface':'ens18'}),patch.object(agent.subprocess,'run') as run:
@@ -173,6 +173,27 @@ class DHCPExecutor(unittest.TestCase):
             self.assertEqual(run.call_args_list[1].args[0][-2:],['--dhcp-task','12'])
         with patch.object(agent,'dhcp_clients',return_value=[(437,['dhclient','ens18'])]),patch.object(agent,'dhcp_run') as run:
             agent.dhcp_background('ens18',{'cleanup_unscoped':True});run.assert_not_called()
+
+    def test_lease_client_is_foreground_in_independent_restartable_unit(self):
+        with patch.object(agent,'dhcp_clients',return_value=[]),patch.object(agent.shutil,'which',return_value='/sbin/dhclient'),patch.object(agent.subprocess,'run') as run:
+            agent.dhcp_background('ens18',{})
+            args=run.call_args_list[-1].args[0]
+            self.assertIn('--unit=hksdan-dhcp-client-ens18',args)
+            self.assertIn('--property=Restart=always',args)
+            self.assertIn('-d',args)
+            self.assertNotIn('--property=RuntimeMaxSec=240',args)
+    def test_unstable_new_address_is_not_reported_successful(self):
+        state,run=self.run_task(['8.8.8.8','1.1.1.1','1.1.1.1'])
+        with patch.object(agent,'dhcp_stable',return_value=False):agent.dhcp_task(99)
+        result=json.loads((state/'dhcp-result.json').read_text())
+        self.assertEqual(result['state'],'failed')
+    def test_recovery_checks_client_even_when_address_exists(self):
+        with patch.object(agent,'dhcp_config',return_value={'interface':'ens18'}),patch.object(agent,'dhcp_background') as background:
+            agent.dhcp_recover();background.assert_called_once_with('ens18',{'interface':'ens18'})
+    def test_stability_requires_live_client_and_default_route(self):
+        from types import SimpleNamespace
+        with patch.object(agent,'dhcp_address',return_value='1.1.1.1'),patch.object(agent,'dhcp_clients',return_value=[(1,[])]),patch.object(agent.subprocess,'run',return_value=SimpleNamespace(stdout='')),patch.object(agent.time,'sleep'):
+            self.assertFalse(agent.dhcp_stable('ens18','1.1.1.1'))
 
     def test_local_opt_in_required_before_launching_any_task(self):
         with patch.object(agent,'dhcp_config',side_effect=ValueError('disabled')),patch.object(agent.subprocess,'run') as run:

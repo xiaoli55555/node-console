@@ -29,3 +29,22 @@
 ## 验证边界
 
 自动化测试模拟进程列表、DHCP 返回、状态文件、IP 变化、认证、单次下发、失败锁定和权限隔离；不实际释放测试环境或线上机器的租约。实际换 IP 仍需在可使用供应商控制台的情况下进行首次验证。
+
+
+### 换后续租进程修复
+
+换 IP 动作使用独立的 `hksdan-dhcp-client-<网卡>.service` 托管前台 dhclient，
+通过 systemd 自动重启维持续租，不再让 dhclient 跟随临时换 IP / 恢复任务退出。
+启动时显式使用现有 `/etc/dhcp/dhclient.conf`，保留上游配置的 Client ID 与 MAC。
+新地址、默认路由及 DHCP 进程需连续约 12 秒正常才报告 changed；这不代表国内探测通过。
+新 IP 是否可用于解析仍由面板所选探测点检查。
+
+先更新面板，再在 HKT VPS 更新 agent；仅更新面板不会替换远端 agent。
+agent 更新本身不释放租约、不换 IP。下一次受控换 IP 测试后，检查：
+
+```bash
+systemctl status hksdan-dhcp-client-ens18 --no-pager
+journalctl -u hksdan-dhcp-client-ens18 --no-pager -n 40
+```
+
+必须继续观察到一次 DHCPREQUEST / DHCPACK 续租，才能确认实际环境下续租恢复。
