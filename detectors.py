@@ -110,7 +110,7 @@ def queue_reboot(db,sid,now):
     try:metrics=json.loads(node['metrics'] or '{}')
     except (TypeError,ValueError):metrics={}
     if 'reboot' not in metrics.get('capabilities',[]):return '未执行自动重启：服务器 agent 不支持重启，请先更新 agent'
-    if db.execute("SELECT 1 FROM commands WHERE server_id=? AND action='reboot' AND status IN ('queued','issued','accepted')",(sid,)).fetchone():
+    if db.execute("SELECT 1 FROM commands WHERE server_id=? AND action IN ('reboot','hkt_dhcp') AND status IN ('queued','issued','accepted','unconfirmed')",(sid,)).fetchone():
         return '未重复排队：此服务器最近已有重启任务'
     admin=db.execute("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1").fetchone()
     if not admin:return '未执行自动重启：找不到管理员账号'

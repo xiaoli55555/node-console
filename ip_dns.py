@@ -102,6 +102,11 @@ def provider_ip(connection):
 def invoke_change_ip_api(connection,server_id,server_name,current_ip):
     """Call an explicitly configured HTTPS JSON action API; never execute shell commands."""
     config=connection['config']
+    if config.get('provider')=='agent_dhcp':
+        from hkt_dhcp import queue
+        if config.get('server_id')!=server_id:raise IntegrationError('HKT API 绑定了另一台 VPS')
+        cid=queue(server_id,connection.get('id'),managed=True)
+        return 'HKT DHCP 任务 #'+str(cid)+' 已排队；等待新 IP 上报和所选检测点复检'
     if config.get('provider')=='moonvm':
         product=str(config.get('product',''));token=connection.get('secret','')
         if not product.isdigit() or not token:raise IntegrationError('MoonVM API 配置无效，请重新保存完整 API 链接')

@@ -20,7 +20,7 @@ mkdir -p /etc/systemd/system/hk-sdan-agent.service.d
 cat > /etc/systemd/system/hk-sdan-agent.service.d/capabilities.conf <<'EOF'
 [Service]
 CapabilityBoundingSet=
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_BOOT
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_BOOT
 EOF
 systemctl daemon-reload
 systemctl restart hk-sdan-agent

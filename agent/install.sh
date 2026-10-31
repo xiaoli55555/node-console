@@ -70,7 +70,9 @@ ProtectControlGroups=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_BOOT
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_BOOT
+StateDirectory=hk-sdan-agent
+StateDirectoryMode=0700
 UMask=0077
 [Install]
 WantedBy=multi-user.target

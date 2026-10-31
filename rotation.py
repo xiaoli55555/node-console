@@ -284,7 +284,7 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
                 for target in (rotation['primary_server_id'],rotation['other_server_id']):
                     db.execute('UPDATE detection_plans SET action_enabled=0 WHERE server_id=?',(target,))
                     db.execute("UPDATE detection_runs SET action_status='cancelled',action_result='轮换计划已删除，停止自动换 IP 重试；已发出的外部请求无法撤回' WHERE server_id=? AND action_status IN ('queued','issued','submitted','uncertain','verifying')",(target,))
-                    db.execute("UPDATE commands SET status='cancelled',updated=? WHERE server_id=? AND action='reboot' AND status='queued'",(int(time.time()),target))
+                    db.execute("UPDATE commands SET status='cancelled',updated=? WHERE server_id=? AND action IN ('reboot','hkt_dhcp') AND status='queued'",(int(time.time()),target))
                 failover.stop_probe(db,rotation['id'],remove=True)
                 db.execute('DELETE FROM vps_rotations WHERE id=?',(rotation['id'],));audit(db,'删除双 VPS 轮换计划 #'+str(rotation['id']))
         return jsonify(ok=True)
@@ -327,7 +327,7 @@ def _failed_ip(db,sid,now):
 def _pending_action(db,sid,verified_candidate=None):
     """A queued/issued action may execute after an apparently healthy probe."""
     if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='commands'").fetchone():
-        if db.execute("SELECT 1 FROM commands WHERE server_id=? AND action='reboot' AND status IN ('queued','issued','accepted','unconfirmed') LIMIT 1",(sid,)).fetchone():return True
+        if db.execute("SELECT 1 FROM commands WHERE server_id=? AND action IN ('reboot','hkt_dhcp') AND status IN ('queued','issued','accepted','unconfirmed') LIMIT 1",(sid,)).fetchone():return True
     if verified_candidate is not None:
         return bool(db.execute("SELECT 1 FROM detection_runs WHERE server_id=? AND action_status IN ('queued','issued','submitted','uncertain','verifying') AND (action_status<>'verifying' OR action_candidate IS NULL OR action_candidate<>?) LIMIT 1",(sid,verified_candidate)).fetchone())
     return bool(db.execute("SELECT 1 FROM detection_runs WHERE server_id=? AND action_status IN ('queued','issued','submitted','uncertain','verifying') LIMIT 1",(sid,)).fetchone())

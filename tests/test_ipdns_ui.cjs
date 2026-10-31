@@ -99,3 +99,15 @@ test('admin lifecycle buttons submit pause resume delete and recover after a fai
  rejectDelete=false;await buttons[2].onclick();assert.equal(removed,true);
  assert.equal(calls.filter(c=>c.method==='PUT').length,3);assert.equal(calls.filter(c=>c.method==='DELETE').length,2);
 });
+
+test('HKT DHCP form generates scoped API without executing DHCP and shows results',async()=>{
+ const elements={hktEnableCommand:{},hktDHCPMessage:{},hktDHCPAPI:{},hktDHCPResult:{},hktDHCPStatus:{},hktDHCPForm:{server_id:{value:'7'}}};let html='';const calls=[];
+ ctx.$=id=>elements[id];ctx.location={origin:'https://panel.example.com'};ctx.modal=v=>{html=v;};
+ ctx.api=async(path,method)=>{calls.push({path,method});return path.endsWith('/status')?{job:{id:1,status:'failed'},result:{state:'unchanged'}}:{path:'/api/hkt-dhcp/7',token:'dummy-scope-token',connection_id:12,message:'仅生成 API'};};
+ ctx.hktDHCPForm([{id:7,name:'HKT <node>'}],7);
+ assert.match(html,/HKT &lt;node&gt;/);assert.match(elements.hktEnableCommand.textContent,/agent-update.sh/);assert.match(elements.hktEnableCommand.textContent,/ens18/);
+ const button={disabled:false};await elements.hktDHCPForm.onsubmit({preventDefault(){},submitter:button});
+ assert.equal(calls[0].path,'admin/servers/7/hkt-dhcp/api');assert.equal(button.disabled,false);assert.match(elements.hktDHCPAPI.textContent,/Authorization: Bearer dummy-scope-token/);
+ await elements.hktDHCPStatus.onclick();assert.match(elements.hktDHCPResult.textContent,/unchanged/);
+ assert.ok(calls.every(x=>x.path.startsWith('admin/')));
+});

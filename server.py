@@ -305,7 +305,7 @@ def get_settings():return jsonify(admin_path=admin_path())
 @auth(True)
 def update_settings():
     value=body().get('admin_path','')
-    reserved={'api','health','agent.py','agent-install.sh','agent-update.sh','app.js','style.css','password.js'}
+    reserved={'api','health','agent.py','agent-install.sh','agent-update.sh','agent-enable-hkt.sh','app.js','style.css','password.js'}
     if not isinstance(value,str) or not re.fullmatch(r'/[A-Za-z0-9][A-Za-z0-9/_-]{2,79}',value) or value.endswith('/') or '//' in value or value.split('/')[1] in reserved:
         return error('路径需以 / 开头，3～80 位英文、数字、下划线或短横线，可分层；不能使用系统保留路径')
     with connect() as db:
@@ -619,7 +619,7 @@ def report():
             if stamp is not None:
                 if type(stamp) is not int or not 0<=stamp<=int(time.time())+60:return error('采集时间格式无效')
                 clean[stamp_key]=stamp
-        clean['capabilities']=['reboot'] if isinstance(d.get('capabilities'),list) and 'reboot' in d['capabilities'] else []
+        clean['capabilities']=[x for x in ('reboot','hkt_dhcp') if isinstance(d.get('capabilities'),list) and x in d['capabilities']]
         clean['udp_method']='socket' if d.get('udp_method')=='socket' else 'conntrack'
         clean['network_method']='TCP ESTABLISHED sockets; UDP '+clean['udp_method']
         db.execute('BEGIN IMMEDIATE')
@@ -633,11 +633,13 @@ def report():
         previous=json.loads(current['metrics']) if current['metrics'] else {}
         reboot_detected=clean.get('uptime') is not None and previous.get('uptime') is not None and clean['uptime']<previous['uptime']
         if reboot_detected:
-            db.execute("UPDATE commands SET status='completed',updated=? WHERE server_id=? AND status='accepted' AND created>=?",(int(time.time()),row['id'],int(time.time())-600))
+            db.execute("UPDATE commands SET status='completed',updated=? WHERE server_id=? AND action='reboot' AND status='accepted' AND created>=?",(int(time.time()),row['id'],int(time.time())-600))
             # A post-reboot IP (common on CMHK) should be re-probed immediately;
             # do not wait out the plan's normal 2+ minute interval.
             db.execute("UPDATE detection_plans SET next_at=MIN(next_at,?) WHERE server_id=? AND automatic=1 AND response_mode='reboot'",(int(time.time()),row['id']))
         db.execute("UPDATE commands SET status='unconfirmed',updated=? WHERE server_id=? AND status='accepted' AND created<?",(int(time.time()),row['id'],int(time.time())-600))
+        from hkt_dhcp import apply_result
+        apply_result(db,row['id'],d.get('dhcp_result'),int(time.time()))
         # Match the public-IP display: fresh external observations first, then
         # interface addresses. Missing/failed samples never erase IP history.
         history_ips=clean.get('public_ips') or None
@@ -652,12 +654,12 @@ def report():
         # Fetch at most one command, and mark it issued before replying (no redelivery).
         command=None;now=int(time.time())
         db.execute("UPDATE commands SET status='expired',updated=? WHERE server_id=? AND status IN ('queued','issued') AND created<?",(now,row['id'],now-120))
-        if 'reboot' in clean['capabilities']:
-            job=db.execute("SELECT commands.*,users.role FROM commands JOIN users ON users.id=commands.user_id WHERE server_id=? AND status='queued' ORDER BY commands.id LIMIT 1",(row['id'],)).fetchone()
+        if clean['capabilities']:
+            job=db.execute("SELECT commands.*,users.role FROM commands JOIN users ON users.id=commands.user_id WHERE server_id=? AND status='queued' AND action IN ("+','.join('?' for _ in clean['capabilities'])+") ORDER BY commands.id LIMIT 1",(row['id'],*clean['capabilities'])).fetchone()
             if job:
                 if job['role']=='admin' or current['owner_id']==job['user_id']:
                     db.execute("UPDATE commands SET status='issued',updated=? WHERE id=?",(now,job['id']))
-                    command={'id':job['id'],'action':'reboot'}
+                    command={'id':job['id'],'action':job['action']}
                 else:db.execute("UPDATE commands SET status='cancelled',updated=? WHERE id=?",(now,job['id']))
     return jsonify(ok=True,command=command)
 
@@ -674,6 +676,7 @@ def request_reboot(sid):
         metrics=json.loads(row['metrics']) if row['metrics'] else {}
         if 'reboot' not in metrics.get('capabilities',[]):return error('请先升级此服务器的采集客户端以启用重启',409)
         db.execute("UPDATE commands SET status='expired',updated=? WHERE server_id=? AND status IN ('queued','issued') AND created<?",(now,sid,now-120))
+        if db.execute("SELECT 1 FROM commands WHERE server_id=? AND action='hkt_dhcp' AND status IN ('queued','issued','accepted','unconfirmed')",(sid,)).fetchone():return error('DHCP 换 IP 任务尚未完成，禁止同时重启',409)
         # Accepted commands are also held for two minutes to prevent double-clicks.
         if db.execute("SELECT id FROM commands WHERE server_id=? AND status IN ('queued','issued','accepted') AND created>=?",(sid,now-120)).fetchone():return error('已有重启任务，请等待状态更新',409)
         result=db.execute("INSERT INTO commands(server_id,user_id,action,status,created,updated) VALUES(?,?,'reboot','queued',?,?)",(sid,g.user['id'],now,now))
@@ -763,6 +766,9 @@ def dns_observer_download():return send_from_directory(ROOT/'probe','dns_observe
 @app.get('/agent-update.sh')
 def agent_updater_download(): return send_from_directory(ROOT/'agent','update.sh',mimetype='text/plain')
 
+@app.get('/agent-enable-hkt.sh')
+def hkt_enable_download():return send_from_directory(ROOT/'agent','enable-hkt.sh',mimetype='text/x-shellscript')
+
 @app.get('/agent.py')
 def agent_download(): return send_from_directory(ROOT/'agent','agent.py',mimetype='text/x-python')
 @app.get('/agent-install.sh')
@@ -797,6 +803,8 @@ register_rotation_dns(app,connect,CIPHER,auth,body,error,audit)
 from rotation_insights import initialize as initialize_insights, register as register_insights
 initialize_insights(connect)
 register_insights(app,connect,auth,body,error,audit)
+from hkt_dhcp import register as register_hkt_dhcp
+register_hkt_dhcp(app,connect,CIPHER,auth,body,error,audit)
 if __name__=='__main__':
     import argparse, getpass
     parser=argparse.ArgumentParser();parser.add_argument('command',choices=['admin','backup','entry']);parser.add_argument('target',nargs='?');args=parser.parse_args()

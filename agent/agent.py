@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Read-only Debian host collector. No shell commands or remote execution."""
-import json, os, time, socket, platform, shutil, subprocess, urllib.request, urllib.error, argparse, ipaddress, threading
+"""Host collector with explicitly enabled, fixed reboot/DHCP actions."""
+import json, os, time, socket, platform, shutil, subprocess, urllib.request, urllib.error, argparse, ipaddress, threading, fcntl, re, signal
 from pathlib import Path
 
 def tcp_count(root=Path('/proc')):
@@ -111,8 +111,118 @@ def collect(previous=None,connections=None):
             'uptime':int(float(Path('/proc/uptime').read_text().split()[0])), 'rx_bytes':rx,'tx_bytes':tx,
             'tcp_by_port':connections.by_port if connections else None,'udp_method':'socket','connections_sampled':connections.sampled_at if connections else int(time.time()),'capabilities':['reboot'],'tcp':tcp,'udp':udp,'public_ips':addresses,'ip_error':ip_error,'network_error':err.strip(),'hostname':socket.gethostname(),'os':os_name,'kernel':platform.release()},now
 
+DHCP_CONFIG=Path('/etc/hk-sdan-agent/hkt-dhcp.json')
+DHCP_STATE=Path('/var/lib/hk-sdan-agent')
+
+def dhcp_config():
+    cfg=json.loads(DHCP_CONFIG.read_text())
+    iface=cfg.get('interface','')
+    if cfg.get('enabled') is not True or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,14}',iface):raise ValueError('DHCP 未在本机启用')
+    if not (Path('/sys/class/net')/iface).exists() or not shutil.which('dhclient'):raise ValueError('缺少网卡或 dhclient')
+    return cfg
+
+def dhcp_address(iface):
+    data=json.loads(subprocess.run(['ip','-j','-4','address','show','dev',iface],check=True,capture_output=True,text=True,timeout=5).stdout)
+    ips=[a['local'] for row in data for a in row.get('addr_info',[]) if ipaddress.ip_address(a['local']).is_global]
+    return ips[0] if len(ips)==1 else None
+
+def dhcp_write(result):
+    DHCP_STATE.mkdir(mode=0o700,parents=True,exist_ok=True)
+    path=DHCP_STATE/'dhcp-result.json';tmp=path.with_suffix('.tmp')
+    tmp.write_text(json.dumps(result));tmp.chmod(0o600);tmp.replace(path)
+
+def dhcp_clients(iface,cleanup_unscoped=False,root=Path('/proc')):
+    result=[]
+    for path in root.iterdir():
+        if not path.name.isdecimal():continue
+        try:args=[x.decode() for x in (path/'cmdline').read_bytes().split(b'\0') if x]
+        except (OSError,UnicodeError):continue
+        if not args or Path(args[0]).name!='dhclient' or '-6' in args:continue
+        if iface in args[1:] or (cleanup_unscoped and args[1:]==['-v']):result.append((int(path.name),args))
+    return result
+
+def dhcp_run(args,timeout=45):
+    # Kill a timed-out invocation's process group, not unrelated DHCP clients.
+    child=subprocess.Popen(args,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+    try:return child.wait(timeout=timeout)==0
+    except subprocess.TimeoutExpired:
+        try:os.killpg(child.pid,signal.SIGKILL)
+        except ProcessLookupError:pass
+        child.wait();return False
+
+def dhcp_acquire(iface,background=False):
+    return [shutil.which('dhclient'),'-4']+(['-nw'] if background else ['-1','-v'])+['-pf',f'/run/dhclient.{iface}.pid','-lf',f'/var/lib/dhcp/dhclient.{iface}.leases',iface]
+
+def dhcp_lease_path(iface):return Path(f'/var/lib/dhcp/dhclient.{iface}.leases')
+
+def dhcp_background(iface,cfg):
+    if not dhcp_clients(iface,cfg.get('cleanup_unscoped') is True):
+        dhcp_run(dhcp_acquire(iface,background=True),timeout=15)
+
+def dhcp_recover():
+    cfg=dhcp_config();iface=cfg['interface']
+    route=subprocess.run(['ip','-4','route','show','default','dev',iface],capture_output=True,text=True,timeout=5,check=True).stdout.strip()
+    if dhcp_address(iface) and route:return
+    dhcp_background(iface,cfg)
+
+def dhcp_task(cid):
+    cfg=dhcp_config();iface=cfg['interface'];DHCP_STATE.mkdir(mode=0o700,parents=True,exist_ok=True)
+    with (DHCP_STATE/'dhcp.lock').open('a') as lock:
+        try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:return
+        path=DHCP_STATE/'dhcp-result.json'
+        previous=json.loads(path.read_text()) if path.exists() else {}
+        if previous.get('id',0)>=cid:return  # persistent at-most-once across agent restarts
+        old=dhcp_address(iface)
+        result={'id':cid,'state':'running','old_ip':old,'attempts':0};dhcp_write(result)
+        try:
+            # Verify a public IPv4 before touching DHCP; no guessed interface/lease.
+            if not old:raise ValueError('无法唯一确认原 IPv4')
+            for attempt in range(1,4):
+                result['attempts']=attempt
+                clients=dhcp_clients(iface,cfg.get('cleanup_unscoped') is True)
+                dhcp_run([shutil.which('dhclient'),'-4','-r','-pf',f'/run/dhclient.{iface}.pid','-lf',f'/var/lib/dhcp/dhclient.{iface}.leases',iface],timeout=10)
+                for pid,args in clients:
+                    try:
+                        current=[x.decode() for x in (Path('/proc')/str(pid)/'cmdline').read_bytes().split(b'\0') if x]
+                        if current==args:os.kill(pid,signal.SIGTERM)
+                    except (OSError,UnicodeError):pass
+                time.sleep(3)
+                if dhcp_clients(iface,cfg.get('cleanup_unscoped') is True):raise ValueError('仍有 DHCP 客户端未退出')
+                # Remove only this interface's IPv4 lease; preserve IPv6 and other NICs.
+                lease=dhcp_lease_path(iface)
+                if lease.exists():
+                    backup=DHCP_STATE/'dhcp-lease.backup';backup.write_bytes(lease.read_bytes());backup.chmod(0o600)
+                    lease.unlink()
+                dhcp_run(dhcp_acquire(iface),timeout=45)
+                time.sleep(5)
+                new=dhcp_address(iface);result['new_ip']=new
+                if new and new!=old:
+                    result['state']='changed';break
+                if not new:dhcp_background(iface,cfg)
+                time.sleep(5)
+            else:result['state']='unchanged' if dhcp_address(iface)==old else 'failed'
+        except Exception as e:
+            result['state']='failed';result['error']=type(e).__name__+': '+str(e)[:180]
+        finally:
+            try:
+                if not dhcp_address(iface):dhcp_background(iface,cfg)
+            except Exception:pass
+            result['finished_at']=int(time.time());dhcp_write(result)
+
+
+def dispatch_dhcp(cid):
+    dhcp_config()  # local opt-in is required even for a valid panel command
+    # Independent systemd jobs survive agent restart or loss of its HTTPS link.
+    subprocess.run(['systemd-run','--unit=hksdan-dhcp-recover-'+str(cid),'--on-active=300s','--collect','/usr/bin/python3',str(Path(__file__).resolve()),'--dhcp-recover'],check=True,timeout=10,capture_output=True)
+    subprocess.run(['systemd-run','--unit=hksdan-dhcp-'+str(cid),'--collect','--property=RuntimeMaxSec=240','/usr/bin/python3',str(Path(__file__).resolve()),'--dhcp-task',str(cid)],check=True,timeout=10,capture_output=True)
+
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--once',action='store_true');p.add_argument('--config',default='/etc/hk-sdan-agent/config.json');a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--once',action='store_true');p.add_argument('--config',default='/etc/hk-sdan-agent/config.json');p.add_argument('--dhcp-task',type=int);p.add_argument('--dhcp-recover',action='store_true');a=p.parse_args()
+    if a.dhcp_recover:dhcp_recover();return
+    if a.dhcp_task is not None:
+        if a.dhcp_task<1:raise SystemExit('无效任务')
+        dhcp_task(a.dhcp_task);return
     config=json.loads(Path(a.config).read_text());url=config['url'].rstrip('/')
     if not url.startswith('https://'):raise SystemExit('只支持 HTTPS 面板地址')
     previous=None;connections=ConnectionSampler();egress=EgressSampler()
@@ -122,20 +232,31 @@ def main():
         try:
             metrics,previous=collect(previous,connections)
             metrics.update(egress.snapshot())
+            try:
+                dhcp_config();metrics['capabilities'].append('hkt_dhcp')
+                state=DHCP_STATE/'dhcp-result.json'
+                if state.exists():
+                    result_state=json.loads(state.read_text())
+                    if result_state.get('state') in ('changed','unchanged','failed'):
+                        metrics['dhcp_result']=result_state
+                        if metrics.get('egress_checked',0)<result_state.get('finished_at',0):
+                            metrics['egress_ips']=None;metrics['egress_checked']=0
+            except (OSError,ValueError):pass
             req=urllib.request.Request(url+'/api/agent/report',data=json.dumps(metrics).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer '+config['token']},method='POST')
             # Never follow redirects with the agent credential.
             opener=urllib.request.build_opener(NoRedirect)
             with opener.open(req,timeout=15) as response:result=json.loads(response.read(32768))
             command=result.get('command')
-            if isinstance(command,dict) and command.get('action')=='reboot' and type(command.get('id')) is int:
+            if isinstance(command,dict) and command.get('action') in ('reboot','hkt_dhcp') and type(command.get('id')) is int:
                 command_url=url+'/api/agent/commands/'+str(command['id'])+'/ack'
                 headers={'Content-Type':'application/json','Authorization':'Bearer '+config['token']}
                 ack=urllib.request.Request(command_url,data=b'{}',headers=headers,method='POST')
                 # Only act after the server accepts this one-time acknowledgement.
                 with opener.open(ack,timeout=15) as response:response.read(1024)
                 try:
-                    subprocess.run(['/usr/bin/systemctl','reboot','--no-block'],check=True,timeout=15,capture_output=True)
-                    print('重启请求已交给系统管理器',flush=True)
+                    if command['action']=='hkt_dhcp':dispatch_dhcp(command['id'])
+                    else:subprocess.run(['/usr/bin/systemctl','reboot','--no-block'],check=True,timeout=15,capture_output=True)
+                    print('动作请求已交给系统管理器',flush=True)
                 except (OSError,subprocess.SubprocessError):
                     print('系统重启请求失败',flush=True)
                     failure=urllib.request.Request(command_url,data=b'{"status":"failed"}',headers=headers,method='POST')
