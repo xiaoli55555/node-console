@@ -22,7 +22,7 @@ def references(db,sid):
     return rows
 
 
-def shared(db,sid):return len(references(db,sid))>1
+def shared(db,sid):return len({(r['primary'],r['owner_id']) for r in references(db,sid)})>1
 
 
 def original(db,sid,exclude=None):

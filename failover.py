@@ -230,7 +230,16 @@ def configure(db,cipher,rid,body,now):
         if not ids:raise IntegrationError('A 尚未绑定解析记录，无法启用故障转移')
         probe_config(db,r['primary_server_id'],r['owner_id'])
         if rot._pending_action(db,sid):raise IntegrationError('故障转移 VPS 有未结束的重启或换 IP 动作')
-        conflict=db.execute('SELECT 1 FROM vps_rotations WHERE id<>? AND (enabled=1 OR failover_server_id IS NOT NULL OR phase<>\'active\' OR dns_intent IS NOT NULL OR EXISTS(SELECT 1 FROM vps_failover_leases l WHERE l.rotation_id=vps_rotations.id)) AND (primary_server_id IN (?,?) OR other_server_id IN (?,?) OR failover_server_id IN (?,?))',(rid,sid,r['primary_server_id'],sid,r['other_server_id'],r['primary_server_id'],r['other_server_id'])).fetchone()
+        related=db.execute('SELECT * FROM vps_rotations WHERE id<>?',(rid,)).fetchall()
+        conflict=False
+        for peer in related:
+            same_pair=peer['primary_server_id']==r['primary_server_id'] and peer['other_server_id']==r['other_server_id'] and peer['owner_id']==r['owner_id']
+            shared_primary=peer['primary_server_id']==r['primary_server_id'] and peer['mode']==r['mode']=='fixed_primary' and peer['owner_id']==r['owner_id']
+            if shared_primary and peer['other_server_id']==sid:raise IntegrationError('故障转移 VPS 不能同时作为其他计划的轮换机')
+            if same_pair or shared_primary:
+                if shared_primary and not same_pair and peer['failover_server_id'] not in (None,sid):raise IntegrationError('共用主 VPS 的计划必须使用同一故障转移 VPS')
+                continue
+            if (peer['enabled'] or peer['failover_server_id'] or peer['phase']!='active' or peer['dns_intent']) and (peer['primary_server_id'] in (sid,r['primary_server_id']) or peer['other_server_id'] in (sid,r['other_server_id']) or peer['failover_server_id'] in (r['primary_server_id'],r['other_server_id'])):conflict=True
         if conflict:raise IntegrationError('故障转移 VPS 或 A/B 已被其他活动轮换任务占用')
         ip,port=standby_ready(db,cipher,r,sid,now)
         if ip in {rot._fresh_ip(db,x,now,cipher)[0] for x in (r['primary_server_id'],r['other_server_id'])}:raise IntegrationError('故障转移 VPS 的公网 IP 不能与 A/B 相同')
@@ -241,8 +250,8 @@ def configure(db,cipher,rid,body,now):
             try:
                 with rot.socket.create_connection((ip,row['port']),timeout=4):pass
             except OSError:raise IntegrationError('故障转移 VPS 未提供 A 解析所需的业务端口：'+str(row['port'])) from None
-            other=db.execute('SELECT 1 FROM vps_rotations WHERE id<>? AND binding_id=?',(rid,bid)).fetchone()
-            if other:raise IntegrationError('所选记录已由其他轮换任务管理')
+            other=db.execute('SELECT * FROM vps_rotations WHERE id<>? AND binding_id=?',(rid,bid)).fetchone()
+            if other and not (other['primary_server_id']==r['primary_server_id'] and other['owner_id']==r['owner_id'] and (other['other_server_id']==r['other_server_id'] or other['mode']==r['mode']=='fixed_primary')):raise IntegrationError('所选记录已由其他轮换任务管理')
     if r['failover_server_id']!=sid:stop_probe(db,rid,remove=True)
     if sid is not None:
         state=_remember_probe(db,rid,sid)
@@ -294,11 +303,11 @@ def _finish(db,r,b,target,restore,now):
     rot._event(db,r['id'],r['primary_server_id'] if restore else r['failover_server_id'],'解析 #'+str(b['id'])+'：'+message,now)
     if restore:
         db.execute('DELETE FROM vps_failover_leases WHERE binding_id=?',(b['id'],))
-        if b['id']==r['binding_id']:
-            # Preserve a B repair in flight; never relabel it as completed.
-            if r['drain_server_id']==r['primary_server_id']:
-                db.execute("UPDATE vps_rotations SET active_server_id=?,phase='active',drain_server_id=NULL,old_ip=NULL,new_ip=NULL,action_started=NULL,emergency=0,low_samples=0,next_switch_at=? WHERE id=?",(r['primary_server_id'],now+r['interval_s'],r['id']))
-            else:db.execute('UPDATE vps_rotations SET active_server_id=? WHERE id=?',(r['primary_server_id'],r['id']))
+        peer=db.execute('SELECT * FROM vps_rotations WHERE binding_id=?',(b['id'],)).fetchone()
+        if peer:
+            if peer['drain_server_id']==peer['primary_server_id']:
+                db.execute("UPDATE vps_rotations SET active_server_id=?,phase='active',drain_server_id=NULL,old_ip=NULL,new_ip=NULL,action_started=NULL,emergency=0,low_samples=0,next_switch_at=? WHERE id=?",(peer['primary_server_id'],now+peer['interval_s'],peer['id']))
+            else:db.execute('UPDATE vps_rotations SET active_server_id=? WHERE id=?',(peer['primary_server_id'],peer['id']))
     else:db.execute('UPDATE vps_failover_leases SET current_ip=?,target_ip=NULL,intent=NULL,updated=? WHERE binding_id=?',(target,now,b['id']))
 
 
@@ -325,7 +334,11 @@ def step(connect,cipher,rid,now):
     import rotation as rot
     with connect() as db:
         r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
-        if not r or not r['failover_server_id']:return False
+        if not r:return False
+        leader=db.execute('SELECT * FROM vps_rotations WHERE primary_server_id=? AND failover_server_id IS NOT NULL ORDER BY id LIMIT 1',(r['primary_server_id'],)).fetchone()
+        if leader and leader['id']!=rid:
+            return bool(db.execute('SELECT 1 FROM vps_failover_leases l JOIN vps_rotations p ON p.id=l.rotation_id WHERE p.primary_server_id=?',(r['primary_server_id'],)).fetchone())
+        if not r['failover_server_id']:return False
         leases=db.execute('SELECT 1 FROM vps_failover_leases WHERE rotation_id=?',(rid,)).fetchone()
         if not rot._owned_server(db,r['primary_server_id'],r['owner_id']):raise IntegrationError('主 VPS 归属已变化，故障转移暂停')
         offline=rot._offline(db,r['primary_server_id'],now,r['offline_after_s'])
@@ -363,17 +376,12 @@ def step(connect,cipher,rid,now):
                 address,port,_=backup_ready(db,cipher,r,now)
             except IntegrationError as e:
                 _status(db,rid,'A 心跳超时；故障转移 VPS 不可接替：'+str(e),now);return True
-            if r['active_server_id']==r['primary_server_id']:
-                ids=list(set(ids+[r['binding_id']]))
-            elif r['binding_id'] in ids:ids.remove(r['binding_id'])
-            # A healthy B keeps mobile; a failed/unknown B can hand it to C.
-            if r['active_server_id']==r['other_server_id']:
-                rot._request_probe(db,r['other_server_id'],now)
-                try:
-                    if rot._offline(db,r['other_server_id'],now,r['offline_after_s']):raise IntegrationError('B 心跳超时')
-                    rot._fixed_ready(db,cipher,r,r['other_server_id'],now)
-                except IntegrationError:
-                    if rot._offline(db,r['other_server_id'],now,r['offline_after_s']) or rot._fixed_failure(db,r['other_server_id'],now):ids=list(set(ids+[r['binding_id']]))
+            # Every healthy B keeps its own records, including sibling plans.
+            for peer in db.execute('SELECT * FROM vps_rotations WHERE primary_server_id=?',(r['primary_server_id'],)).fetchall():
+                if peer['active_server_id']!=peer['other_server_id']:continue
+                if peer['binding_id'] in ids:ids.remove(peer['binding_id'])
+                rot._request_probe(db,peer['other_server_id'],now)
+                if rot._offline(db,peer['other_server_id'],now,peer['offline_after_s']) or rot._fixed_failure(db,peer['other_server_id'],now):ids=list(set(ids+[peer['binding_id']]))
             work=[]
             for bid in ids:
                 lease=next((x for x in lease_rows if x['binding_id']==bid),None)

@@ -81,6 +81,7 @@ test('admin rotation form prechecks and saves the selected telecom record withou
  await elements.checkAdminRotation.onclick();assert.equal(calls[0].path,'admin/servers/1/rotation/readiness');assert.equal(calls[0].body.binding_id,12);
  const submitter={disabled:false};await form.onsubmit({preventDefault(){},submitter});
  assert.equal(calls[1].method,'PUT');assert.equal(calls[1].body.binding_id,12);assert.equal(calls[1].body.mode,'fixed_primary');assert.equal(calls[1].body.interval_s,7200);assert.equal(refreshed,1);assert.equal(submitter.disabled,false);
+ form.binding_id.multiple=true;form.binding_id.selectedOptions=[{value:'11'},{value:'12'}];await elements.checkAdminRotation.onclick();await form.onsubmit({preventDefault(){},submitter});assert.deepEqual(JSON.parse(JSON.stringify(calls[2].body.binding_ids)),[11,12]);assert.deepEqual(JSON.parse(JSON.stringify(calls[3].body.binding_ids)),[11,12]);assert.match(html,/multiple size="5"/);
 });
 
 test('admin lifecycle buttons submit pause resume delete and recover after a failed delete',async()=>{
@@ -97,7 +98,7 @@ test('admin lifecycle buttons submit pause resume delete and recover after a fai
  await buttons[1].onclick();assert.equal(r.enabled,false);
  await buttons[2].onclick();assert.match(message.textContent,/稍后重试/);assert.equal(buttons[2].disabled,false);
  rejectDelete=false;await buttons[2].onclick();assert.equal(removed,true);
- assert.equal(calls.filter(c=>c.method==='PUT').length,3);assert.equal(calls.filter(c=>c.method==='DELETE').length,2);
+ assert.equal(calls.filter(c=>c.method==='PUT').length,3);assert.equal(calls.filter(c=>c.method==='DELETE').length,2);assert.equal(calls.find(c=>c.method==='PUT').body.rotation_id,5);assert.match(calls.find(c=>c.method==='DELETE').path,/rotation_id=5/);
 });
 
 test('HKT DHCP form generates scoped API without executing DHCP and shows results',async()=>{
@@ -153,3 +154,18 @@ test('HKT one-shot test uses admin session without reading or rotating API keys'
  calls=[];ctx.confirm=()=>false;await elements.hktDHCPTest.onclick();assert.equal(calls.length,0);
  ctx.confirm=()=>true;ctx.api=async()=>{throw Error('冷备用不接受此动作');};await elements.hktDHCPTest.onclick();assert.match(elements.hktDHCPMessage.textContent,/冷备用/);assert.equal(elements.hktDHCPTest.disabled,false);
 });
+
+test('rotation multi-select picker binds all chosen records and retains every selection',async()=>{
+ const fields={dns_connection_id:{value:'3'},rotation_domain:{value:'example.com'},rotation_record:{multiple:true,value:'0',selectedOptions:[{value:'0'},{value:'1'}]},binding_id:{multiple:true,options:[]},primary_server_id:{value:'7'}};
+ const elements={loadRotationDnsRecords:{},chooseRotationDnsRecord:{},rotationDnsPickerStatus:{},rotationDnsDomains:{}};
+ const calls=[],data={bindings:[]};ctx.$=id=>elements[id];ctx.api=async(path,method,body)=>{calls.push({path,method,body});if(path.endsWith('/records'))return {domain:'example.com',records:[{RecordId:'r1',RR:'edge',Line:'unicom',Value:'8.8.8.8'},{RecordId:'r2',RR:'edge',Line:'telecom',Value:'8.8.8.8'}]};return {bindings:[{id:101,server_id:7},{id:102,server_id:7}],message:'已选择 2 条'};};
+ ctx.bindAdminRotationDNSPicker(data,fields,()=>{fields.binding_id.options=data.bindings.map(b=>({value:String(b.id),selected:false}));});
+ await elements.loadRotationDnsRecords.onclick();fields.rotation_record.onchange();assert.equal(elements.chooseRotationDnsRecord.disabled,false);
+ await elements.chooseRotationDnsRecord.onclick();assert.deepEqual(JSON.parse(JSON.stringify(calls[1].body.record_ids)),['r1','r2']);assert.equal(data.bindings.length,2);assert.ok(fields.binding_id.options.every(o=>o.selected));
+});
+
+
+test('multi-record coordination does not claim all records have finished switching',()=>{const html=ctx.rotationLiveMarkup({phase:'active',mode:'fixed_primary',primary_server_id:1,active_server_id:2,active_name:'多条记录切换中',enabled:1,group_pending:true,next_switch_at:2000000000,status:'等待其他线路'});assert.match(html,/多记录协调中/);assert.match(html,/等待全部记录完成切换与恢复/);});
+
+
+test('shared primary failover freezes a sibling plan even when its own record stays on B',()=>{const html=ctx.rotationLiveMarkup({phase:'active',mode:'fixed_primary',primary_server_id:1,active_server_id:2,active_name:'B',enabled:1,primary_failover_active:true,next_switch_at:2000000000,status:'C 接替其他 A 解析'});assert.match(html,/A 故障转移接替中/);assert.match(html,/故障接替期间暂停定时轮换/);});

@@ -8,6 +8,8 @@ from pathlib import Path
 from flask import g, jsonify
 from rotation_insights import record_switch, record_progress
 import failover
+import rotation_groups
+from contextlib import nullcontext
 
 from detectors import boce_dns_gate, queue_reboot
 from ip_dns import (
@@ -87,6 +89,12 @@ def _owned_server(db,sid,uid):
 def _rotation_json(db,row):
     if not row:return None
     data=dict(row)
+    group=rotation_groups.members(db,row)
+    data['binding_ids']=[p['binding_id'] for p in group]
+    data['member_ids']=[p['id'] for p in group]
+    data['member_phases']=[{'id':p['id'],'binding_id':p['binding_id'],'phase':p['phase'],'active_server_id':p['active_server_id'],'status':p['status']} for p in group]
+    data['group_pending']=len({(p['phase'],p['active_server_id'],bool(p['dns_intent'])) for p in group})>1
+    data['primary_failover_active']=bool(db.execute('SELECT 1 FROM vps_failover_leases l JOIN vps_rotations p ON p.id=l.rotation_id WHERE p.primary_server_id=?',(row['primary_server_id'],)).fetchone())
     names=db.execute('SELECT id,name FROM servers WHERE id IN (?,?)',(data['primary_server_id'],data['other_server_id'])).fetchall()
     data['primary_name']=next((x['name'] for x in names if x['id']==data['primary_server_id']),str(data['primary_server_id']))
     data['other_name']=next((x['name'] for x in names if x['id']==data['other_server_id']),str(data['other_server_id']))
@@ -95,11 +103,15 @@ def _rotation_json(db,row):
     backup=db.execute('SELECT name FROM servers WHERE id=?',(data['failover_server_id'],)).fetchone()
     data['failover_name']=backup['name'] if backup else None
     data['failover_binding_ids']=json.loads(data['failover_binding_ids'])
-    data['failover_leases']=[dict(x) for x in db.execute('SELECT binding_id,current_ip,target_ip,intent FROM vps_failover_leases WHERE rotation_id=?',(data['id'],))]
+    data['failover_leases']=[dict(x) for x in db.execute('SELECT binding_id,current_ip,target_ip,intent FROM vps_failover_leases WHERE rotation_id IN ('+','.join('?' for _ in group)+') OR binding_id IN ('+','.join('?' for _ in group)+')',data['member_ids']+data['binding_ids'])]
     mobile_lease=next((x for x in data['failover_leases'] if x['binding_id']==data['binding_id']),None)
+    if data['failover_leases'] and not data['failover_server_id']:
+        inherited=db.execute('SELECT r.failover_server_id,r.failover_status,s.name FROM vps_failover_leases l JOIN vps_rotations r ON r.id=l.rotation_id JOIN servers s ON s.id=r.failover_server_id WHERE l.binding_id=?',((mobile_lease or data['failover_leases'][0])['binding_id'],)).fetchone()
+        if inherited:data['failover_server_id']=inherited['failover_server_id'];data['failover_name']=inherited['name'];data['failover_status']=inherited['failover_status']
     data['mobile_effective_server_id']=data['failover_server_id'] if mobile_lease and not mobile_lease['intent'] else data['active_server_id']
     if mobile_lease:data['active_name']='解析待核对' if mobile_lease['intent'] else (data['failover_name'] or str(data['failover_server_id']))+'（故障转移）'
-    data['events']=[dict(e) for e in db.execute('SELECT server_id,message,created FROM vps_rotation_events WHERE rotation_id=? ORDER BY id DESC LIMIT 50',(data['id'],))]
+    if len({p['active_server_id'] for p in group})>1:data['active_name']='多条记录切换中'
+    data['events']=[dict(e) for e in db.execute('SELECT server_id,message,created FROM vps_rotation_events WHERE rotation_id IN ('+','.join('?' for _ in group)+') ORDER BY id DESC LIMIT 50',data['member_ids'])]
     return data
 
 def _server_snapshot(db,sid,now,cipher):
@@ -149,17 +161,17 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
     get_rotation.__name__='client_get_vps_rotation'
 
     @auth()
-    def save_rotation(sid):
+    def save_one(sid):
         if g.user['role'] not in ('admin','client'):return error('无权管理轮换',403)
-        d=body();other=d.get('other_server_id');binding_id=d.get('binding_id');interval=d.get('interval_s',7200);threshold=d.get('connection_threshold',80);enabled=d.get('enabled');offline_after=d.get('offline_after_s',15);lead=d.get('lead_s',min(120,interval//4) if type(interval)is int else 0)
+        d=getattr(g,'rotation_payload',None) or body();other=d.get('other_server_id');binding_id=d.get('binding_id');interval=d.get('interval_s',7200);threshold=d.get('connection_threshold',80);enabled=d.get('enabled');offline_after=d.get('offline_after_s',15);lead=d.get('lead_s',min(120,interval//4) if type(interval)is int else 0)
         if d.get('mode')=='fixed_primary':lead=0
         if type(other)is not int or other==sid or type(binding_id)is not int or type(interval)is not int or not 60<=interval<=604800 or type(threshold)is not int or not 1<=threshold<=10000 or type(offline_after)is not int or not 10<=offline_after<=120 or type(lead)is not int or not 0<=lead<interval or type(enabled)is not bool:return error('请检查备用 VPS、DNS 记录、轮换间隔、连接数阈值和开关')
         now=int(time.time())
         try:
-            with connect() as db:
-                db.execute('BEGIN IMMEDIATE')
+            with (nullcontext(g.rotation_db) if hasattr(g,'rotation_db') else connect()) as db:
+                if not db.in_transaction:db.execute('BEGIN IMMEDIATE')
                 if not _owned_server(db,sid,g.user['id']) or not _owned_server(db,other,g.user['id']):return error('两台 VPS 必须都分配给当前客户',404)
-                existing=db.execute('SELECT * FROM vps_rotations WHERE primary_server_id=? OR other_server_id=? OR binding_id=?',(sid,sid,binding_id)).fetchall()
+                existing=db.execute('SELECT * FROM vps_rotations WHERE binding_id=?',(binding_id,)).fetchall()
                 if len(existing)>1:return error('VPS 或 DNS 记录已用于其他轮换任务',409)
                 rotation=existing[0] if existing else None
                 if rotation and g.user['role']!='admin' and rotation['owner_id']!=g.user['id']:return error('轮换计划不属于当前客户',403)
@@ -185,7 +197,8 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
                     return jsonify(ok=True,rotation=_rotation_json(db,db.execute('SELECT * FROM vps_rotations WHERE id=?',(rotation['id'],)).fetchone()))
                 import server_failover
                 if server_failover.reserved(db,sid) or server_failover.reserved(db,other):return error('冷备用已被单机故障转移占用，不能参与轮换',409)
-                conflicts=db.execute('SELECT id FROM vps_rotations WHERE enabled=1 AND (primary_server_id IN (?,?) OR other_server_id IN (?,?)) AND id<>?',(sid,other,sid,other,rotation['id'] if rotation else -1)).fetchone()
+                rotation_groups.compatible(db,sid,other,mode,effective_uid,rotation['id'] if rotation else None)
+                conflicts=False
                 if enabled and (conflicts or db.execute('SELECT 1 FROM vps_rotations WHERE id<>? AND failover_server_id IN (?,?) AND (enabled=1 OR failover_server_id IS NOT NULL OR EXISTS(SELECT 1 FROM vps_failover_leases l WHERE l.rotation_id=vps_rotations.id))',(rotation['id'] if rotation else -1,sid,other)).fetchone()):return error('其中一台 VPS 已参加其他启用中的轮换或故障转移任务',409)
                 binding=db.execute('SELECT b.*,c.kind,c.owner_id AS connection_owner,c.server_id AS connection_server FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id WHERE b.id=?',(binding_id,)).fetchone()
                 binding_owner=None if _admin_user(db,effective_uid) else effective_uid
@@ -197,6 +210,9 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
                 if a['ip']==b['ip']:return error('两台 VPS 当前公网 IP 相同，不能进行轮换')
                 if mode=='fixed_primary':_rotation_tcp_count(b['metrics'],now)
                 if mode=='fixed_primary' and (not rotation or not rotation['enabled']) and (_pending_action(db,sid) or _pending_action(db,other)):return error('机器存在未完成的重启或换 IP 动作，完成核对后再启用固定主机模式',409)
+                if mode=='fixed_primary' and (not rotation or not rotation['enabled']):
+                    pending=db.execute("SELECT * FROM vps_rotations WHERE drain_server_id IN (?,?) AND phase IN ('waiting_ip','waiting_probe')",(sid,other)).fetchall()
+                    if any(p['primary_server_id']!=sid or p['other_server_id']!=other or p['owner_id']!=effective_uid for p in pending):return error('共享机器仍由其他计划换 IP 或复检，完成后再新建或启用计划',409)
                 active_ip=(a['ip'] if not rotation or rotation['active_server_id']==sid else b['ip'])
                 connection=load_connection(db,cipher,binding['connection_id'])
                 record=get_dns_record(connection,dict(binding))
@@ -226,6 +242,38 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
         except IntegrationError as e:return error(str(e),409)
 
     @auth()
+    def save_rotation(sid):
+        d=body();requested=d.get('binding_ids');rid=d.get('rotation_id')
+        if rid is not None and type(rid)is not int:return error('轮换计划编号无效')
+        if requested is not None and (not isinstance(requested,list) or not 1<=len(requested)<=50 or any(type(x)is not int or x<1 for x in requested) or len(set(requested))!=len(requested)):return error('请选择 1～50 条不同的 DNS 记录')
+        with connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            old=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone() if rid is not None else db.execute('SELECT * FROM vps_rotations WHERE binding_id=?',(d.get('binding_id') or (requested[0] if requested else None),)).fetchone()
+            if rid is not None and (not old or old['primary_server_id']!=sid):return error('轮换计划不存在',404)
+            if old and g.user['role']!='admin' and old['owner_id']!=g.user['id']:return error('轮换计划不属于当前账号',403)
+            group=rotation_groups.members(db,old) if old else []
+            old_ids=[x['binding_id'] for x in group]
+            ids=requested if requested is not None else (old_ids or [d.get('binding_id')])
+            if old and set(ids)!=set(old_ids):return error('已有计划的记录范围不能直接改变，请暂停并删除后重新创建',409)
+            if not old and any(db.execute('SELECT 1 FROM vps_rotations WHERE binding_id=?',(bid,)).fetchone() for bid in ids):return error('所选记录已被其他计划管理',409)
+            # A different record cannot silently create another plan on the same
+            # physical pair; multi-selection creates one explicit group atomically.
+            if not old and db.execute('SELECT 1 FROM vps_rotations WHERE primary_server_id=? AND other_server_id=?',(sid,d.get('other_server_id'))).fetchone():return error('这对 VPS 已有计划，请从原计划管理记录',409)
+            g.rotation_db=db
+            try:
+                created=[]
+                for bid in ids:
+                    g.rotation_payload=dict(d,binding_id=bid)
+                    response=app.make_response(save_one.__wrapped__(sid))
+                    if response.status_code>=400:
+                        db.rollback();return response
+                    created.append(response.get_json()['rotation']['id'])
+                root=db.execute('SELECT * FROM vps_rotations WHERE id=?',(min(created),)).fetchone()
+                return jsonify(ok=True,rotation=_rotation_json(db,root))
+            finally:
+                g.pop('rotation_db',None);g.pop('rotation_payload',None)
+
+    @auth()
     def readiness(sid):
         if g.user['role'] not in ('admin','client'):return error('无权管理轮换',403)
         d=body();other=d.get('other_server_id');bid=d.get('binding_id');checks=[];now=int(time.time());recommended=120
@@ -252,13 +300,16 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
                     if not db.execute('SELECT 1 FROM dns_bindings WHERE server_id=?',(sid,)).fetchone():raise IntegrationError('A 尚未绑定解析记录')
                     checks.append({'name':'A 故障转移 VPS','ok':True,'message':'冷备用就绪；故障时继承 A 的探测点，待命不拨测、不消耗额度'})
                 except IntegrationError as e:checks.append({'name':'A 故障转移 VPS','ok':False,'message':str(e)})
-            binding=db.execute('SELECT b.*,c.owner_id AS credential_owner FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id WHERE b.id=? AND b.server_id=?',(bid,sid)).fetchone()
-            try:
-                if not binding or binding['credential_owner']!=(None if _admin_user(db,effective_uid) else effective_uid):raise IntegrationError('请选择主 VPS 自有 DNS 绑定')
-                conn=load_connection(db,cipher,binding['connection_id']);record=get_dns_record(conn,binding);validate_dns_record(record,binding,conn)
-                ttl=int(record.get('ttl',record.get('TTL',300)) or 300);ttl=300 if ttl<=1 else ttl;recommended=ttl+60
-                checks.append({'name':'DNS 记录','ok':True,'message':'记录身份与当前值核对通过；启用后接管单机自动解析，本次未修改 DNS；建议提前至少 '+str(recommended)+' 秒'})
-            except IntegrationError as e:checks.append({'name':'DNS 记录','ok':False,'message':str(e)})
+            selected=d.get('binding_ids') or [bid]
+            if not isinstance(selected,list) or not 1<=len(selected)<=50 or any(type(x)is not int for x in selected):return error('请选择 1～50 条 DNS 记录')
+            for bid in selected:
+                binding=db.execute('SELECT b.*,c.owner_id AS credential_owner FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id WHERE b.id=? AND b.server_id=?',(bid,sid)).fetchone()
+                try:
+                    if not binding or binding['credential_owner']!=(None if _admin_user(db,effective_uid) else effective_uid):raise IntegrationError('请选择主 VPS 自有 DNS 绑定')
+                    conn=load_connection(db,cipher,binding['connection_id']);record=get_dns_record(conn,binding);validate_dns_record(record,binding,conn)
+                    ttl=int(record.get('ttl',record.get('TTL',300)) or 300);ttl=300 if ttl<=1 else ttl;recommended=max(recommended,ttl+60)
+                    checks.append({'name':'DNS 记录','ok':True,'message':'记录身份与当前值核对通过；启用后接管单机自动解析，本次未修改 DNS；建议提前至少 '+str(recommended)+' 秒'})
+                except IntegrationError as e:checks.append({'name':'DNS 记录','ok':False,'message':str(e)})
         return jsonify(ok=all(x['ok'] for x in checks),checks=checks,recommended_lead_s=recommended)
     app.add_url_rule('/api/client/servers/<int:sid>/rotation/readiness','client_rotation_readiness',readiness,methods=['POST'])
 
@@ -276,19 +327,35 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
             with connect() as db:
                 db.execute('BEGIN IMMEDIATE')
                 if not _owned_server(db,sid,g.user['id']):return error('服务器不存在',404)
-                rotation=db.execute('SELECT * FROM vps_rotations WHERE primary_server_id=? AND (? OR owner_id=?)',(sid,int(g.user['role']=='admin'),g.user['id'])).fetchone()
+                from flask import request
+                requested=request.args.get('rotation_id',type=int)
+                choices=db.execute('SELECT * FROM vps_rotations WHERE primary_server_id=? AND (? OR owner_id=?) ORDER BY id',(sid,int(g.user['role']=='admin'),g.user['id'])).fetchall()
+                if requested is None and len({p['other_server_id'] for p in choices})>1:return error('该主机有多个计划，请指定 rotation_id 删除目标计划',409)
+                rotation=next((p for p in choices if p['id']==requested),None) if requested is not None else (choices[0] if choices else None)
                 if not rotation:return error('轮换计划不存在',404)
-                if rotation['enabled']:return error('请先暂停轮换再删除',409)
-                if rotation['dns_intent']:return error('DNS 写入结果待核对，请确认实际解析后再删除',409)
-                if db.execute('SELECT 1 FROM vps_failover_leases WHERE rotation_id=?',(rotation['id'],)).fetchone():return error('C 正在接替解析，请等待安全切回 A 后再删除',409)
-                # Deleting stops recovery instead of waiting forever for historical jobs.
-                # Issued external requests cannot be recalled; retain their command history.
+                group=rotation_groups.members(db,rotation)
+                for member in group:
+                    if member['enabled']:return error('请先暂停轮换再删除',409)
+                    if member['dns_intent']:return error('DNS 写入结果待核对，请确认实际解析后再删除',409)
+                    if db.execute('SELECT 1 FROM vps_failover_leases WHERE rotation_id=? OR binding_id=?',(member['id'],member['binding_id'])).fetchone():return error('C 正在接替解析，请等待安全切回 A 后再删除',409)
+                ids={m['id'] for m in group}
                 for target in (rotation['primary_server_id'],rotation['other_server_id']):
+                    remaining=[p for p in db.execute('SELECT * FROM vps_rotations WHERE primary_server_id=? OR other_server_id=?',(target,target)).fetchall() if p['id'] not in ids]
+                    if remaining:
+                        inflight=next((p for p in group if p['drain_server_id']==target and p['phase']=='waiting_ip' and p['action_started'] is not None),None)
+                        if inflight:
+                            recipient=next((p for p in remaining if p['active_server_id']!=target and p['mode']=='fixed_primary'),None)
+                            if not recipient:return error('共享机器已有在途动作，尚无安全接管该动作的其他计划',409)
+                            fields=['phase','drain_server_id','drain_started','drain_grace_s','old_ip','new_ip','action_started','action_attempts','reboot_command_id','last_sample_at','low_samples','emergency','fault_recovery']
+                            db.execute('UPDATE vps_rotations SET '+','.join(k+'=?' for k in fields)+',status=?,updated=? WHERE id=?',[inflight[k] for k in fields]+['原计划已删除，接管共享主机的在途换 IP 动作；不重复发送',int(time.time()),recipient['id']])
+                        continue
                     db.execute('UPDATE detection_plans SET action_enabled=0 WHERE server_id=?',(target,))
                     db.execute("UPDATE detection_runs SET action_status='cancelled',action_result='轮换计划已删除，停止自动换 IP 重试；已发出的外部请求无法撤回' WHERE server_id=? AND action_status IN ('queued','issued','submitted','uncertain','verifying')",(target,))
                     db.execute("UPDATE commands SET status='cancelled',updated=? WHERE server_id=? AND action IN ('reboot','hkt_dhcp') AND status='queued'",(int(time.time()),target))
-                failover.stop_probe(db,rotation['id'],remove=True)
-                db.execute('DELETE FROM vps_rotations WHERE id=?',(rotation['id'],));audit(db,'删除双 VPS 轮换计划 #'+str(rotation['id']))
+                for member in group:
+                    failover.stop_probe(db,member['id'],remove=True)
+                    db.execute('DELETE FROM vps_rotations WHERE id=?',(member['id'],))
+                audit(db,'删除多记录轮换计划 #'+str(rotation['id']))
         return jsonify(ok=True)
     delete_rotation.__name__='client_delete_vps_rotation'
     app.add_url_rule('/api/client/servers/<int:sid>/rotation','client_delete_vps_rotation',delete_rotation,methods=['DELETE'])
@@ -296,7 +363,7 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
     @auth(admin=True)
     def admin_rotations():
         with connect() as db:
-            return jsonify(rotations=[dict(_rotation_json(db,r),owner_role=db.execute('SELECT role FROM users WHERE id=?',(r['owner_id'],)).fetchone()['role']) for r in db.execute('SELECT * FROM vps_rotations ORDER BY id DESC')],servers=[dict(x) for x in db.execute('SELECT id,name FROM servers')],bindings=[dict(x) for x in db.execute('SELECT b.id,b.server_id,b.domain,b.rr,b.line,b.expected_ip,c.owner_id AS credential_owner FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id')],dns_connections=[dict(x) for x in db.execute("SELECT id,name,kind,json_extract(config,'$.zone_name') AS zone_name FROM ip_connections WHERE owner_id IS NULL AND kind IN ('alidns','cloudflare')")])
+            return jsonify(rotations=[dict(_rotation_json(db,r),owner_role=db.execute('SELECT role FROM users WHERE id=?',(r['owner_id'],)).fetchone()['role']) for r in rotation_groups.roots(db)],servers=[dict(x) for x in db.execute('SELECT id,name FROM servers')],bindings=[dict(x) for x in db.execute('SELECT b.id,b.server_id,b.domain,b.rr,b.line,b.expected_ip,c.owner_id AS credential_owner FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id')],dns_connections=[dict(x) for x in db.execute("SELECT id,name,kind,json_extract(config,'$.zone_name') AS zone_name FROM ip_connections WHERE owner_id IS NULL AND kind IN ('alidns','cloudflare')")])
     app.add_url_rule('/api/admin/servers/<int:sid>/rotation','admin_save_rotation',auth(admin=True)(save_rotation.__wrapped__),methods=['PUT'])
     app.add_url_rule('/api/admin/servers/<int:sid>/rotation/readiness','admin_rotation_readiness',auth(admin=True)(readiness.__wrapped__),methods=['POST'])
     app.add_url_rule('/api/admin/servers/<int:sid>/rotation','admin_delete_rotation',auth(admin=True)(delete_rotation.__wrapped__),methods=['DELETE'])
@@ -363,6 +430,7 @@ def _request_probe(db,sid,now):
 
 
 def _fixed_ready(db,cipher,r,sid,now,verified_candidate=None):
+    rotation_groups.target_guard(db,r,sid)
     if _offline(db,sid,now,r['offline_after_s']):raise IntegrationError('目标 VPS 心跳已超时，不能接替')
     if r['phase'] in ('waiting_ip','waiting_probe') and r['drain_server_id']==sid:raise IntegrationError('目标 VPS 的换 IP / 复检尚未结束，不能接替')
     if _pending_action(db,sid,verified_candidate):raise IntegrationError('目标 VPS 有未结束的重启或换 IP 动作，不能接替')
@@ -661,6 +729,9 @@ def _run_rotation(connect,cipher,rid,now):
             plan=_validated_plan(db,old,r['owner_id'])
             if not plan or (plan.get('rotation_action')!='reboot' and not plan['action_connection_id']):
                 db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('旧机连接已降至阈值，但未配置换 IP API',now,rid));return
+            try:rotation_groups.action_guard(db,r,old,now)
+            except IntegrationError as e:
+                db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',(str(e),now,rid));return
             from server_failover import before_action
             reason=before_action(db,old,now,cipher)
             if reason:
@@ -714,6 +785,9 @@ def _run_rotation(connect,cipher,rid,now):
                     db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('换 IP 暂缓：'+str(e),now,rid));return
             if not r['emergency']:
                 db.execute("UPDATE vps_rotations SET phase='draining',emergency=0,low_samples=0,last_sample_at=NULL,action_started=NULL,status=?,updated=? WHERE id=?",('未观察到 IP 变化；重新确认轮换机连接数后再重试',now,rid));return
+            try:rotation_groups.action_guard(db,r,old,now)
+            except IntegrationError as e:
+                db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',(str(e),now,rid));return
             from server_failover import before_action
             reason=before_action(db,old,now,cipher)
             if reason:

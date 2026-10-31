@@ -805,6 +805,7 @@ def register(app,connect,cipher,auth,body,error,audit):
                 if not db.execute('SELECT 1 FROM ip_monitors WHERE server_id=?',(d.get('server_id'),)).fetchone():raise IntegrationError('请先将此 VPS 加入监控')
                 from failover import guarded
                 if d.get('id') and guarded(db,d['id']):raise IntegrationError('此记录由 A 故障转移接管，切回前不能修改绑定')
+                if d.get('id') and db.execute('SELECT 1 FROM vps_rotations WHERE binding_id=?',(d['id'],)).fetchone():raise IntegrationError('此记录由轮换计划管理，请先暂停并删除对应计划再修改绑定')
                 c=load_connection(db,cipher,d.get('connection_id'))
                 if c['kind'] not in ('alidns','cloudflare') or c.get('owner_id') is not None:raise IntegrationError('请选择管理员的 DNS 连接')
                 source=d.get('source_id') or None
@@ -836,6 +837,9 @@ def register(app,connect,cipher,auth,body,error,audit):
         if kind not in ('connections','bindings'):return error('类型无效')
         try:
             with connect() as db:
+                if kind=='bindings':
+                    from failover import guarded
+                    if guarded(db,ident) or db.execute('SELECT 1 FROM vps_rotations WHERE binding_id=?',(ident,)).fetchone():return error('此记录由轮换或故障转移管理，请先安全切回并删除对应计划',409)
                 if kind=='connections':deleted=db.execute('DELETE FROM ip_connections WHERE id=? AND owner_id IS NULL',(ident,)).rowcount
                 else:deleted=db.execute('DELETE FROM dns_bindings WHERE id=? AND id IN (SELECT b.id FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id WHERE c.owner_id IS NULL)',(ident,)).rowcount
                 if not deleted:return error('连接或绑定不存在，或不属于管理员配置')

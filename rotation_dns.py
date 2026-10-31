@@ -66,33 +66,40 @@ def register(app,connect,cipher,auth,body,error,audit):
     @app.post('/api/admin/servers/<int:sid>/rotation/dns-binding')
     @auth(admin=True)
     def choose_record(sid):
-        d=body();cid=d.get('connection_id');rid=d.get('record_id')
-        if type(cid)is not int or not isinstance(rid,str) or not 1<=len(rid)<=100:return error('请选择 DNS 连接和具体记录')
+        d=body();cid=d.get('connection_id');ids=d.get('record_ids',[d.get('record_id')])
+        if type(cid)is not int or not isinstance(ids,list) or not 1<=len(ids)<=50 or any(not isinstance(rid,str) or not 1<=len(rid)<=100 for rid in ids) or len(set(ids))!=len(ids):return error('请选择 DNS 连接和 1～50 条不同的记录')
         try:
             domain=domain_name(d.get('domain'))
             with connect() as db:c=connection(db,cid)
             rows,_=records(c,domain)
-            record=next((r for r in rows if str(r.get('RecordId'))==rid),None)
-            if not record:raise dns.IntegrationError('域名下未找到所选启用中的 A 记录，请重新读取')
-            if not isinstance(record.get('RR'),str) or not 1<=len(record['RR'])<=253 or not isinstance(record.get('Line'),str) or not 1<=len(record['Line'])<=100:raise dns.IntegrationError('所选记录的主机名或线路格式异常')
+            selected=[]
+            for rid in ids:
+                record=next((r for r in rows if str(r.get('RecordId'))==rid),None)
+                if not record:raise dns.IntegrationError('域名下未找到所选启用中的 A 记录，请重新读取')
+                if not isinstance(record.get('RR'),str) or not 1<=len(record['RR'])<=253 or not isinstance(record.get('Line'),str) or not 1<=len(record['Line'])<=100:raise dns.IntegrationError('所选记录的主机名或线路格式异常')
+                selected.append(record)
             with connect() as db:
                 db.execute('BEGIN IMMEDIATE')
                 monitor=db.execute('SELECT * FROM ip_monitors WHERE server_id=?',(sid,)).fetchone()
                 if not monitor:raise dns.IntegrationError('请先为主 VPS 开启 IP 监控')
                 current=dns.candidate_ip(db,{'server_id':sid,'source_id':monitor['source_id']},cipher)
-                address=dns.public_v4(record['Value'])
-                if address!=current:raise dns.IntegrationError('这条线路当前解析不是主 VPS 的新鲜公网 IP，不能选用；请核对机器与线路')
-                binding={'record_id':rid,'rr':str(record['RR']),'line':str(record['Line']),'domain':domain,'expected_ip':address}
-                fresh=dns.get_dns_record(c,binding);dns.validate_dns_record(fresh,binding,c)
-                existing=db.execute('SELECT * FROM dns_bindings WHERE connection_id=? AND record_id=?',(cid,rid)).fetchone()
-                if existing:
-                    if existing['server_id']!=sid:raise dns.IntegrationError('该记录已绑定其他 VPS，不能在这里抢占')
-                    if db.execute('SELECT 1 FROM vps_rotations WHERE binding_id=?',(existing['id'],)).fetchone():raise dns.IntegrationError('该记录已用于轮换，请从原计划编辑')
-                    if (existing['domain'],existing['rr'],existing['line'],existing['expected_ip'])!=(domain,binding['rr'],binding['line'],address):raise dns.IntegrationError('已有绑定与当前记录不一致，请先核对原绑定')
-                    bid=existing['id']
-                else:
-                    bid=db.execute('INSERT INTO dns_bindings(server_id,connection_id,domain,record_id,rr,line,expected_ip,port,automatic) VALUES(?,?,?,?,?,?,?,?,0)',(sid,cid,domain,rid,binding['rr'],binding['line'],address,monitor['port'])).lastrowid
-                audit(db,'后台轮换选择 DNS 记录（仅面板绑定，未修改 DNS） #'+str(bid))
-                return jsonify(ok=True,binding={'id':bid,'server_id':sid,**binding,'credential_owner':None},message='已选用此记录，仅保存面板绑定；未修改供应商 DNS')
+                prepared=[]
+                for record in selected:
+                    rid=str(record['RecordId']);address=dns.public_v4(record['Value'])
+                    if address!=current:raise dns.IntegrationError('所选线路当前解析不是主 VPS 的新鲜公网 IP，请核对机器与线路')
+                    binding={'record_id':rid,'rr':str(record['RR']),'line':str(record['Line']),'domain':domain,'expected_ip':address}
+                    fresh=dns.get_dns_record(c,binding);dns.validate_dns_record(fresh,binding,c)
+                    existing=db.execute('SELECT * FROM dns_bindings WHERE connection_id=? AND record_id=?',(cid,rid)).fetchone()
+                    if existing:
+                        if existing['server_id']!=sid:raise dns.IntegrationError('该记录已绑定其他 VPS，不能在这里抢占')
+                        if db.execute('SELECT 1 FROM vps_rotations WHERE binding_id=?',(existing['id'],)).fetchone():raise dns.IntegrationError('该记录已用于轮换，请从原计划编辑')
+                        if (existing['domain'],existing['rr'],existing['line'],existing['expected_ip'])!=(domain,binding['rr'],binding['line'],address):raise dns.IntegrationError('已有绑定与当前记录不一致，请先核对原绑定')
+                    prepared.append((existing,binding))
+                chosen=[]
+                for existing,binding in prepared:
+                    bid=existing['id'] if existing else db.execute('INSERT INTO dns_bindings(server_id,connection_id,domain,record_id,rr,line,expected_ip,port,automatic) VALUES(?,?,?,?,?,?,?,?,0)',(sid,cid,domain,binding['record_id'],binding['rr'],binding['line'],current,monitor['port'])).lastrowid
+                    chosen.append({'id':bid,'server_id':sid,**binding,'credential_owner':None})
+                    audit(db,'后台轮换选择 DNS 记录（仅面板绑定，未修改 DNS） #'+str(bid))
+                return jsonify(ok=True,binding=chosen[0],bindings=chosen,message='已选用 '+str(len(chosen))+' 条记录，仅保存面板绑定；未修改供应商 DNS')
         except sqlite3.IntegrityError:return error('此记录已被其他操作绑定，请刷新后重试',409)
         except (dns.IntegrationError,TypeError,ValueError,KeyError) as e:return error(str(e) if isinstance(e,dns.IntegrationError) else 'DNS 记录格式异常',409)
