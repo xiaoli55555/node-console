@@ -9,7 +9,7 @@ import re
 import secrets
 import urllib.parse
 from datetime import datetime, timezone
-from ip_dns import IntegrationError, request_json
+from ip_dns import IntegrationError, UpstreamHTTPError, request_json
 
 
 def credentials(secret):
@@ -21,6 +21,21 @@ def credentials(secret):
         return value
     except (ValueError, TypeError):
         raise IntegrationError('请填写有效的阿里云 AccessKey ID 和 Secret') from None
+
+
+def diagnostic(action,status,data,redactions):
+    def safe(value,limit):
+        if not isinstance(value,str):return '未知'
+        for token in sorted(set(redactions),key=len,reverse=True):
+            if token:
+                value=value.replace(token,'[隐藏]')
+                value=value.replace(urllib.parse.quote(token,safe=''),'[隐藏]')
+        return ' '.join(value.split())[:limit] or '未知'
+    # Never include request headers, payloads, Recommend URLs or whole responses.
+    fields=[f'阿里云 {action}',f'HTTP {status}',
+            'Code='+safe(data.get('Code'),64),'RequestId='+safe(data.get('RequestId'),80),
+            'Message='+safe(data.get('Message'),100)]
+    return '；'.join(fields)
 
 
 def call(secret, action, **kwargs):
@@ -36,10 +51,20 @@ def call(secret, action, **kwargs):
     try:
         data = request_json('https://metrics.cn-hangzhou.aliyuncs.com/',
                             {'Content-Type': 'application/x-www-form-urlencoded'}, urllib.parse.urlencode(params))
-    except IntegrationError:
-        raise IntegrationError('阿里云拨测连接失败：请检查网络、RAM 权限及服务开通状态') from None
-    if not isinstance(data, dict) or str(data.get('Success')).lower() != 'true' or str(data.get('Code')) != '200':
-        raise IntegrationError('阿里云拨测 API 拒绝请求，请检查 RAM 权限、余额及服务开通状态')
+    except UpstreamHTTPError as e:
+        raise IntegrationError(diagnostic(action,e.status,e.details,
+                               [cred['access_key_id'],cred['access_key_secret'],params['Signature']])) from None
+    except IntegrationError as e:
+        # Generic transport errors carry no provider body and must not echo secrets.
+        reason=str(e)
+        known=('API 地址必须解析到公网地址','接口响应过大',
+               '接口连接、TLS 校验或 JSON 解析失败；请检查地址及凭证')
+        if reason not in known:reason='连接失败，未取得可用响应'
+        raise IntegrationError(f'阿里云 {action}；HTTP 未取得；'+reason) from None
+    if not isinstance(data, dict):
+        raise IntegrationError(f'阿里云 {action}；HTTP 200；响应不是 JSON 对象')
+    if str(data.get('Success')).lower() != 'true' or str(data.get('Code')) != '200':
+        raise IntegrationError(diagnostic(action,200,data,[cred['access_key_id'],cred['access_key_secret'],params['Signature']]))
     return data
 
 

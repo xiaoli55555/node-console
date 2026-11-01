@@ -27,6 +27,31 @@ class ProviderTest(unittest.TestCase):
   with patch('aliyun_probe.request_json',side_effect=IntegrationError(SECRET)):
    with self.assertRaises(IntegrationError) as error:provider.call(SECRET,'X')
   self.assertNotIn('test-secret-value',str(error.exception))
+ def test_http_and_business_errors_include_safe_diagnostics(self):
+  from ip_dns import UpstreamHTTPError
+  for status in (400,403,429,500,200):
+   data={'Code':'InvalidQueryParameter','Message':'TaskType does not exists test-secret-value test-access-key',
+         'RequestId':'req-123','Recommend':'https://example.com/secret'}
+   with self.subTest(status=status):
+    options={'return_value':data} if status==200 else {'side_effect':UpstreamHTTPError(status,data)}
+    with patch('aliyun_probe.request_json',**options),self.assertRaises(IntegrationError) as caught:
+     provider.call(SECRET,'CreateInstantSiteMonitor')
+    message=str(caught.exception)
+    for expected in ('CreateInstantSiteMonitor','HTTP '+str(status),'InvalidQueryParameter','req-123','TaskType does not exists'):
+     self.assertIn(expected,message)
+    for hidden in ('test-secret-value','test-access-key','https://example.com'):
+     self.assertNotIn(hidden,message)
+ def test_non_json_http_error_retains_status_without_echoing_body(self):
+  from ip_dns import UpstreamHTTPError
+  with patch('aliyun_probe.request_json',side_effect=UpstreamHTTPError(502)),self.assertRaises(IntegrationError) as caught:
+   provider.call(SECRET,'DescribeSiteMonitorLog')
+  self.assertIn('HTTP 502',str(caught.exception))
+  self.assertIn('DescribeSiteMonitorLog',str(caught.exception))
+ def test_transport_preserves_only_known_safe_reason(self):
+  reason='API 地址必须解析到公网地址'
+  with patch('aliyun_probe.request_json',side_effect=IntegrationError(reason)),self.assertRaises(IntegrationError) as caught:
+   provider.call(SECRET,'CreateInstantSiteMonitor')
+  self.assertIn(reason,str(caught.exception));self.assertIn('HTTP 未取得',str(caught.exception))
  def test_nodes_only_mainland(self):
   with patch('aliyun_probe.call',return_value={'IspCityList':{'IspCity':[NODE,{**NODE,'Country.en':'Japan'}]}}):
    self.assertEqual(provider.nodes(SECRET),[{'id':'546:232','name':'Beijing','isp':'China-Unicom'}])
@@ -88,6 +113,17 @@ class IntegrationTest(unittest.TestCase):
   with self.connect() as db:
    self.assertIn('不自动重试',db.execute('SELECT status FROM detection_runs WHERE id=?',(rid,)).fetchone()[0])
    self.assertEqual(db.execute('SELECT COUNT(*) FROM commands').fetchone()[0],0)
+ def test_poll_error_is_visible_without_becoming_unreachable(self):
+  source=self.aliyun_source();self.plan(source,nodes=['546:232'])
+  with patch('aliyun_probe.create',return_value='remote1'):
+   rid=detectors.start_run(self.connect,self.cipher,1)
+  with self.connect() as db:db.execute('UPDATE detection_runs SET poll_at=0 WHERE id=?',(rid,))
+  reason='阿里云 DescribeSiteMonitorLog；HTTP 403；Code=Forbidden；RequestId=req-456'
+  with patch('aliyun_probe.poll',side_effect=IntegrationError(reason)):detectors.tick(self.connect,self.cipher)
+  with self.connect() as db:
+   row=db.execute('SELECT * FROM detection_runs WHERE id=?',(rid,)).fetchone()
+   self.assertIn(reason,row['status']);self.assertEqual(json.loads(row['details']),[])
+   self.assertEqual(db.execute('SELECT COUNT(*) FROM commands').fetchone()[0],0)
  def test_reject_invalid_nodes_and_unverified_automatic_actions(self):
   source=self.aliyun_source()
   self.assertEqual(self.post('/plans/1',dict(source_id=source,nodes=['1'])).status_code,400)
@@ -143,3 +179,18 @@ class OperationalTest(IntegrationTest):
   with self.connect() as db:
    self.assertEqual(db.execute('SELECT status FROM detection_plans WHERE server_id=1').fetchone()[0],'等待新配置检测')
    self.assertEqual(db.execute('SELECT COUNT(*) FROM commands').fetchone()[0],0)
+
+class HTTPErrorBodyTest(unittest.TestCase):
+ def test_pinned_transport_retains_only_selected_json_fields(self):
+  from unittest.mock import MagicMock
+  import ip_dns
+  for body in (json.dumps({'Code':'Forbidden','Message':'denied','RequestId':'req','secret':'hidden'}).encode(),b'<html>failure</html>'):
+   conn=MagicMock();response=conn.getresponse.return_value
+   response.status=403;response.read.return_value=body
+   with patch('ip_dns.socket.getaddrinfo',return_value=[(2,1,6,'',('8.8.8.8',443))]),patch('ip_dns.socket.create_connection'),patch('ip_dns.ssl.create_default_context'),patch('ip_dns.http.client.HTTPSConnection',return_value=conn):
+    with self.assertRaises(ip_dns.UpstreamHTTPError) as caught:ip_dns.request_json('https://example.com/')
+   error=caught.exception
+   self.assertEqual(error.status,403);self.assertNotIn('hidden',str(error));self.assertNotIn('secret',error.details)
+   if body.startswith(b'{'):self.assertEqual(error.details['RequestId'],'req')
+   else:self.assertEqual(error.details,{})
+   conn.close.assert_called_once()

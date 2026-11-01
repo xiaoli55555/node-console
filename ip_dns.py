@@ -63,6 +63,15 @@ def endpoint(url):
     if port!=443:raise IntegrationError('API 连接仅支持 HTTPS 443 端口')
     return p
 
+class UpstreamHTTPError(IntegrationError):
+    """Keep bounded provider error fields separate from the default public error."""
+    def __init__(self,status,data=None):
+        super().__init__('上游接口返回 HTTP '+str(status))
+        self.status=status
+        self.details={k:v for k,v in (data.items() if isinstance(data,dict) else [])
+                      if k in ('Code','Message','RequestId') and isinstance(v,str)}
+
+
 def request_json(url, headers=None, payload=None, method=None):
     """Resolve once, reject non-public addresses, pin TLS socket; never follow redirects."""
     p=endpoint(url)
@@ -78,8 +87,11 @@ def request_json(url, headers=None, payload=None, method=None):
             path=urllib.parse.urlunsplit(('', '', p.path or '/', p.query, ''))
             conn.request(method or ('POST' if payload is not None else 'GET'),path,body=payload,headers=headers or {})
             response=conn.getresponse()
-            if not 200<=response.status<300:raise IntegrationError('上游接口返回 HTTP '+str(response.status))
             data=response.read(262145)
+            if not 200<=response.status<300:
+                try:detail=json.loads(data) if len(data)<=262144 else None
+                except (ValueError,UnicodeError):detail=None
+                raise UpstreamHTTPError(response.status,detail)
             if len(data)>262144:raise IntegrationError('接口响应过大')
             return json.loads(data)
         finally:conn.close()

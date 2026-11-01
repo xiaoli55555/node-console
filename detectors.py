@@ -313,8 +313,10 @@ def tick(connect,cipher):
             if not data['done']:continue
             status,rows=summarize(data.get('list'),json.loads(r['nodes']))
             with connect() as db:finish(db,r,status,rows)
-        except IntegrationError:
-            with connect() as db:finish(db,r,'检测接口异常（不能判定目标不通）',[])
+        except IntegrationError as e:
+            status='检测接口异常（不能判定目标不通）'
+            if r['kind']=='aliyun':status+='：'+str(e)[:400]
+            with connect() as db:finish(db,r,status,[])
     with connect() as db:
         due=[r[0] for r in db.execute('SELECT p.server_id FROM detection_plans p JOIN ip_monitors m ON m.server_id=p.server_id JOIN detection_sources s ON s.id=p.source_id WHERE p.automatic=1 AND m.enabled=1 AND s.enabled=1 AND p.next_at<=?',(now,))]
     for sid in due:
