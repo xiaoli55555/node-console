@@ -43,6 +43,15 @@ CREATE TABLE IF NOT EXISTS vps_rotations(
  status TEXT NOT NULL DEFAULT '已暂停',
  updated INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS vps_rotation_drain_timings(
+ id INTEGER PRIMARY KEY,
+ rotation_id INTEGER NOT NULL REFERENCES vps_rotations(id) ON DELETE CASCADE,
+ server_id INTEGER NOT NULL, old_ip TEXT, started INTEGER NOT NULL,
+ threshold INTEGER NOT NULL, grace_s INTEGER NOT NULL,
+ finished INTEGER, elapsed_s INTEGER, tcp INTEGER,
+ outcome TEXT NOT NULL DEFAULT 'pending',
+ UNIQUE(rotation_id,server_id,started)
+);
 CREATE INDEX IF NOT EXISTS vps_rotation_due ON vps_rotations(enabled,phase,next_switch_at);
 CREATE TABLE IF NOT EXISTS vps_rotation_events(
  id INTEGER PRIMARY KEY, rotation_id INTEGER NOT NULL REFERENCES vps_rotations(id) ON DELETE CASCADE,
@@ -78,6 +87,26 @@ def _rotation_tcp_count(metrics,now):
     return count,stamp
 
 
+def _drain_timing(db,r,now,outcome=None,tcp=None,start=False):
+    """Observe one DNS handoff; never count action retries as new drains."""
+    if not r['drain_server_id'] or r['drain_started'] is None:return
+    if start:db.execute("INSERT OR IGNORE INTO vps_rotation_drain_timings(rotation_id,server_id,old_ip,started,threshold,grace_s) VALUES(?,?,?,?,?,?)",
+               (r['id'],r['drain_server_id'],r['old_ip'],r['drain_started'],r['connection_threshold'],r['drain_grace_s']))
+    db.execute("UPDATE vps_rotation_drain_timings SET threshold=? WHERE rotation_id=? AND server_id=? AND started=? AND outcome='pending'",(r['connection_threshold'],r['id'],r['drain_server_id'],r['drain_started']))
+    if r['emergency']:outcome='skipped'
+    if outcome:
+        db.execute("UPDATE vps_rotation_drain_timings SET outcome=?,finished=?,elapsed_s=?,tcp=? WHERE rotation_id=? AND server_id=? AND started=? AND outcome='pending'",
+                   (outcome,now,max(0,now-r['drain_started']) if outcome=='completed' else None,tcp,r['id'],r['drain_server_id'],r['drain_started']))
+
+
+def _drain_statistics(db,r,limit=20):
+    # Per-record measurements avoid conflating different DNS TTLs in a group.
+    records=[dict(x) for x in db.execute("SELECT d.*,s.name AS server_name FROM vps_rotation_drain_timings d LEFT JOIN servers s ON s.id=d.server_id WHERE rotation_id=? ORDER BY started DESC,id DESC LIMIT ?",(r['id'],limit))]
+    summaries=[dict(x) for x in db.execute("SELECT d.server_id,s.name AS server_name,COUNT(*) AS count,ROUND(AVG(elapsed_s)) AS average_s,MIN(elapsed_s) AS min_s,MAX(elapsed_s) AS max_s FROM vps_rotation_drain_timings d LEFT JOIN servers s ON s.id=d.server_id WHERE rotation_id=? AND outcome='completed' GROUP BY d.server_id",(r['id'],))]
+    counts={x['outcome']:x['count'] for x in db.execute('SELECT outcome,COUNT(*) AS count FROM vps_rotation_drain_timings WHERE rotation_id=? GROUP BY outcome',(r['id'],))}
+    return {'records':records,'summaries':summaries,'counts':counts}
+
+
 def _admin_user(db,uid):
     row=db.execute('SELECT role FROM users WHERE id=?',(uid,)).fetchone()
     return bool(row and row['role']=='admin')
@@ -111,6 +140,7 @@ def _rotation_json(db,row):
     data['mobile_effective_server_id']=data['failover_server_id'] if mobile_lease and not mobile_lease['intent'] else data['active_server_id']
     if mobile_lease:data['active_name']='解析待核对' if mobile_lease['intent'] else (data['failover_name'] or str(data['failover_server_id']))+'（故障转移）'
     if len({p['active_server_id'] for p in group})>1:data['active_name']='多条记录切换中'
+    data['drain_statistics']=_drain_statistics(db,row)
     data['events']=[dict(e) for e in db.execute('SELECT server_id,message,created FROM vps_rotation_events WHERE rotation_id IN ('+','.join('?' for _ in group)+') ORDER BY id DESC LIMIT 50',data['member_ids'])]
     return data
 
@@ -364,6 +394,11 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
     def admin_rotations():
         with connect() as db:
             return jsonify(rotations=[dict(_rotation_json(db,r),owner_role=db.execute('SELECT role FROM users WHERE id=?',(r['owner_id'],)).fetchone()['role']) for r in rotation_groups.roots(db)],servers=[dict(x) for x in db.execute('SELECT id,name FROM servers')],bindings=[dict(x) for x in db.execute('SELECT b.id,b.server_id,b.domain,b.rr,b.line,b.expected_ip,c.owner_id AS credential_owner FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id')],dns_connections=[dict(x) for x in db.execute("SELECT id,name,kind,json_extract(config,'$.zone_name') AS zone_name FROM ip_connections WHERE owner_id IS NULL AND kind IN ('alidns','cloudflare')")])
+    @app.get('/api/admin/rotation-drain-statistics')
+    @auth(admin=True)
+    def admin_drain_statistics():
+        with connect() as db:
+            return jsonify(rotations=[dict(_rotation_json(db,r),drain_statistics=_drain_statistics(db,r,200)) for r in db.execute('SELECT * FROM vps_rotations ORDER BY id')])
     app.add_url_rule('/api/admin/servers/<int:sid>/rotation','admin_save_rotation',auth(admin=True)(save_rotation.__wrapped__),methods=['PUT'])
     app.add_url_rule('/api/admin/servers/<int:sid>/rotation/readiness','admin_rotation_readiness',auth(admin=True)(readiness.__wrapped__),methods=['POST'])
     app.add_url_rule('/api/admin/servers/<int:sid>/rotation','admin_delete_rotation',auth(admin=True)(delete_rotation.__wrapped__),methods=['DELETE'])
@@ -497,6 +532,7 @@ def _reconcile_fixed_dns(connect,cipher,rid,now):
         db.execute('UPDATE dns_bindings SET expected_ip=?,status=?,updated=? WHERE id=?',(intent['to'],message,now,binding['id']))
         db.execute('UPDATE vps_rotations SET active_server_id=?,phase=?,drain_server_id=?,drain_started=?,drain_grace_s=?,old_ip=?,new_ip=NULL,action_started=NULL,reboot_command_id=NULL,last_sample_at=NULL,low_samples=?,emergency=?,next_switch_at=?,dns_intent=NULL,status=?,updated=? WHERE id=?',(target,phase,None if normal_takeover else old,None if normal_takeover else now,0 if emergency or normal_takeover else ttl+60,None if normal_takeover else intent['from'],2 if emergency else 0,emergency,now+delay,message,now,rid))
         if emergency:db.execute('UPDATE vps_rotations SET fault_recovery=1 WHERE id=?',(rid,))
+        if phase=='draining':_drain_timing(db,db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone(),now,start=True)
         _event(db,rid,target,message,now)
         return True
 
@@ -647,6 +683,7 @@ def _dns_switch(connect,cipher,rotation,now,emergency=False,offline=False):
             if r['active_server_id']==r['other_server_id'] and not (emergency and not offline):
                 db.execute('UPDATE vps_rotations SET emergency=0,low_samples=0,drain_grace_s=? WHERE id=?',(ttl+60,rotation))
         if emergency:db.execute('UPDATE vps_rotations SET fault_recovery=1 WHERE id=?',(rotation,))
+        _drain_timing(db,db.execute('SELECT * FROM vps_rotations WHERE id=?',(rotation,)).fetchone(),now,start=True)
         _event(db,rotation,r['active_server_id'],message,now)
 
 def _paused_failover(connect,cipher,rid,now):
@@ -730,16 +767,19 @@ def _run_rotation(connect,cipher,rid,now):
         old=r['drain_server_id']
         if not old:return
         if r['phase']=='draining':
+            _drain_timing(db,r,now)
             if _fixed(r) and old==r['primary_server_id'] and not _fixed_failure(db,old,now):
                 if _offline(db,old,now,r['offline_after_s']):
                     db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('主 VPS 离线，等待恢复；未确认被墙，不更换主机 IP',now,rid));return
                 address,port,_=_fresh_ip(db,old,now,cipher)
                 reason=boce_dns_gate(db,old,address,port,require_plan=True)
                 if reason:raise IntegrationError('等待主 VPS 恢复确认：'+reason)
+                _drain_timing(db,r,now,'cancelled')
                 db.execute("UPDATE vps_rotations SET phase='active',drain_server_id=NULL,emergency=0,next_switch_at=?,status=?,updated=? WHERE id=?",(now,'主 VPS 已恢复且保持原 IP，准备切回所选线路解析',now,rid));return
             if not r['emergency'] and (_fixed_failure(db,old,now) if _fixed(r) else _failed_ip(db,old,now)):
                 db.execute('UPDATE vps_rotations SET emergency=1,low_samples=2,drain_grace_s=0 WHERE id=?',(rid,))
                 r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
+                _drain_timing(db,r,now)
             try:_validated_plan(db,old,r['owner_id'])
             except IntegrationError as e:
                 db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',(str(e),now,rid));return
@@ -748,6 +788,7 @@ def _run_rotation(connect,cipher,rid,now):
             try:ip,port,metrics=_fresh_ip(db,old,now,cipher)
             except IntegrationError as e:db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',(str(e),now,rid));return
             if ip!=r['old_ip']:
+                _drain_timing(db,r,now,'unobserved')
                 db.execute("UPDATE vps_rotations SET phase='waiting_probe',new_ip=?,action_started=COALESCE(action_started,?),status=?,updated=? WHERE id=?",(ip,now,'旧 VPS IP 已变化，等待 BOCE 复检',now,rid));return
             stamp=metrics.get('connections_sampled');count=metrics.get('tcp')
             if not r['emergency']:
@@ -760,6 +801,7 @@ def _run_rotation(connect,cipher,rid,now):
                 db.execute('UPDATE vps_rotations SET low_samples=?,last_sample_at=?,status=?,updated=? WHERE id=?',(lows,stamp,f'旧 VPS 当前 {count} 条 TCP 连接；阈值 < {r["connection_threshold"]}，连续低值采样 {lows}/2',now,rid))
                 r=dict(r);r['low_samples']=lows
             if r['low_samples']<2:return
+            _drain_timing(db,r,now,'completed',count if not r['emergency'] else None)
             if _fixed(r):
                 try:_fixed_action_safe(db,cipher,r,old,now)
                 except IntegrationError as e:

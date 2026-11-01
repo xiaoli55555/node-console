@@ -169,3 +169,22 @@ test('multi-record coordination does not claim all records have finished switchi
 
 
 test('shared primary failover freezes a sibling plan even when its own record stays on B',()=>{const html=ctx.rotationLiveMarkup({phase:'active',mode:'fixed_primary',primary_server_id:1,active_server_id:2,active_name:'B',enabled:1,primary_failover_active:true,next_switch_at:2000000000,status:'C 接替其他 A 解析'});assert.match(html,/A 故障转移接替中/);assert.match(html,/故障接替期间暂停定时轮换/);});
+
+test('drain statistics escape names, show durations and exclude faults explicitly',()=>{
+ const r={drain_server_id:2,drain_started:100,drain_statistics:{records:[{server_id:2,server_name:'<B>',old_ip:'1.1.1.1',started:100,threshold:50,outcome:'skipped'}],summaries:[{server_name:'<B>',count:3,average_s:125,min_s:60,max_s:180}]}};
+ assert.match(ctx.rotationDrainMarkup(r),/2 分 5 秒/);
+ assert.match(ctx.rotationDrainMarkup(r),/&lt;B&gt;/);
+ assert.match(ctx.rotationDrainHistory(r),/故障跳过排空（不计平均）/);
+ assert.match(ctx.rotationDrainMarkup({}),/暂无完成统计/);
+ assert.match(ctx.rotationDrainHistory({}),/不会补算升级前/);
+});
+
+test('dedicated drain page loads filters and refreshes without DNS actions',async()=>{
+ const elements=Object.fromEntries(['drainStatisticsContent','drainPlanFilter','drainServerFilter','drainStatisticsRows','drainStatisticsError'].map(id=>[id,{value:'',innerHTML:'',textContent:''}]));
+ const requests=[];let refresh;
+ const sandbox=vm.createContext({esc:ctx.esc,console,page:'drainStatistics',$:id=>elements[id],clearInterval:()=>{},setInterval:fn=>{refresh=fn;return 1;},api:async path=>{requests.push(path);return {rotations:[{id:1,primary_server_id:1,other_server_id:2,primary_name:'<A>',other_name:'B',binding_id:3,drain_statistics:{records:[],summaries:[],counts:{}}}]};}});
+ vm.runInContext(source,sandbox);await sandbox.loadDrainStatistics();
+ assert.match(elements.drainStatisticsContent.innerHTML,/筛选计划/);assert.match(elements.drainStatisticsContent.innerHTML,/筛选 VPS/);
+ assert.match(elements.drainStatisticsRows.innerHTML,/&lt;A&gt;/);
+ await refresh();assert.deepEqual(requests,['admin/rotation-drain-statistics','admin/rotation-drain-statistics']);
+});
