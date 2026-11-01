@@ -13,6 +13,8 @@ SCHEMA='''
 CREATE TABLE IF NOT EXISTS detection_sources(id INTEGER PRIMARY KEY,name TEXT NOT NULL,kind TEXT NOT NULL,secret TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,last_seen INTEGER,verified_at INTEGER,owner_id INTEGER REFERENCES users(id) ON DELETE CASCADE,server_id INTEGER REFERENCES servers(id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS detection_plans(server_id INTEGER PRIMARY KEY REFERENCES servers(id) ON DELETE CASCADE,source_id INTEGER NOT NULL REFERENCES detection_sources(id),nodes TEXT NOT NULL DEFAULT '[]',interval_s INTEGER NOT NULL DEFAULT 600,automatic INTEGER NOT NULL DEFAULT 0,daily_limit INTEGER NOT NULL DEFAULT 1000,next_at INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT '等待检测',checked INTEGER,response_mode TEXT NOT NULL DEFAULT 'none',action_connection_id INTEGER REFERENCES ip_connections(id),failure_threshold INTEGER NOT NULL DEFAULT 3,failure_streak INTEGER NOT NULL DEFAULT 0,failure_ip TEXT,failure_port INTEGER,last_action INTEGER,owner_id INTEGER);
 CREATE TABLE IF NOT EXISTS detection_runs(id INTEGER PRIMARY KEY,server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,source_id INTEGER NOT NULL REFERENCES detection_sources(id),ip TEXT NOT NULL,port INTEGER NOT NULL,nodes TEXT NOT NULL,status TEXT NOT NULL,remote_id TEXT,created INTEGER NOT NULL,updated INTEGER NOT NULL,details TEXT NOT NULL DEFAULT '[]',poll_at INTEGER NOT NULL DEFAULT 0,cost INTEGER NOT NULL DEFAULT 0,scheduled INTEGER NOT NULL DEFAULT 0,action_result TEXT,action_status TEXT);
+CREATE TABLE IF NOT EXISTS detection_incidents(id INTEGER PRIMARY KEY,server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,source_id INTEGER NOT NULL,source_name TEXT NOT NULL,ip TEXT NOT NULL,port INTEGER NOT NULL,nodes TEXT NOT NULL,threshold INTEGER NOT NULL,failures INTEGER NOT NULL DEFAULT 0,first_failed INTEGER NOT NULL,last_failed INTEGER NOT NULL,confirmed_at INTEGER,closed_at INTEGER,state TEXT NOT NULL,last_run INTEGER NOT NULL,details TEXT NOT NULL,response_mode TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS detection_incident_server ON detection_incidents(server_id,id);
 CREATE INDEX IF NOT EXISTS detection_pending ON detection_runs(status,poll_at);
 CREATE INDEX IF NOT EXISTS detection_server_latest ON detection_runs(server_id,source_id,id);
 '''
@@ -120,15 +122,50 @@ def queue_reboot(db,sid,now,cipher=None):
     cur=db.execute("INSERT INTO commands(server_id,user_id,action,status,created,updated) VALUES(?,?,'reboot','queued',?,?)",(sid,admin['id'],now,now))
     return '已排队自动重启命令 #'+str(cur.lastrowid)+'；agent 下次上报时执行'
 
+def record_incident(db,run,plan,rows,now):
+    """Independent evidence history; never drives repair or DNS actions."""
+    if not run['scheduled']:return
+    active=db.execute("SELECT * FROM detection_incidents WHERE server_id=? AND closed_at IS NULL ORDER BY id DESC LIMIT 1",(run['server_id'],)).fetchone()
+    if active and (active['ip']!=run['ip'] or active['port']!=run['port'] or active['source_id']!=run['source_id'] or active['nodes']!=run['nodes']):
+        reason='ip_changed' if active['ip']!=run['ip'] else 'config_changed'
+        db.execute('UPDATE detection_incidents SET state=?,closed_at=? WHERE id=?',(reason,now,active['id']));active=None
+    node=db.execute('SELECT seen FROM servers WHERE id=?',(run['server_id'],)).fetchone()
+    online=node and node['seen'] and 0<=now-node['seen']<=60
+    expected=set(json.loads(run['nodes']))
+    complete=bool(expected) and len(rows)==len(expected) and {str(x.get('node_id')) for x in rows}==expected
+    states=[x.get('state') for x in rows]
+    failed=online and complete and all(x=='unreachable' for x in states)
+    healthy=online and complete and all(x=='reachable' for x in states)
+    if healthy:
+        if active:db.execute("UPDATE detection_incidents SET state='recovered',closed_at=?,last_run=?,details=? WHERE id=?",(now,run['id'],json.dumps(rows),active['id']))
+        return
+    if not failed:
+        if active:
+            if active['confirmed_at'] is None:
+                db.execute("UPDATE detection_incidents SET state='interrupted',closed_at=?,last_run=? WHERE id=?",(now,run['id'],active['id']))
+            else:db.execute('UPDATE detection_incidents SET failures=0,last_run=? WHERE id=?',(run['id'],active['id']))
+        return
+    threshold=plan['failure_threshold']
+    if not active:
+        source=db.execute('SELECT name FROM detection_sources WHERE id=?',(run['source_id'],)).fetchone()
+        db.execute("INSERT INTO detection_incidents(server_id,source_id,source_name,ip,port,nodes,threshold,failures,first_failed,last_failed,state,last_run,details,response_mode) VALUES(?,?,?,?,?,?,?,1,?,?,'suspected',?,?,?)",(run['server_id'],run['source_id'],source['name'],run['ip'],run['port'],run['nodes'],threshold,now,now,run['id'],json.dumps(rows),plan['response_mode']))
+    else:
+        count=active['failures']+1
+        db.execute("UPDATE detection_incidents SET failures=?,last_failed=?,last_run=?,details=?,confirmed_at=COALESCE(confirmed_at,?),state=? WHERE id=?",(count,now,run['id'],json.dumps(rows),now if count>=active['threshold'] else None,'confirmed' if active['confirmed_at'] or count>=active['threshold'] else 'suspected',active['id']))
+
+
 def finish(db,run,status,rows):
     now=int(time.time())
     action_result=None
     action_status=None
+    previous=db.execute('SELECT status FROM detection_runs WHERE id=?',(run['id'],)).fetchone()
+    new_evidence=previous and previous['status'] in ('creating','pending','queued','issued')
     db.execute('UPDATE detection_runs SET status=?,details=?,updated=? WHERE id=?',(status,json.dumps(rows),now,run['id']))
     # Do not apply old source/IP results to a reconfigured plan or a changed target.
     plan=db.execute('SELECT p.*,s.enabled AS source_enabled FROM detection_plans p JOIN detection_sources s ON s.id=p.source_id WHERE p.server_id=?',(run['server_id'],)).fetchone()
     current=db.execute('SELECT current_ip,enabled,port FROM ip_monitors WHERE server_id=?',(run['server_id'],)).fetchone()
     if plan and plan['source_enabled'] and plan['source_id']==run['source_id'] and plan['nodes']==run['nodes'] and current and current['enabled'] and current['port']==run['port'] and (not current['current_ip'] or current['current_ip']==run['ip']):
+        if new_evidence:record_incident(db,run,plan,rows,now)
         scheduled=bool(run['scheduled']) if 'scheduled' in run.keys() else False
         streak=plan['failure_streak']
         rotation_managed=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vps_rotations'").fetchone() and db.execute('SELECT 1 FROM vps_rotations WHERE (primary_server_id=? OR other_server_id=?)',(run['server_id'],run['server_id'])).fetchone()
@@ -342,6 +379,16 @@ def register(app,connect,cipher,auth,body,error,audit):
         for p in plans:p['nodes']=json.loads(p['nodes'])
         for r in runs:r['details']=json.loads(r['details'])
         return jsonify(sources=sources,plans=plans,runs=runs)
+
+    @app.get('/api/detection/incidents')
+    @auth(admin=True)
+    def detection_incidents():
+        with connect() as db:
+            items=[dict(r) for r in db.execute("SELECT i.*,s.name AS server_name FROM detection_incidents i JOIN servers s ON s.id=i.server_id WHERE confirmed_at IS NOT NULL ORDER BY i.id DESC LIMIT 500")]
+        for item in items:
+            item['nodes']=json.loads(item['nodes']);item['details']=json.loads(item['details'])
+            item['duration_s']=(item['closed_at'] or int(time.time()))-item['first_failed']
+        return jsonify(incidents=items,notice='记录代表所选检测点连续 TCP 不通，不能单独证明被墙；IP 变化或配置变化不算原 IP 恢复。仅统计上线后的证据，不补造历史。')
 
     @app.get('/api/detection/monitor-status')
     @auth(admin=True)

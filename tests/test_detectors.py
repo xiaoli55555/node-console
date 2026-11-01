@@ -59,6 +59,42 @@ class DetectorTest(unittest.TestCase):
   with self.connect() as db:db.execute('DELETE FROM ip_monitors WHERE server_id=1')
   self.assertEqual(self.post('/plans/1',{'source_id':source,'nodes':[]}).status_code,400)
   with self.connect() as db:self.assertIsNone(db.execute('SELECT 1 FROM ip_monitors').fetchone())
+ def incident_run(self,source,states,ip='8.8.8.8',scheduled=True):
+  now=int(time.time())
+  with self.connect() as db:
+   db.execute('UPDATE ip_monitors SET current_ip=? WHERE server_id=1',(ip,))
+   rid=db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,scheduled,created,updated) VALUES(1,?,?,443,?,'pending',?,?,?)",(source,ip,json.dumps(['1','2']),int(scheduled),now,now)).lastrowid
+   run=db.execute('SELECT * FROM detection_runs WHERE id=?',(rid,)).fetchone()
+   detectors.finish(db,run,'test',[{'node_id':str(i+1),'state':state} for i,state in enumerate(states)])
+ def test_incident_confirms_once_and_survives_run_history_cleanup(self):
+  source=self.source()['id'];self.plan(source,automatic=True)
+  for _ in range(4):self.incident_run(source,['unreachable','unreachable'])
+  with self.connect() as db:
+   rows=db.execute('SELECT * FROM detection_incidents WHERE confirmed_at IS NOT NULL').fetchall()
+   self.assertEqual(len(rows),1);self.assertEqual(rows[0]['state'],'confirmed')
+   db.execute('DELETE FROM detection_runs')
+  self.incident_run(source,['reachable','reachable'])
+  data=self.client.get('/api/detection/incidents',headers=self.headers).json
+  self.assertEqual(len(data['incidents']),1)
+  self.assertEqual(data['incidents'][0]['state'],'recovered')
+  self.assertEqual(self.client.get('/api/detection/incidents').status_code,403)
+ def test_manual_partial_unknown_and_offline_do_not_confirm_incident(self):
+  source=self.source()['id'];self.plan(source,automatic=True)
+  for _ in range(3):self.incident_run(source,['unreachable','unreachable'],scheduled=False)
+  self.incident_run(source,['unreachable','unreachable'])
+  self.incident_run(source,['unknown','unreachable'])
+  self.incident_run(source,['unreachable','unreachable'])
+  self.incident_run(source,['reachable','unreachable'])
+  with self.connect() as db:db.execute('UPDATE servers SET seen=0 WHERE id=1')
+  for _ in range(3):self.incident_run(source,['unreachable','unreachable'])
+  with self.connect() as db:self.assertEqual(db.execute('SELECT COUNT(*) FROM detection_incidents WHERE confirmed_at IS NOT NULL').fetchone()[0],0)
+ def test_ip_change_closes_incident_without_claiming_old_ip_recovered(self):
+  source=self.source()['id'];self.plan(source,automatic=True)
+  for _ in range(3):self.incident_run(source,['unreachable','unreachable'])
+  self.incident_run(source,['reachable','reachable'],ip='1.1.1.1')
+  with self.connect() as db:
+   row=db.execute('SELECT * FROM detection_incidents').fetchone()
+   self.assertEqual(row['state'],'ip_changed');self.assertIsNotNone(row['closed_at'])
  def test_secret_encryption_and_admin_only(self):
   self.source();self.assertEqual(self.client.get('/api/detection').status_code,403)
   data=self.client.get('/api/detection',headers=self.headers).text;self.assertNotIn('testsecret',data)
