@@ -37,3 +37,18 @@ class OriginalEmergencyProbe(unittest.TestCase):
         with server.connect() as db:db.execute("UPDATE vps_rotations SET phase='waiting_ip',drain_server_id=? WHERE id=?",(f.sid('B'),f.rid))
         with self.assertRaisesRegex(IntegrationError,'换 IP 或复检'):rotation._dns_switch(server.connect,server.CIPHER,f.rid,f.clock[0],emergency=True)
         self.assertEqual(f.value('mobile'),'8.8.8.8')
+
+    def test_twenty_recoveries_then_new_fault_require_new_probe(self):
+        f=self.f
+        for cycle in range(20):
+            with self.subTest(cycle=cycle):
+                f.health[f.sid('A')]=False;f.advance(5,online=('A','B'));f.tick()
+                self.assertIsNotNone(f.row()['emergency_probe_after'])
+                f.health[f.sid('A')]=True;f.advance(5,online=('A','B'));f.tick()
+                self.assertIsNone(f.row()['emergency_probe_after'])
+                self.assertEqual(f.value('mobile'),'8.8.8.8')
+        f.health[f.sid('A')]=False;f.refresh('A');f.tick()
+        self.assertEqual(f.value('mobile'),'8.8.8.8')
+        self.assertEqual(f.row()['emergency_probe_after'],f.clock[0]+1)
+        f.advance(2,online=('A','B'));f.tick()
+        self.assertEqual(f.value('mobile'),'1.1.1.1')

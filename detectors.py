@@ -165,7 +165,7 @@ def record_incident(db,run,plan,rows,now):
     failed=online and complete and all(x=='unreachable' for x in states)
     healthy=online and complete and all(x=='reachable' for x in states)
     if healthy:
-        if active:db.execute("UPDATE detection_incidents SET state='recovered',closed_at=?,last_run=?,details=? WHERE id=?",(now,run['id'],json.dumps(rows),active['id']))
+        if active:db.execute("UPDATE detection_incidents SET state='recovered',closed_at=?,last_run=? WHERE id=?",(now,run['id'],active['id']))
         return
     if not failed:
         if active:

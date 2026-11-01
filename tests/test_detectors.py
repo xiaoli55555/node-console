@@ -77,7 +77,24 @@ class DetectorTest(unittest.TestCase):
   data=self.client.get('/api/detection/incidents',headers=self.headers).json
   self.assertEqual(len(data['incidents']),1)
   self.assertEqual(data['incidents'][0]['state'],'recovered')
+  self.assertTrue(all(n['state']=='unreachable' for n in data['incidents'][0]['details']))
+  self.assertEqual(data['incidents'][0]['server_id'],1)
+  self.assertEqual(data['incidents'][0]['ip'],'8.8.8.8')
   self.assertEqual(self.client.get('/api/detection/incidents').status_code,403)
+ def test_twenty_incident_cycles_preserve_identity_time_and_failure_evidence(self):
+  source=self.source()['id'];self.plan(source,automatic=True)
+  for cycle in range(20):
+   for _ in range(4):self.incident_run(source,['unreachable','unreachable'])
+   self.incident_run(source,['reachable','reachable'])
+  data=self.client.get('/api/detection/incidents',headers=self.headers).json['incidents']
+  self.assertEqual(len(data),20)
+  for incident in data:
+   self.assertEqual(incident['server_id'],1)
+   self.assertEqual(incident['ip'],'8.8.8.8')
+   self.assertLessEqual(incident['first_failed'],incident['confirmed_at'])
+   self.assertLessEqual(incident['confirmed_at'],incident['closed_at'])
+   self.assertEqual(incident['state'],'recovered')
+   self.assertTrue(all(n['state']=='unreachable' for n in incident['details']))
  def test_manual_partial_unknown_and_offline_do_not_confirm_incident(self):
   source=self.source()['id'];self.plan(source,automatic=True)
   for _ in range(3):self.incident_run(source,['unreachable','unreachable'],scheduled=False)

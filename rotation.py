@@ -681,6 +681,16 @@ def _run_rotation(connect,cipher,rid,now):
     with connect() as db:
         r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
         if not r or (not r['enabled'] and not r['fault_recovery']):return
+        # A recovered carrier ends this fault attempt. A later fault must request
+        # another standby round, rather than reuse the previous incident's marker.
+        if not _fixed(r) and r['emergency_probe_after'] is not None and not _offline(db,r['active_server_id'],now,r['offline_after_s']):
+            try:
+                address,port,_=_fresh_ip(db,r['active_server_id'],now,cipher)
+                healthy=not boce_dns_gate(db,r['active_server_id'],address,port,require_plan=True)
+            except IntegrationError:healthy=False
+            if healthy:
+                db.execute('UPDATE vps_rotations SET emergency_probe_after=NULL WHERE id=?',(rid,))
+                r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
         if not _fixed(r) and r['phase'] in ('active','draining') and _offline(db,r['active_server_id'],now,r['offline_after_s']):
             target=r['other_server_id'] if r['active_server_id']==r['primary_server_id'] else r['primary_server_id']
             if _offline(db,target,now,r['offline_after_s']):raise IntegrationError('当前机和备用机均离线，没有可用备用机；保持 DNS 并等待恢复')
