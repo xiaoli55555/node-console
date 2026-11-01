@@ -179,7 +179,11 @@ def dhcp_stable(iface,address):
 def dhcp_recover():
     cfg=dhcp_config();iface=cfg['interface']
     # An address alone is insufficient: renewals need a surviving client too.
-    dhcp_background(iface,cfg)
+    DHCP_STATE.mkdir(mode=0o700,parents=True,exist_ok=True)
+    with (DHCP_STATE/'dhcp.lock').open('a') as lock:
+        try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:return
+        dhcp_background(iface,cfg)
 
 def dhcp_task(cid):
     cfg=dhcp_config();iface=cfg['interface'];DHCP_STATE.mkdir(mode=0o700,parents=True,exist_ok=True)
@@ -194,8 +198,9 @@ def dhcp_task(cid):
         try:
             # Verify a public IPv4 before touching DHCP; no guessed interface/lease.
             if not old:raise ValueError('无法唯一确认原 IPv4')
-            for attempt in range(1,4):
-                result['attempts']=attempt
+            while True:
+                result['attempts']+=1
+                dhcp_write(result)
                 clients=dhcp_clients(iface,cfg.get('cleanup_unscoped') is True)
                 subprocess.run(['systemctl','stop',dhcp_client_unit(iface)],capture_output=True,timeout=15,check=False)
                 dhcp_run([shutil.which('dhclient'),'-4','-r','-pf',f'/run/dhclient.{iface}.pid','-lf',f'/var/lib/dhcp/dhclient.{iface}.leases',iface],timeout=10)
@@ -217,14 +222,10 @@ def dhcp_task(cid):
                     if dhcp_address(iface):break
                 new=dhcp_address(iface);result['new_ip']=new
                 if new and new!=old and new.startswith('42.'):
-                    if not dhcp_stable(iface,new):raise ValueError('新 IP、默认路由或 DHCP 续租进程未通过稳定检查')
-                    result['state']='changed';break
+                    if dhcp_stable(iface,new):
+                        result['state']='changed';break
                 if not new:dhcp_background(iface,cfg)
                 time.sleep(5)
-            else:
-                result['state']='unchanged' if dhcp_address(iface)==old else 'failed'
-                if result.get('new_ip') and not result['new_ip'].startswith('42.'):
-                    result['error']='HKT 优选 IP 策略：仅允许 42.0.0.0/8；本轮未获取合格 IP，保留网络并停止自动尝试'
         except Exception as e:
             result['state']='failed';result['error']=type(e).__name__+': '+str(e)[:180]
         finally:
@@ -238,7 +239,7 @@ def dispatch_dhcp(cid):
     dhcp_config()  # local opt-in is required even for a valid panel command
     # Independent systemd jobs survive agent restart or loss of its HTTPS link.
     subprocess.run(['systemd-run','--unit=hksdan-dhcp-recover-'+str(cid),'--on-active=300s','--collect','/usr/bin/python3',str(Path(__file__).resolve()),'--dhcp-recover'],check=True,timeout=10,capture_output=True)
-    subprocess.run(['systemd-run','--unit=hksdan-dhcp-'+str(cid),'--collect','--property=RuntimeMaxSec=240','/usr/bin/python3',str(Path(__file__).resolve()),'--dhcp-task',str(cid)],check=True,timeout=10,capture_output=True)
+    subprocess.run(['systemd-run','--unit=hksdan-dhcp-'+str(cid),'--collect','/usr/bin/python3',str(Path(__file__).resolve()),'--dhcp-task',str(cid)],check=True,timeout=10,capture_output=True)
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('--once',action='store_true');p.add_argument('--config',default='/etc/hk-sdan-agent/config.json');p.add_argument('--dhcp-task',type=int);p.add_argument('--dhcp-recover',action='store_true');a=p.parse_args()
@@ -260,7 +261,7 @@ def main():
                 state=DHCP_STATE/'dhcp-result.json'
                 if state.exists():
                     result_state=json.loads(state.read_text())
-                    if result_state.get('state') in ('changed','unchanged','failed'):
+                    if result_state.get('state') in ('running','changed','unchanged','failed'):
                         metrics['dhcp_result']=result_state
                         if metrics.get('egress_checked',0)<result_state.get('finished_at',0):
                             metrics['egress_ips']=None;metrics['egress_checked']=0

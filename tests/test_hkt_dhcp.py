@@ -160,13 +160,14 @@ class DHCPExecutor(unittest.TestCase):
         self.assertEqual(result['state'],'changed');self.assertEqual(result['attempts'],1)
         count=run.call_count;agent.dhcp_task(10);self.assertEqual(run.call_count,count)
         self.assertEqual((state/'dhcp-lease.backup').read_text(),'old lease')
-    def test_nonpreferred_new_ip_never_reports_success(self):
-        state,run=self.run_task('1.36.96.112')
+    def test_nonpreferred_addresses_retry_past_three_until_42(self):
+        addresses=['8.8.8.8']+['1.36.96.112']*8+['42.98.100.156']*2
+        state,run=self.run_task(addresses)
         agent.dhcp_task(55)
         result=json.loads((state/'dhcp-result.json').read_text())
-        self.assertNotEqual(result['state'],'changed')
-        self.assertEqual(result['attempts'],3)
-        self.assertIn('42.0.0.0/8',result['error'])
+        self.assertEqual(result['state'],'changed')
+        self.assertEqual(result['attempts'],5)
+        self.assertEqual(result['new_ip'],'42.98.100.156')
     def test_rotation_gate_applies_only_to_registered_hkt(self):
         import sqlite3
         from rotation import _preferred_rotation_ip
@@ -178,16 +179,17 @@ class DHCPExecutor(unittest.TestCase):
         _preferred_rotation_ip(db,2,'1.36.96.112')
         with self.assertRaises(IntegrationError):_preferred_rotation_ip(db,1,'1.36.96.112')
 
-    def test_unchanged_IP_stops_after_three_attempts_without_false_success(self):
-        state,run=self.run_task('8.8.8.8');agent.dhcp_task(11)
-        result=json.loads((state/'dhcp-result.json').read_text());self.assertEqual(result['state'],'unchanged');self.assertEqual(result['attempts'],3)
-        self.assertEqual(sum('-r' in c.args[0] for c in run.call_args_list),3)
+    def test_same_ip_retries_until_preferred_new_address(self):
+        state,run=self.run_task(['8.8.8.8']+['8.8.8.8']*6+['42.98.100.156']*2)
+        agent.dhcp_task(11)
+        result=json.loads((state/'dhcp-result.json').read_text())
+        self.assertEqual(result['state'],'changed');self.assertEqual(result['attempts'],4)
         self.assertFalse(any('-6' in c.args[0] for c in run.call_args_list))
     def test_watchdog_is_scheduled_before_network_task_and_existing_client_is_not_duplicated(self):
         with patch.object(agent,'dhcp_config',return_value={'enabled':True,'interface':'ens18'}),patch.object(agent.subprocess,'run') as run:
             agent.dispatch_dhcp(12)
             self.assertIn('--on-active=300s',run.call_args_list[0].args[0])
-            self.assertIn('--property=RuntimeMaxSec=240',run.call_args_list[1].args[0])
+            self.assertFalse(any('RuntimeMaxSec' in x for x in run.call_args_list[1].args[0]))
             self.assertEqual(run.call_args_list[1].args[0][-2:],['--dhcp-task','12'])
         with patch.object(agent,'dhcp_clients',return_value=[(437,['dhclient','ens18'])]),patch.object(agent,'dhcp_run') as run:
             agent.dhcp_background('ens18',{'cleanup_unscoped':True});run.assert_not_called()
@@ -200,13 +202,13 @@ class DHCPExecutor(unittest.TestCase):
             self.assertIn('--property=Restart=always',args)
             self.assertIn('-d',args)
             self.assertNotIn('--property=RuntimeMaxSec=240',args)
-    def test_unstable_new_address_is_not_reported_successful(self):
-        state,run=self.run_task(['8.8.8.8','42.98.100.156','42.98.100.156'])
-        with patch.object(agent,'dhcp_stable',return_value=False):agent.dhcp_task(99)
+    def test_unstable_preferred_address_retries_until_stable(self):
+        state,run=self.run_task(['8.8.8.8']+['42.98.100.156']*4)
+        with patch.object(agent,'dhcp_stable',side_effect=[False,True]):agent.dhcp_task(99)
         result=json.loads((state/'dhcp-result.json').read_text())
-        self.assertEqual(result['state'],'failed')
+        self.assertEqual(result['state'],'changed');self.assertEqual(result['attempts'],2)
     def test_recovery_checks_client_even_when_address_exists(self):
-        with patch.object(agent,'dhcp_config',return_value={'interface':'ens18'}),patch.object(agent,'dhcp_background') as background:
+        with patch.object(agent,'dhcp_config',return_value={'interface':'ens18'}),patch.object(agent,'dhcp_background') as background,tempfile.TemporaryDirectory() as folder,patch.object(agent,'DHCP_STATE',Path(folder)):
             agent.dhcp_recover();background.assert_called_once_with('ens18',{'interface':'ens18'})
     def test_stability_requires_live_client_and_default_route(self):
         from types import SimpleNamespace

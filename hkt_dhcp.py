@@ -60,12 +60,16 @@ def queue(server_id,connection_id=None,managed=False):
         return db.execute("INSERT INTO commands(server_id,user_id,action,status,created,updated) VALUES(?,?,'hkt_dhcp','queued',?,?)",(server_id,admin['id'],now,now)).lastrowid
 
 def apply_result(db,sid,result,now):
-    if not isinstance(result,dict) or type(result.get('id')) is not int or result.get('state') not in ('changed','unchanged','failed'):return
+    if not isinstance(result,dict) or type(result.get('id')) is not int or result.get('state') not in ('running','changed','unchanged','failed'):return
     job=db.execute("SELECT status FROM commands WHERE id=? AND server_id=? AND action='hkt_dhcp'",(result['id'],sid)).fetchone()
     if not job or job['status'] not in ('accepted','unconfirmed'):return
     # A reported success is still subject to fresh agent IP + selected probe gates.
     safe={k:result[k] for k in ('id','state','old_ip','new_ip','attempts','error') if k in result}
     if len(json.dumps(safe))>1024:return
+    if result['state']=='running':
+        db.execute("UPDATE commands SET status='accepted',updated=? WHERE id=?",(now,result['id']))
+        db.execute('INSERT OR REPLACE INTO hkt_dhcp_results(command_id,result,updated) VALUES(?,?,?)',(result['id'],json.dumps(safe),now))
+        return
     db.execute("UPDATE commands SET status=?,updated=? WHERE id=?",('completed' if result['state']=='changed' else 'failed',now,result['id']))
     db.execute('INSERT OR REPLACE INTO hkt_dhcp_results(command_id,result,updated) VALUES(?,?,?)',(result['id'],json.dumps(safe),now))
     db.execute('UPDATE detection_plans SET next_at=MIN(next_at,?) WHERE server_id=?',(now,sid))
