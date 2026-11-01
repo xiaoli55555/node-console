@@ -657,6 +657,14 @@ class PanelTest(unittest.TestCase):
                 db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details) VALUES(?,?,?,?,'[\"13\"]','国内不通',?,?,?)",(nodes[1][0],source,ips[1],port,clock[0],clock[0],json.dumps([{'node_id':'13','state':'unreachable'}])))
             rotation.tick(server.connect,server.CIPHER)
             with server.connect() as db:
+                self.assertEqual(db.execute('SELECT active_server_id FROM vps_rotations').fetchone()[0],nodes[1][0])
+            # The healthy replacement must complete a probe created after this fault.
+            clock[0]+=2;report(0)
+            with server.connect() as db:
+                source=db.execute('SELECT source_id FROM detection_plans WHERE server_id=?',(nodes[0][0],)).fetchone()[0]
+                db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details) VALUES(?,?,?,?,'[\"13\"]','TCP 可达',?,?,?)",(nodes[0][0],source,ips[0],port,clock[0],clock[0],json.dumps([{'node_id':'13','state':'reachable'}])))
+            rotation.tick(server.connect,server.CIPHER)
+            with server.connect() as db:
                 row=db.execute('SELECT * FROM vps_rotations').fetchone()
                 self.assertEqual(row['active_server_id'],nodes[0][0])
                 self.assertEqual(row['phase'],'waiting_ip')
@@ -669,6 +677,12 @@ class PanelTest(unittest.TestCase):
                 db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details) VALUES(?,?,?,?,'[\"13\"]','TCP 可达',?,?,?)",(nodes[1][0],source,ips[1],port,clock[0],clock[0],json.dumps([{'node_id':'13','state':'reachable'}])))
                 db.execute("UPDATE vps_rotations SET phase='active',emergency=0,drain_server_id=NULL")
                 db.execute('UPDATE servers SET seen=? WHERE id=?',(clock[0]-91,nodes[0][0]))
+            rotation.tick(server.connect,server.CIPHER)
+            clock[0]+=2;report(1)
+            with server.connect() as db:
+                db.execute('UPDATE servers SET seen=? WHERE id=?',(clock[0]-91,nodes[0][0]))
+                source=db.execute('SELECT source_id FROM detection_plans WHERE server_id=?',(nodes[1][0],)).fetchone()[0]
+                db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details) VALUES(?,?,?,?,'[\"13\"]','TCP 可达',?,?,?)",(nodes[1][0],source,ips[1],port,clock[0],clock[0],json.dumps([{'node_id':'13','state':'reachable'}])))
             rotation.tick(server.connect,server.CIPHER)
             with server.connect() as db:
                 row=db.execute('SELECT * FROM vps_rotations').fetchone()

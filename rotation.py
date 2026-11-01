@@ -59,7 +59,7 @@ def initialize(connect):
 
         if 'offline_after_s' not in {r[1] for r in db.execute('PRAGMA table_info(vps_rotations)')}:db.execute('ALTER TABLE vps_rotations ADD COLUMN offline_after_s INTEGER NOT NULL DEFAULT 15')
         columns={r[1] for r in db.execute('PRAGMA table_info(vps_rotations)')}
-        for name,definition in [('mode',"TEXT NOT NULL DEFAULT 'alternating'"),('takeover_s','INTEGER NOT NULL DEFAULT 600'),('first_switch_at','INTEGER'),('mobile_only_ack','INTEGER NOT NULL DEFAULT 0'),('dns_intent','TEXT'),('fault_recovery','INTEGER NOT NULL DEFAULT 0'),('reboot_command_id','INTEGER')]:
+        for name,definition in [('mode',"TEXT NOT NULL DEFAULT 'alternating'"),('takeover_s','INTEGER NOT NULL DEFAULT 600'),('first_switch_at','INTEGER'),('mobile_only_ack','INTEGER NOT NULL DEFAULT 0'),('dns_intent','TEXT'),('fault_recovery','INTEGER NOT NULL DEFAULT 0'),('reboot_command_id','INTEGER'),('emergency_probe_after','INTEGER')]:
             if name not in columns:db.execute(f'ALTER TABLE vps_rotations ADD COLUMN {name} {definition}')
         failover.initialize(db)
 
@@ -563,6 +563,24 @@ def _offline(db,sid,now,timeout=15):
     node=db.execute('SELECT seen FROM servers WHERE id=?',(sid,)).fetchone()
     return not node or not node['seen'] or now-node['seen']>=timeout
 
+def _original_emergency_probe(db,r,target,now):
+    """Require a new probe round after the incident, not a cached healthy result."""
+    after=r['emergency_probe_after']
+    if after is None:
+        # One second boundary prevents a pre-incident result from the same second
+        # being reused. Persist before returning to the asynchronous worker.
+        after=now+1
+        db.execute('UPDATE vps_rotations SET emergency_probe_after=? WHERE id=?',(after,r['id']))
+        db.execute('UPDATE detection_plans SET next_at=MIN(next_at,?) WHERE server_id=?',(after,target))
+        db.commit()
+        raise IntegrationError('当前承载异常，已请求刚换下 VPS #'+str(target)+' 加测一轮；通过后立即接替')
+    last=db.execute("SELECT created FROM detection_runs WHERE server_id=? AND status NOT IN ('creating','pending','queued','issued') ORDER BY id DESC LIMIT 1",(target,)).fetchone()
+    if not last or last['created']<after:
+        db.execute('UPDATE detection_plans SET next_at=MIN(next_at,?) WHERE server_id=?',(max(after,now),target))
+        db.commit()
+        raise IntegrationError('等待换下 VPS #'+str(target)+' 完成本次故障后的新一轮探测')
+
+
 def _dns_switch(connect,cipher,rotation,now,emergency=False,offline=False):
     with connect() as db:
         r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rotation,)).fetchone()
@@ -574,6 +592,7 @@ def _dns_switch(connect,cipher,rotation,now,emergency=False,offline=False):
         conn=load_connection(db,cipher,binding['connection_id'])
         target=r['other_server_id'] if r['active_server_id']==r['primary_server_id'] else r['primary_server_id']
         _validated_plan(db,target,r['owner_id'])
+        if emergency and not _fixed(r):_original_emergency_probe(db,r,target,now)
         _fixed_ready(db,cipher,r,target,now)
         if offline:old_ip,port=binding['expected_ip'],binding['port']
         else:old_ip,port,_=_fresh_ip(db,r['active_server_id'],now,cipher)
@@ -617,7 +636,7 @@ def _dns_switch(connect,cipher,rotation,now,emergency=False,offline=False):
             db.execute('UPDATE dns_bindings SET status=? WHERE id=?',(message,binding['id']))
             _event(db,rotation,target,message,now)
             return
-        db.execute("UPDATE vps_rotations SET active_server_id=?,phase='draining',drain_server_id=?,drain_started=?,drain_grace_s=?,old_ip=?,new_ip=NULL,action_started=NULL,reboot_command_id=NULL,last_sample_at=NULL,low_samples=0,status=?,next_switch_at=?,updated=? WHERE id=?",(target,r['active_server_id'],now,grace,old_ip,message,now+r['interval_s']-r['lead_s'],now,rotation))
+        db.execute("UPDATE vps_rotations SET active_server_id=?,phase='draining',emergency_probe_after=NULL,drain_server_id=?,drain_started=?,drain_grace_s=?,old_ip=?,new_ip=NULL,action_started=NULL,reboot_command_id=NULL,last_sample_at=NULL,low_samples=0,status=?,next_switch_at=?,updated=? WHERE id=?",(target,r['active_server_id'],now,grace,old_ip,message,now+r['interval_s']-r['lead_s'],now,rotation))
         db.execute('UPDATE vps_rotations SET emergency=?,low_samples=? WHERE id=?',(int(emergency and not offline),2 if emergency and not offline else 0,rotation))
         if _fixed(r):
             delay=r['interval_s'] if target==r['other_server_id'] else 0
