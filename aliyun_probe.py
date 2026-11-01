@@ -52,7 +52,8 @@ def node_parts(node):
 
 def nodes(secret):
     data = call(secret, 'DescribeSiteMonitorISPCityList', IPV4='true', IPV6='false', ViewAll='false')
-    rows = data.get('IspCityList', {}).get('IspCity')
+    listing = data.get('IspCityList')
+    rows = listing.get('IspCity') if isinstance(listing, dict) else None
     if not isinstance(rows, list): raise IntegrationError('阿里云节点列表格式异常')
     result = []
     for row in rows:
@@ -110,13 +111,16 @@ def poll(secret, remote, selected, created):
             code = row.get('errorCode')
             # Only explicit connect failure is unreachable. Socket-resource errors,
             # receive timeouts, unknown codes and missing values remain unknown.
-            state = 'reachable' if str(code) == '0' else ('unreachable' if str(code) == '611' else 'unknown')
+            valid_code = type(code) in (int, float) and math.isfinite(code)
+            state = 'reachable' if (valid_code and code == 0) or code == '0' else ('unreachable' if (valid_code and code == 611) or code == '611' else 'unknown')
             states.append(state)
             latency = row.get('tcpConnectTime')
             if state == 'reachable' and type(latency) in (int, float) and math.isfinite(latency) and 0 <= latency <= 60000:
                 latencies.append(latency)
         state = 'reachable' if 'reachable' in states else ('unreachable' if all(s == 'unreachable' for s in states) else 'unknown')
+        # Preserve raw latency for diagnosis without claiming an unverified unit.
         row = batch[-1]
         result.append({'node_id': node, 'name': str(row.get('cityCN') or row.get('cityEN') or node)+' '+str(row.get('ispCN') or row.get('ispEN') or ''),
-                       'state': state, 'latency_ms': round(sum(latencies)/len(latencies), 2) if latencies else None})
+                       'state': state, 'latency_ms': None,
+                       'raw_tcp_connect_time': round(sum(latencies)/len(latencies), 2) if latencies else None})
     return result
