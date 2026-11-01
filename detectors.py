@@ -1,5 +1,6 @@
 """Replaceable detection sources: BOCE asynchronous tasks or authenticated self-hosted probes."""
 import aliyun_probe
+import baota_probe
 import hashlib
 import ipaddress
 import json
@@ -74,12 +75,13 @@ def source_nodes(source,cipher):
         cached=_source_nodes_cache.get(key)
         if cached and time.monotonic()-cached[0]<60:return cached[1],True
         if source['kind']=='aliyun':rows=aliyun_probe.nodes(secret)
+        elif source['kind']=='baota':rows=baota_probe.nodes(secret)
         elif source['kind']=='boce':
             result=boce(secret,'node/list')
             listing=result.get('data',{}).get('list')
             if not isinstance(listing,list):raise IntegrationError('节点列表格式异常')
             rows=[{'id':str(r['id']),'name':str(r.get('node_name',''))[:80],'isp':str(r.get('isp_name',''))[:80]} for r in listing if isinstance(r,dict) and str(r.get('id','')).isdigit()]
-        else:raise IntegrationError('请选择 BOCE 或阿里云来源')
+        else:raise IntegrationError('请选择 BOCE、宝塔或阿里云来源')
         if not rows:raise IntegrationError('检测来源未返回可用节点')
         with _source_nodes_guard:
             if len(_source_nodes_cache)>=128:_source_nodes_cache.clear()
@@ -253,9 +255,9 @@ def start_run(connect,cipher,sid,scheduled=False):
         if db.execute("SELECT 1 FROM detection_runs WHERE server_id=? AND status IN ('creating','pending','queued','issued')",(sid,)).fetchone():raise IntegrationError('已有检测任务进行中，请勿重复提交')
         now=int(time.time())
         if now<p['next_at']:raise IntegrationError('尚未到下一次检测时间，请避免重复扣费')
-        ip=candidate_ip(db,m,cipher);nodes=json.loads(p['nodes']) if p['kind'] in ('boce','aliyun') else ['self']
+        ip=candidate_ip(db,m,cipher);nodes=json.loads(p['nodes']) if p['kind'] in ('boce','aliyun','baota') else ['self']
         if not nodes:raise IntegrationError('请至少选择一个国内检测点')
-        cost=len(nodes) if p['kind'] in ('boce','aliyun') else 0
+        cost=len(nodes) if p['kind'] in ('boce','aliyun','baota') else 0
         from datetime import datetime
         from zoneinfo import ZoneInfo
         z=ZoneInfo('Asia/Shanghai');today=datetime.now(z).replace(hour=0,minute=0,second=0,microsecond=0).timestamp()
@@ -278,6 +280,9 @@ def start_run(connect,cipher,sid,scheduled=False):
                     shape='data 类型='+type(payload).__name__+'，id 类型='+type(remote).__name__
                     raise IntegrationError('BOCE 未返回有效任务 ID（'+shape+'）'+('：'+detail if detail else ''))
                 db.execute("UPDATE detection_runs SET remote_id=?,status='pending' WHERE id=?",(remote,rid))
+            elif p['kind']=='baota':
+                remote=baota_probe.create(source_secret(p,cipher),ip,m['port'],nodes,rid)
+                db.execute("UPDATE detection_runs SET remote_id=?,status='pending' WHERE id=?",(remote,rid))
             elif p['kind']=='aliyun':
                 remote=aliyun_probe.create(source_secret(p,cipher),ip,m['port'],nodes,rid)
                 db.execute("UPDATE detection_runs SET remote_id=?,status='pending' WHERE id=?",(remote,rid))
@@ -295,12 +300,19 @@ def tick(connect,cipher):
     now=int(time.time())
     with connect() as db:
         # Timed-out self probes and expired BOCE jobs never imply target is blocked.
-        expired=db.execute("SELECT * FROM detection_runs WHERE status IN ('pending','queued','issued','creating') AND created<?",(now-120,)).fetchall()
+        expired=db.execute("SELECT r.* FROM detection_runs r JOIN detection_sources s ON s.id=r.source_id WHERE r.status IN ('pending','queued','issued','creating') AND r.created<?-CASE WHEN s.kind='baota' THEN 300 ELSE 120 END",(now,)).fetchall()
         for r in expired:finish(db,r,'检测超时（不能判定目标不通）',[])
         pending=[dict(r) for r in db.execute("SELECT r.*,s.secret,s.enabled,s.kind FROM detection_runs r JOIN detection_sources s ON s.id=r.source_id WHERE r.status='pending' AND r.poll_at<=?",(now,))]
     for r in pending:
         with connect() as db:db.execute('UPDATE detection_runs SET poll_at=? WHERE id=?',(now+10,r['id']))
         try:
+            if r['kind']=='baota':
+                rows=baota_probe.poll(source_secret(r,cipher),r['remote_id'],json.loads(r['nodes']))
+                if rows is None:continue
+                states=[x['state'] for x in rows]
+                status='宝塔 TCP 可达' if states and all(x=='reachable' for x in states) else ('宝塔 TCP 均不通（待复核）' if states and all(x=='unreachable' for x in states) else '宝塔 TCP 部分不通或结果未知')
+                with connect() as db:finish(db,r,status,rows)
+                continue
             if r['kind']=='aliyun':
                 rows=aliyun_probe.poll(source_secret(r,cipher),r['remote_id'],json.loads(r['nodes']),r['created'])
                 if rows is None:continue
@@ -315,7 +327,7 @@ def tick(connect,cipher):
             with connect() as db:finish(db,r,status,rows)
         except IntegrationError as e:
             status='检测接口异常（不能判定目标不通）'
-            if r['kind']=='aliyun':status+='：'+str(e)[:400]
+            if r['kind'] in ('aliyun','baota'):status+='：'+str(e)[:400]
             with connect() as db:finish(db,r,status,[])
     with connect() as db:
         due=[r[0] for r in db.execute('SELECT p.server_id FROM detection_plans p JOIN ip_monitors m ON m.server_id=p.server_id JOIN detection_sources s ON s.id=p.source_id WHERE p.automatic=1 AND m.enabled=1 AND s.enabled=1 AND p.next_at<=?',(now,))]
@@ -449,7 +461,7 @@ def register(app,connect,cipher,auth,body,error,audit):
     @auth(admin=True)
     def detection_save_source():
         d=body();kind=d.get('kind');name=d.get('name','');secret=d.get('secret','');enabled=d.get('enabled',True)
-        if kind not in ('boce','self','aliyun') or not isinstance(name,str) or not 1<=len(name.strip())<=80 or not isinstance(secret,str) or len(secret)>4096 or type(enabled)is not bool:return error('检测来源格式无效')
+        if kind not in ('boce','self','aliyun','baota') or not isinstance(name,str) or not 1<=len(name.strip())<=80 or not isinstance(secret,str) or len(secret)>4096 or type(enabled)is not bool:return error('检测来源格式无效')
         if kind=='aliyun' and secret:
             try:aliyun_probe.credentials(secret)
             except IntegrationError as e:return error(str(e))
@@ -463,7 +475,7 @@ def register(app,connect,cipher,auth,body,error,audit):
                 db.execute('UPDATE detection_sources SET name=?,secret=?,enabled=?,verified_at=CASE WHEN ? THEN NULL ELSE verified_at END WHERE id=?',(name.strip(),encrypted,int(enabled),int(bool(secret)),old['id']));sid=old['id']
             else:
                 if kind=='self':secret=token=secrets.token_urlsafe(36)
-                if not secret:return error('请填写 BOCE API Key')
+                if not secret:return error('请填写检测来源 API 密钥')
                 sid=db.execute('INSERT INTO detection_sources(name,kind,secret,enabled) VALUES(?,?,?,?)',(name.strip(),kind,cipher.encrypt(secret.encode()).decode(),int(enabled))).lastrowid
             audit(db,'保存检测来源 #'+str(sid))
         return jsonify(ok=True,id=sid,probe_token=token)
@@ -477,9 +489,9 @@ def register(app,connect,cipher,auth,body,error,audit):
             if not s:raise IntegrationError('检测来源不存在')
             if not s['enabled']:raise IntegrationError('检测来源已暂停，请先启用')
             now=int(time.time())
-            if s['kind'] in ('boce','aliyun'):
+            if s['kind'] in ('boce','aliyun','baota'):
                 rows,cached=source_nodes(s,cipher)
-                label='BOCE' if s['kind']=='boce' else '阿里云'
+                label={'boce':'BOCE','aliyun':'阿里云','baota':'宝塔拨测'}[s['kind']]
                 message=f'{label} API 可用，读取到 {len(rows)} 个检测节点；未提交拨测任务'
                 if cached:message+='（复用最近 60 秒同一凭证验证的节点列表）'
             elif s['kind']=='self':
@@ -498,7 +510,7 @@ def register(app,connect,cipher,auth,body,error,audit):
     def detection_nodes(sid):
         try:
             with connect() as db:s=db.execute('SELECT * FROM detection_sources WHERE id=?',(sid,)).fetchone()
-            if not s or not s['enabled']:raise IntegrationError('请选择已启用的 BOCE 或阿里云来源')
+            if not s or not s['enabled']:raise IntegrationError('请选择已启用的 BOCE、宝塔或阿里云来源')
             rows,cached=source_nodes(s,cipher)
             return jsonify(nodes=rows,cached=cached)
         except IntegrationError as e:return error(str(e))
@@ -696,13 +708,13 @@ def register(app,connect,cipher,auth,body,error,audit):
             if action_connection_id:
                 action=db.execute('SELECT kind,owner_id FROM ip_connections WHERE id=?',(action_connection_id,)).fetchone()
                 if not action or action['kind']!='change_ip' or action['owner_id'] is not None:return error('请选择管理员的换 IP API 连接')
-            if s['kind']=='boce' and any(not str(x).isdigit() for x in ids):return error('BOCE 节点 ID 必须为数字')
+            if s['kind'] in ('boce','baota') and any(not str(x).isdigit() for x in ids):return error('BOCE / 宝塔节点 ID 必须为数字')
             if s['kind']=='aliyun':
                 try:
                     for node in ids:aliyun_probe.node_parts(node)
                 except IntegrationError as e:return error(str(e))
                 if response_mode!='none':return error('阿里云来源当前仅记录检测结果；完成真实账号联调后再启用自动处理')
-            ids=sorted(set(map(str,ids))) if s['kind'] in ('boce','aliyun') else ['self']
+            ids=sorted(set(map(str,ids))) if s['kind'] in ('boce','aliyun','baota') else ['self']
             if not ids:return error('请填写至少一个节点 ID')
             db.execute('INSERT OR IGNORE INTO ip_monitors(server_id,port) VALUES(?,?)',(sid,port or 443))
             if port is not None:db.execute('UPDATE ip_monitors SET port=? WHERE server_id=?',(port,sid))
