@@ -25,3 +25,16 @@ test('node listing, source verification and 120 second plan preserve composite n
 test('changing sources discards delayed validation results',async()=>{
  const h=setup();await h.ctx.editDetectionPlan();let resolve;h.ctx.api=()=>new Promise(r=>resolve=r);const button=h.elements.loadPlanNodes.next,pending=button.onclick();h.elements.detectorPlanForm.elements.source_id.value='8';h.elements.detectorPlanForm.elements.source_id.onchange();resolve({message:'旧来源通过'});await pending;assert.equal(h.elements.probeSourceStatus.textContent,'');assert.equal(button.disabled,false);
 });
+
+test('node lookup immediately displays progress and discards results after source change',async()=>{
+ const h=setup();await h.ctx.editDetectionPlan();let resolve;h.ctx.api=()=>new Promise(r=>resolve=r);
+ const button=h.elements.loadPlanNodes,pending=button.onclick();assert.equal(button.disabled,true);assert.match(button.textContent,/正在获取/);assert.match(h.elements.detectorPlanError.textContent,/正在获取/);
+ h.elements.detectorPlanForm.elements.source_id.value='8';h.elements.detectorPlanForm.elements.source_id.onchange();
+ resolve({nodes:[{id:'old',name:'旧节点',isp:'test'}]});await pending;
+ assert.equal(h.elements.planNodeChoices.innerHTML,'');assert.equal(button.disabled,false);
+});
+test('node lookup timeout restores button and displays local error',async()=>{
+ const h=setup();await h.ctx.editDetectionPlan();let timeout;h.ctx.setTimeout=fn=>{timeout=fn;return 1};h.ctx.clearTimeout=()=>{};h.ctx.api=()=>new Promise(()=>{});
+ const pending=h.elements.loadPlanNodes.onclick();timeout();await pending;
+ assert.equal(h.elements.loadPlanNodes.disabled,false);assert.match(h.elements.detectorPlanError.textContent,/超时/);
+});

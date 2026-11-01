@@ -95,6 +95,27 @@ class DetectorTest(unittest.TestCase):
   with self.connect() as db:
    row=db.execute('SELECT * FROM detection_incidents').fetchone()
    self.assertEqual(row['state'],'ip_changed');self.assertIsNotNone(row['closed_at'])
+ def test_nodes_and_source_test_share_short_cache_and_changed_key_invalidates(self):
+  source=self.source()['id']
+  with patch('detectors.boce',return_value={'data':{'list':[{'id':1,'node_name':'test'}]}}) as remote:
+   first=self.post('/sources/'+str(source)+'/nodes')
+   self.assertEqual(first.status_code,200);self.assertFalse(first.json['cached'])
+   self.assertEqual(self.post('/sources/'+str(source)+'/test').status_code,200)
+   self.assertTrue(self.post('/sources/'+str(source)+'/nodes').json['cached'])
+   self.assertEqual(remote.call_count,1)
+   with self.connect() as db:db.execute('UPDATE detection_sources SET secret=? WHERE id=?',(self.cipher.encrypt(b'new-secret-value').decode(),source))
+   self.assertFalse(self.post('/sources/'+str(source)+'/nodes').json['cached'])
+   self.assertEqual(remote.call_count,2)
+ def test_node_cache_expires_and_errors_are_not_cached(self):
+  source=self.source()['id']
+  with patch('detectors.time.monotonic',return_value=100) as clock,patch('detectors.boce',return_value={'data':{'list':[{'id':1}]}}) as remote:
+   self.assertEqual(self.post('/sources/'+str(source)+'/nodes').status_code,200)
+   clock.return_value=161
+   remote.side_effect=IntegrationError('upstream unavailable')
+   self.assertEqual(self.post('/sources/'+str(source)+'/nodes').status_code,400)
+   remote.side_effect=None
+   self.assertEqual(self.post('/sources/'+str(source)+'/nodes').status_code,200)
+   self.assertEqual(remote.call_count,3)
  def test_secret_encryption_and_admin_only(self):
   self.source();self.assertEqual(self.client.get('/api/detection').status_code,403)
   data=self.client.get('/api/detection',headers=self.headers).text;self.assertNotIn('testsecret',data)

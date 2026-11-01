@@ -6,6 +6,7 @@ import json
 import math
 import secrets
 import time
+import threading
 import urllib.parse
 from flask import g,jsonify,request
 from ip_dns import IntegrationError, request_json, candidate_ip, load_connection, invoke_change_ip_api, boce_dns_gate, ChangeIPUncertain
@@ -21,6 +22,7 @@ CREATE INDEX IF NOT EXISTS detection_server_latest ON detection_runs(server_id,s
 '''
 
 def initialize(connect):
+    _source_nodes_cache.clear()
     with connect() as db:
         db.executescript(SCHEMA)
         # Additive migrations preserve existing monitoring plans and run history.
@@ -59,6 +61,31 @@ def initialize(connect):
                 if name not in existing:db.execute(f'ALTER TABLE {table} ADD COLUMN {name} {definition}')
         db.execute('CREATE INDEX IF NOT EXISTS detection_recovery_status ON detection_runs(action_status,id)')
         db.execute("UPDATE detection_runs SET action_attempted=? WHERE action_attempted IS NULL AND action_status IN ('issued','submitted','uncertain')",(int(time.time()),))
+
+_source_nodes_cache={}
+_source_nodes_locks={}
+_source_nodes_guard=threading.Lock()
+
+def source_nodes(source,cipher):
+    secret=source_secret(source,cipher)
+    key=(source['id'],source['kind'],hashlib.sha256(secret.encode()).hexdigest())
+    with _source_nodes_guard:lock=_source_nodes_locks.setdefault(source['id'],threading.Lock())
+    with lock:
+        cached=_source_nodes_cache.get(key)
+        if cached and time.monotonic()-cached[0]<60:return cached[1],True
+        if source['kind']=='aliyun':rows=aliyun_probe.nodes(secret)
+        elif source['kind']=='boce':
+            result=boce(secret,'node/list')
+            listing=result.get('data',{}).get('list')
+            if not isinstance(listing,list):raise IntegrationError('节点列表格式异常')
+            rows=[{'id':str(r['id']),'name':str(r.get('node_name',''))[:80],'isp':str(r.get('isp_name',''))[:80]} for r in listing if isinstance(r,dict) and str(r.get('id','')).isdigit()]
+        else:raise IntegrationError('请选择 BOCE 或阿里云来源')
+        if not rows:raise IntegrationError('检测来源未返回可用节点')
+        with _source_nodes_guard:
+            if len(_source_nodes_cache)>=128:_source_nodes_cache.clear()
+            _source_nodes_cache[key]=(time.monotonic(),rows)
+        return rows,False
+
 
 def boce(secret,path,params=None):
     # BOCE documents key and task parameters as query parameters; do not send form body
@@ -448,16 +475,11 @@ def register(app,connect,cipher,auth,body,error,audit):
             if not s:raise IntegrationError('检测来源不存在')
             if not s['enabled']:raise IntegrationError('检测来源已暂停，请先启用')
             now=int(time.time())
-            if s['kind']=='boce':
-                result=boce(source_secret(s,cipher),'node/list')
-                rows=result.get('data',{}).get('list')
-                if not isinstance(rows,list):raise IntegrationError('BOCE 节点列表格式异常')
-                valid=sum(1 for r in rows if isinstance(r,dict) and str(r.get('id','')).isdigit())
-                if not valid:raise IntegrationError('BOCE API 可连接，但没有返回可用检测节点')
-                message=f'BOCE API 可用，读取到 {valid} 个检测节点；这只是连通性测试，不会提交收费拨测任务'
-            elif s['kind']=='aliyun':
-                valid=len(aliyun_probe.nodes(source_secret(s,cipher)))
-                message=f'阿里云 API 可用，读取到 {valid} 个大陆节点；未提交拨测任务'
+            if s['kind'] in ('boce','aliyun'):
+                rows,cached=source_nodes(s,cipher)
+                label='BOCE' if s['kind']=='boce' else '阿里云'
+                message=f'{label} API 可用，读取到 {len(rows)} 个检测节点；未提交拨测任务'
+                if cached:message+='（复用最近 60 秒同一凭证验证的节点列表）'
             elif s['kind']=='self':
                 seen=s['last_seen']
                 if not seen or now-int(seen)>35:raise IntegrationError('自建探针未在线：检查探针服务、面板 HTTPS 地址及密钥；在线后等待 10–35 秒再测试')
@@ -474,12 +496,9 @@ def register(app,connect,cipher,auth,body,error,audit):
     def detection_nodes(sid):
         try:
             with connect() as db:s=db.execute('SELECT * FROM detection_sources WHERE id=?',(sid,)).fetchone()
-            if s and s['kind']=='aliyun':return jsonify(nodes=aliyun_probe.nodes(source_secret(s,cipher)))
-            if not s or s['kind']!='boce':raise IntegrationError('请选择 BOCE 或阿里云来源')
-            result=boce(source_secret(s,cipher),'node/list') # No area parameter => mainland, per official docs.
-            rows=result.get('data',{}).get('list')
-            if not isinstance(rows,list):raise IntegrationError('节点列表格式异常')
-            return jsonify(nodes=[{'id':str(r['id']),'name':str(r.get('node_name',''))[:80],'isp':str(r.get('isp_name',''))[:80]} for r in rows if isinstance(r,dict) and str(r.get('id','')).isdigit()])
+            if not s or not s['enabled']:raise IntegrationError('请选择已启用的 BOCE 或阿里云来源')
+            rows,cached=source_nodes(s,cipher)
+            return jsonify(nodes=rows,cached=cached)
         except IntegrationError as e:return error(str(e))
 
     @app.get('/api/client/servers/<int:sid>/probe-config')
