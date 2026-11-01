@@ -596,3 +596,13 @@ dialog:has(.client-dns-panel){width:680px;max-height:88vh;overflow:auto;scroll-b
 .client-probe-hub{max-width:880px}.client-probe-hub>h2{margin:10px 0}.client-probe-server-card{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:12px 0;padding:16px;border:1px solid #e5e7ef;border-radius:14px;background:#ffffffb8}.client-probe-server-card>div{display:grid;gap:6px;min-width:0}.client-probe-server-card strong{color:#37465d}.client-probe-server-card span{font-size:12px}.client-probe-server-card small{color:#888;font-size:11px}.client-probe-server-card button{flex-shrink:0}@media(max-width:600px){.client-probe-server-card{align-items:flex-start;flex-direction:column}.client-probe-server-card button{width:100%}}
 
 .hkt-dhcp-panel pre{background:#11191c;color:#edf1f5;border:1px solid #485358;white-space:pre-wrap;overflow-wrap:anywhere;padding:16px;border-radius:12px}
+
+/* Keep sidebar status above the brand and let long menus scroll independently. */
+@media(min-width:761px){
+ #shell>aside{display:flex;flex-direction:column;padding-top:12px;overflow:hidden}
+ #shell>aside>.sidefoot{position:static;flex:none;max-width:none;margin:0 0 8px;padding:0;border:0;border-radius:0;background:transparent;font-size:11px;line-height:1.35}
+ #shell>aside>.sidefoot small{font-size:9px}
+ #shell>aside>.logo{flex:none}
+ #shell>aside>.caption{flex:none;margin:22px 8px 12px}
+ #shell>aside>nav{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;padding-bottom:12px;scrollbar-width:thin}
+}
