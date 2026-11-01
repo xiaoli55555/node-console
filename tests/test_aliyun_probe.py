@@ -39,7 +39,7 @@ class ProviderTest(unittest.TestCase):
   self.assertEqual(json.loads(args['IspCities']),[{'city':'546','isp':'232','type':'IDC'}])
   self.assertNotIn('RandomIspCity',args)
  def test_poll_conservative_and_complete(self):
-  for code,state in [(0,'reachable'),(611,'unreachable'),(610,'unknown'),(550,'unknown'),(None,'unknown'),(999,'unknown')]:
+  for code,state in [(0,'reachable'),(0.0,'reachable'),('0','reachable'),(False,'unknown'),(611.0,'unreachable'),(611,'unreachable'),(610,'unknown'),(550,'unknown'),(None,'unknown'),(999,'unknown')]:
    with self.subTest(code=code),patch('aliyun_probe.call',return_value={'Data':json.dumps([log(code)])}):
     self.assertEqual(provider.poll(SECRET,'remote1',['546:232'],int(time.time())-1)[0]['state'],state)
   for data in [{'Data':[]},{'Data':[log(task='wrong')]},{'Data':[log()],'NextToken':'more'}]:
@@ -47,7 +47,10 @@ class ProviderTest(unittest.TestCase):
   with patch('aliyun_probe.call',return_value={'Data':[log(611),log(0)]}):
    self.assertEqual(provider.poll(SECRET,'remote1',['546:232'],int(time.time())-1)[0]['state'],'reachable')
 
-class IntegrationTest(fixtures.DetectorTest):
+class IntegrationTest(unittest.TestCase):
+ setUp=fixtures.DetectorTest.setUp
+ post=fixtures.DetectorTest.post
+ plan=fixtures.DetectorTest.plan
  def aliyun_source(self):
   response=self.post('/sources',dict(kind='aliyun',name='阿里云',secret=SECRET))
   self.assertEqual(response.status_code,200,response.json)
@@ -93,3 +96,50 @@ class IntegrationTest(fixtures.DetectorTest):
   self.assertEqual(self.post('/plans/1',dict(source_id=source,nodes=['546:232'],automatic=True,response_mode='reboot')).status_code,400)
 
 if __name__=='__main__':unittest.main()
+
+class RobustnessTest(unittest.TestCase):
+ def test_bad_payloads_fail_safely(self):
+  for secret in ['null','[]','{}','bad',json.dumps({'access_key_id':False,'access_key_secret':'abcdefgh'})]:
+   with self.subTest(secret=secret),self.assertRaises(IntegrationError):provider.credentials(secret)
+  for data in [{'IspCityList':None},{'IspCityList':[]},{'IspCityList':{'IspCity':'bad'}}]:
+   with patch('aliyun_probe.call',return_value=data),self.assertRaises(IntegrationError):provider.nodes(SECRET)
+  for raw in ['bad','{}',None]:
+   with patch('aliyun_probe.call',return_value={'Data':raw}),self.assertRaises(IntegrationError):provider.poll(SECRET,'remote1',['546:232'],1)
+ def test_stale_missing_and_foreign_logs_never_complete(self):
+  for rows in [[{**log(), 'taskEndTimestamp':1}],[log(node='1:2')],[log()], [{**log(),'taskEndTimestamp':float('nan')}]]:
+   with patch('aliyun_probe.call',return_value={'Data':rows}):
+    self.assertIsNone(provider.poll(SECRET,'remote1',['546:232','572:232'],int(time.time())-1))
+ def test_raw_latency_not_mislabelled_as_ms(self):
+  with patch('aliyun_probe.call',return_value={'Data':[log()]}):
+   row=provider.poll(SECRET,'remote1',['546:232'],int(time.time())-1)[0]
+   self.assertIsNone(row['latency_ms']);self.assertEqual(row['raw_tcp_connect_time'],15)
+ def test_invalid_or_unavailable_target_does_not_create_billable_task(self):
+  for ip,port,selected in [('127.0.0.1',443,['546:232']),('8.8.8.8',True,['546:232']),('8.8.8.8',0,['546:232']),('8.8.8.8',443,[])]:
+   with patch('aliyun_probe.call') as call,self.assertRaises(IntegrationError):provider.create(SECRET,ip,port,selected,1)
+   call.assert_not_called()
+  with patch('aliyun_probe.nodes',return_value=[{'id':'1:2'}]),patch('aliyun_probe.call') as call,self.assertRaises(IntegrationError):
+   provider.create(SECRET,'8.8.8.8',443,['546:232'],1)
+  call.assert_not_called()
+
+class OperationalTest(IntegrationTest):
+ def test_daily_budget_and_pending_expiry(self):
+  source=self.aliyun_source();self.plan(source,nodes=['546:232'],daily_limit=1)
+  with patch('aliyun_probe.create',return_value='remote1'):rid=detectors.start_run(self.connect,self.cipher,1)
+  with self.connect() as db:db.execute('UPDATE detection_runs SET created=?,poll_at=0 WHERE id=?',(int(time.time())-130,rid))
+  with patch('aliyun_probe.poll') as poll:detectors.tick(self.connect,self.cipher)
+  poll.assert_not_called()
+  with self.connect() as db:
+   run=db.execute('SELECT * FROM detection_runs WHERE id=?',(rid,)).fetchone()
+   self.assertIn('不能判定目标不通',run['status']);self.assertEqual(json.loads(run['details']),[])
+   db.execute('UPDATE detection_plans SET next_at=0 WHERE server_id=1')
+  with patch('aliyun_probe.create') as create,self.assertRaises(IntegrationError):detectors.start_run(self.connect,self.cipher,1)
+  create.assert_not_called()
+ def test_stale_result_does_not_replace_reconfigured_plan(self):
+  source=self.aliyun_source();self.plan(source,nodes=['546:232'],port=443)
+  with patch('aliyun_probe.create',return_value='remote1'):rid=detectors.start_run(self.connect,self.cipher,1)
+  self.plan(source,nodes=['572:232'],port=50332)
+  with self.connect() as db:db.execute('UPDATE detection_runs SET poll_at=0 WHERE id=?',(rid,))
+  with patch('aliyun_probe.poll',return_value=[{'node_id':'546:232','name':'old','state':'unreachable','latency_ms':None}]):detectors.tick(self.connect,self.cipher)
+  with self.connect() as db:
+   self.assertEqual(db.execute('SELECT status FROM detection_plans WHERE server_id=1').fetchone()[0],'等待新配置检测')
+   self.assertEqual(db.execute('SELECT COUNT(*) FROM commands').fetchone()[0],0)
