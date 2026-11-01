@@ -216,12 +216,15 @@ def dhcp_task(cid):
                     time.sleep(2)
                     if dhcp_address(iface):break
                 new=dhcp_address(iface);result['new_ip']=new
-                if new and new!=old:
+                if new and new!=old and new.startswith('42.'):
                     if not dhcp_stable(iface,new):raise ValueError('新 IP、默认路由或 DHCP 续租进程未通过稳定检查')
                     result['state']='changed';break
                 if not new:dhcp_background(iface,cfg)
                 time.sleep(5)
-            else:result['state']='unchanged' if dhcp_address(iface)==old else 'failed'
+            else:
+                result['state']='unchanged' if dhcp_address(iface)==old else 'failed'
+                if result.get('new_ip') and not result['new_ip'].startswith('42.'):
+                    result['error']='HKT 优选 IP 策略：仅允许 42.0.0.0/8；本轮未获取合格 IP，保留网络并停止自动尝试'
         except Exception as e:
             result['state']='failed';result['error']=type(e).__name__+': '+str(e)[:180]
         finally:

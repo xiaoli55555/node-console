@@ -155,11 +155,29 @@ class DHCPExecutor(unittest.TestCase):
         for p in patches:self.addCleanup(p.stop)
         return state,mocks[5]
     def test_changed_IP_stops_and_same_command_is_never_executed_twice(self):
-        state,run=self.run_task(['8.8.8.8','1.1.1.1','1.1.1.1'])
+        state,run=self.run_task(['8.8.8.8','42.98.100.156','42.98.100.156'])
         agent.dhcp_task(10);result=json.loads((state/'dhcp-result.json').read_text())
         self.assertEqual(result['state'],'changed');self.assertEqual(result['attempts'],1)
         count=run.call_count;agent.dhcp_task(10);self.assertEqual(run.call_count,count)
         self.assertEqual((state/'dhcp-lease.backup').read_text(),'old lease')
+    def test_nonpreferred_new_ip_never_reports_success(self):
+        state,run=self.run_task('1.36.96.112')
+        agent.dhcp_task(55)
+        result=json.loads((state/'dhcp-result.json').read_text())
+        self.assertNotEqual(result['state'],'changed')
+        self.assertEqual(result['attempts'],3)
+        self.assertIn('42.0.0.0/8',result['error'])
+    def test_rotation_gate_applies_only_to_registered_hkt(self):
+        import sqlite3
+        from rotation import _preferred_rotation_ip
+        db=sqlite3.connect(':memory:')
+        self.addCleanup(db.close)
+        db.execute('CREATE TABLE hkt_dhcp_apis(server_id INTEGER)')
+        db.execute('INSERT INTO hkt_dhcp_apis VALUES(1)')
+        _preferred_rotation_ip(db,1,'42.98.100.156')
+        _preferred_rotation_ip(db,2,'1.36.96.112')
+        with self.assertRaises(IntegrationError):_preferred_rotation_ip(db,1,'1.36.96.112')
+
     def test_unchanged_IP_stops_after_three_attempts_without_false_success(self):
         state,run=self.run_task('8.8.8.8');agent.dhcp_task(11)
         result=json.loads((state/'dhcp-result.json').read_text());self.assertEqual(result['state'],'unchanged');self.assertEqual(result['attempts'],3)
@@ -183,7 +201,7 @@ class DHCPExecutor(unittest.TestCase):
             self.assertIn('-d',args)
             self.assertNotIn('--property=RuntimeMaxSec=240',args)
     def test_unstable_new_address_is_not_reported_successful(self):
-        state,run=self.run_task(['8.8.8.8','1.1.1.1','1.1.1.1'])
+        state,run=self.run_task(['8.8.8.8','42.98.100.156','42.98.100.156'])
         with patch.object(agent,'dhcp_stable',return_value=False):agent.dhcp_task(99)
         result=json.loads((state/'dhcp-result.json').read_text())
         self.assertEqual(result['state'],'failed')

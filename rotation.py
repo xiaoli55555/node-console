@@ -429,12 +429,20 @@ def _request_probe(db,sid,now):
         db.execute('UPDATE detection_plans SET next_at=MIN(next_at,?) WHERE server_id=?',(now,sid))
 
 
+def _preferred_rotation_ip(db,sid,ip):
+    # Registered HKT DHCP machines must never be published with a nonpreferred IP.
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hkt_dhcp_apis'").fetchone():
+        if db.execute('SELECT 1 FROM hkt_dhcp_apis WHERE server_id=?',(sid,)).fetchone() and not ip.startswith('42.'):
+            raise IntegrationError('HKT 优选 IP 策略：仅允许 42 开头的 IPv4 进入轮换；当前 '+ip)
+
+
 def _fixed_ready(db,cipher,r,sid,now,verified_candidate=None):
     rotation_groups.target_guard(db,r,sid)
     if _offline(db,sid,now,r['offline_after_s']):raise IntegrationError('目标 VPS 心跳已超时，不能接替')
     if r['phase'] in ('waiting_ip','waiting_probe') and r['drain_server_id']==sid:raise IntegrationError('目标 VPS 的换 IP / 复检尚未结束，不能接替')
     if _pending_action(db,sid,verified_candidate):raise IntegrationError('目标 VPS 有未结束的重启或换 IP 动作，不能接替')
     ip,port,metrics=_fresh_ip(db,sid,now,cipher)
+    _preferred_rotation_ip(db,sid,ip)
     if verified_candidate is not None and ip!=verified_candidate:raise IntegrationError('待恢复候选 IP 已变化，重新验证')
     last=db.execute("SELECT updated FROM detection_runs WHERE server_id=? AND status NOT IN ('creating','pending','queued','issued') ORDER BY id DESC LIMIT 1",(sid,)).fetchone()
     if not last or not 0<=now-last['updated']<=90:raise IntegrationError('目标 VPS 所选检测点结果过期，正在加急复测')
@@ -802,6 +810,9 @@ def _run_rotation(connect,cipher,rid,now):
             except IntegrationError as e:db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',(str(e),now,rid));return
             if ip!=r['new_ip']:
                 db.execute('UPDATE vps_rotations SET new_ip=?,action_started=?,status=?,updated=? WHERE id=?',(ip,now,'备用 VPS IP 再次变化，等待新一轮 BOCE 复检',now,rid));return
+            try:_preferred_rotation_ip(db,old,ip)
+            except IntegrationError as e:
+                db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',(str(e),now,rid));return
             plan=db.execute('SELECT port FROM ip_monitors WHERE server_id=?',(old,)).fetchone()
             if _fixed(r):_request_probe(db,old,now)
             reason=boce_dns_gate(db,old,ip,port,require_plan=True,min_created=r['action_started'])
