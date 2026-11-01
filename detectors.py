@@ -1,4 +1,5 @@
 """Replaceable detection sources: BOCE asynchronous tasks or authenticated self-hosted probes."""
+import aliyun_probe
 import hashlib
 import ipaddress
 import json
@@ -225,9 +226,9 @@ def start_run(connect,cipher,sid,scheduled=False):
         if db.execute("SELECT 1 FROM detection_runs WHERE server_id=? AND status IN ('creating','pending','queued','issued')",(sid,)).fetchone():raise IntegrationError('已有检测任务进行中，请勿重复提交')
         now=int(time.time())
         if now<p['next_at']:raise IntegrationError('尚未到下一次检测时间，请避免重复扣费')
-        ip=candidate_ip(db,m,cipher);nodes=json.loads(p['nodes']) if p['kind']=='boce' else ['self']
+        ip=candidate_ip(db,m,cipher);nodes=json.loads(p['nodes']) if p['kind'] in ('boce','aliyun') else ['self']
         if not nodes:raise IntegrationError('请至少选择一个国内检测点')
-        cost=len(nodes) if p['kind']=='boce' else 0
+        cost=len(nodes) if p['kind'] in ('boce','aliyun') else 0
         from datetime import datetime
         from zoneinfo import ZoneInfo
         z=ZoneInfo('Asia/Shanghai');today=datetime.now(z).replace(hour=0,minute=0,second=0,microsecond=0).timestamp()
@@ -250,6 +251,9 @@ def start_run(connect,cipher,sid,scheduled=False):
                     shape='data 类型='+type(payload).__name__+'，id 类型='+type(remote).__name__
                     raise IntegrationError('BOCE 未返回有效任务 ID（'+shape+'）'+('：'+detail if detail else ''))
                 db.execute("UPDATE detection_runs SET remote_id=?,status='pending' WHERE id=?",(remote,rid))
+            elif p['kind']=='aliyun':
+                remote=aliyun_probe.create(source_secret(p,cipher),ip,m['port'],nodes,rid)
+                db.execute("UPDATE detection_runs SET remote_id=?,status='pending' WHERE id=?",(remote,rid))
             else:db.execute("UPDATE detection_runs SET status='queued' WHERE id=?",(rid,))
         except IntegrationError as e:
             # Preserve the safe reason; ambiguous submission is never retried.
@@ -266,10 +270,17 @@ def tick(connect,cipher):
         # Timed-out self probes and expired BOCE jobs never imply target is blocked.
         expired=db.execute("SELECT * FROM detection_runs WHERE status IN ('pending','queued','issued','creating') AND created<?",(now-120,)).fetchall()
         for r in expired:finish(db,r,'检测超时（不能判定目标不通）',[])
-        pending=[dict(r) for r in db.execute("SELECT r.*,s.secret,s.enabled FROM detection_runs r JOIN detection_sources s ON s.id=r.source_id WHERE r.status='pending' AND r.poll_at<=?",(now,))]
+        pending=[dict(r) for r in db.execute("SELECT r.*,s.secret,s.enabled,s.kind FROM detection_runs r JOIN detection_sources s ON s.id=r.source_id WHERE r.status='pending' AND r.poll_at<=?",(now,))]
     for r in pending:
         with connect() as db:db.execute('UPDATE detection_runs SET poll_at=? WHERE id=?',(now+10,r['id']))
         try:
+            if r['kind']=='aliyun':
+                rows=aliyun_probe.poll(source_secret(r,cipher),r['remote_id'],json.loads(r['nodes']),r['created'])
+                if rows is None:continue
+                states=[x['state'] for x in rows]
+                status='阿里云 TCP 可达' if all(x=='reachable' for x in states) else ('阿里云 TCP 均不通（待复核）' if all(x=='unreachable' for x in states) else '阿里云 TCP 部分不通或结果未知')
+                with connect() as db:finish(db,r,status,rows)
+                continue
             data=boce(source_secret(r,cipher),'task/tcping/'+urllib.parse.quote(r['remote_id'],safe=''))
             if type(data.get('done'))is not bool:raise IntegrationError('BOCE 结果格式无效')
             if not data['done']:continue
@@ -409,7 +420,10 @@ def register(app,connect,cipher,auth,body,error,audit):
     @auth(admin=True)
     def detection_save_source():
         d=body();kind=d.get('kind');name=d.get('name','');secret=d.get('secret','');enabled=d.get('enabled',True)
-        if kind not in ('boce','self') or not isinstance(name,str) or not 1<=len(name.strip())<=80 or not isinstance(secret,str) or len(secret)>4096 or type(enabled)is not bool:return error('检测来源格式无效')
+        if kind not in ('boce','self','aliyun') or not isinstance(name,str) or not 1<=len(name.strip())<=80 or not isinstance(secret,str) or len(secret)>4096 or type(enabled)is not bool:return error('检测来源格式无效')
+        if kind=='aliyun' and secret:
+            try:aliyun_probe.credentials(secret)
+            except IntegrationError as e:return error(str(e))
         token=None
         with connect() as db:
             if d.get('id'):
@@ -441,6 +455,9 @@ def register(app,connect,cipher,auth,body,error,audit):
                 valid=sum(1 for r in rows if isinstance(r,dict) and str(r.get('id','')).isdigit())
                 if not valid:raise IntegrationError('BOCE API 可连接，但没有返回可用检测节点')
                 message=f'BOCE API 可用，读取到 {valid} 个检测节点；这只是连通性测试，不会提交收费拨测任务'
+            elif s['kind']=='aliyun':
+                valid=len(aliyun_probe.nodes(source_secret(s,cipher)))
+                message=f'阿里云 API 可用，读取到 {valid} 个大陆节点；未提交拨测任务'
             elif s['kind']=='self':
                 seen=s['last_seen']
                 if not seen or now-int(seen)>35:raise IntegrationError('自建探针未在线：检查探针服务、面板 HTTPS 地址及密钥；在线后等待 10–35 秒再测试')
@@ -457,7 +474,8 @@ def register(app,connect,cipher,auth,body,error,audit):
     def detection_nodes(sid):
         try:
             with connect() as db:s=db.execute('SELECT * FROM detection_sources WHERE id=?',(sid,)).fetchone()
-            if not s or s['kind']!='boce':raise IntegrationError('请选择 BOCE 来源')
+            if s and s['kind']=='aliyun':return jsonify(nodes=aliyun_probe.nodes(source_secret(s,cipher)))
+            if not s or s['kind']!='boce':raise IntegrationError('请选择 BOCE 或阿里云来源')
             result=boce(source_secret(s,cipher),'node/list') # No area parameter => mainland, per official docs.
             rows=result.get('data',{}).get('list')
             if not isinstance(rows,list):raise IntegrationError('节点列表格式异常')
@@ -642,7 +660,7 @@ def register(app,connect,cipher,auth,body,error,audit):
     @auth(admin=True)
     def detection_save_plan(sid):
         d=body();ids=d.get('nodes',[]);interval=d.get('interval_s',600);limit=d.get('daily_limit',1000);automatic=d.get('automatic',False);response_mode=d.get('response_mode','none');action_connection_id=d.get('action_connection_id') or None;failure_threshold=d.get('failure_threshold',3)
-        if not isinstance(ids,list) or len(ids)>20 or any(not str(x).isdigit() for x in ids) or type(interval)is not int or not 120<=interval<=86400 or type(limit)is not int or not 1<=limit<=100000 or type(automatic)is not bool or response_mode not in ('none','reboot','change_api') or type(failure_threshold)is not int or not 2<=failure_threshold<=5:return error('检测节点、频率、上限或自动处理策略无效')
+        if not isinstance(ids,list) or len(ids)>20 or any(not isinstance(x,(str,int)) or not str(x) or len(str(x))>40 for x in ids) or type(interval)is not int or not 120<=interval<=86400 or type(limit)is not int or not 1<=limit<=100000 or type(automatic)is not bool or response_mode not in ('none','reboot','change_api') or type(failure_threshold)is not int or not 2<=failure_threshold<=5:return error('检测节点、频率、上限或自动处理策略无效')
         port=d.get('port')
         if port is not None and (type(port)is not int or not 1<=port<=65535):return error('业务 TCP 端口必须为 1–65535 的整数')
         if response_mode!='none' and not automatic:return error('自动处理必须同时开启定时检测')
@@ -657,7 +675,13 @@ def register(app,connect,cipher,auth,body,error,audit):
             if action_connection_id:
                 action=db.execute('SELECT kind,owner_id FROM ip_connections WHERE id=?',(action_connection_id,)).fetchone()
                 if not action or action['kind']!='change_ip' or action['owner_id'] is not None:return error('请选择管理员的换 IP API 连接')
-            ids=sorted(set(map(str,ids))) if s['kind']=='boce' else ['self']
+            if s['kind']=='boce' and any(not str(x).isdigit() for x in ids):return error('BOCE 节点 ID 必须为数字')
+            if s['kind']=='aliyun':
+                try:
+                    for node in ids:aliyun_probe.node_parts(node)
+                except IntegrationError as e:return error(str(e))
+                if response_mode!='none':return error('阿里云来源当前仅记录检测结果；完成真实账号联调后再启用自动处理')
+            ids=sorted(set(map(str,ids))) if s['kind'] in ('boce','aliyun') else ['self']
             if not ids:return error('请填写至少一个节点 ID')
             db.execute('INSERT OR IGNORE INTO ip_monitors(server_id,port) VALUES(?,?)',(sid,port or 443))
             if port is not None:db.execute('UPDATE ip_monitors SET port=? WHERE server_id=?',(port,sid))
