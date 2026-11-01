@@ -118,7 +118,9 @@ def dhcp_config():
     cfg=json.loads(DHCP_CONFIG.read_text())
     iface=cfg.get('interface','')
     if cfg.get('enabled') is not True or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,14}',iface):raise ValueError('DHCP 未在本机启用')
-    if not (Path('/sys/class/net')/iface).exists() or not shutil.which('dhclient'):raise ValueError('缺少网卡或 dhclient')
+    manager=cfg.get('manager','dhclient')
+    if manager not in ('dhclient','dhcpcd'):raise ValueError('不支持的 DHCP 管理器')
+    if not (Path('/sys/class/net')/iface).exists() or not shutil.which(manager):raise ValueError('缺少网卡或 '+manager)
     return cfg
 
 def dhcp_address(iface):
@@ -141,6 +143,51 @@ def dhcp_clients(iface,cleanup_unscoped=False,root=Path('/proc')):
         if iface in args[1:] or (cleanup_unscoped and args[1:]==['-v']):result.append((int(path.name),args))
     return result
 
+def dhcpcd_clients(iface,root=Path('/proc')):
+    # Only the interface master, never privileged/network/DHCP6 helper titles.
+    found=[]
+    pattern=re.compile(r'^dhcpcd: '+re.escape(iface)+r' \[ip4\](?: \[ip6\])?$')
+    for path in root.iterdir():
+        if not path.name.isdecimal():continue
+        try:
+            if (path/'exe').resolve().name!='dhcpcd':continue
+            title=(path/'cmdline').read_bytes().split(b'\0')[0].decode().strip()
+        except (OSError,UnicodeError):continue
+        if pattern.fullmatch(title):found.append((int(path.name),title))
+    return found
+
+def dhcp_manager(iface):
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,14}',iface):raise ValueError('无效网卡')
+    classic=dhcp_clients(iface,True);modern=dhcpcd_clients(iface)
+    if classic and modern:raise ValueError('同一网卡同时有 dhclient 与 dhcpcd，拒绝自动操作')
+    if modern:
+        if len(modern)!=1:raise ValueError('无法唯一确认 dhcpcd 主进程')
+        version=subprocess.run([shutil.which('dhcpcd'),'--version'],check=True,capture_output=True,text=True,timeout=5).stdout
+        if not re.search(r'\bdhcpcd 10\.',version):raise ValueError('仅支持已核对的 dhcpcd 10.x 控制协议')
+        return 'dhcpcd'
+    if classic:return 'dhclient'
+    raise ValueError('未发现目标网卡的 DHCP 主进程，拒绝猜测网络管理方式')
+
+def dhcpcd_rebind(iface,client_id=None):
+    masters=dhcpcd_clients(iface)
+    if len(masters)!=1:raise ValueError('dhcpcd 主进程不存在或不唯一，保留配置等待人工检查')
+    args=[shutil.which('dhcpcd'),'-n']
+    # -4 on a dual-stack rebind would change its configuration to IPv4-only.
+    # Preserve dual-stack mode; IPv6 may revalidate, but is never released.
+    if '[ip6]' not in masters[0][1]:args+=['-4']
+    if client_id:args+=['-I',client_id,'-y','0']
+    args+=[iface]
+    if not dhcp_run(args,timeout=15):raise ValueError('dhcpcd 重新申请请求失败')
+
+def dhcpcd_cycle(iface):
+    if len(dhcpcd_clients(iface))!=1 or dhcp_clients(iface,True):raise ValueError('DHCP 管理器变化或冲突，停止操作')
+    # AF_INET release leaves the manager and DHCPv6 alive; never kill helpers.
+    if not dhcp_run([shutil.which('dhcpcd'),'-4','-k',iface],timeout=15):raise ValueError('dhcpcd IPv4 释放请求失败')
+    time.sleep(2)
+    identity='01:'+':'.join(f'{x:02x}' for x in os.urandom(6))
+    dhcpcd_rebind(iface,identity)
+
+
 def dhcp_run(args,timeout=45):
     # Kill a timed-out invocation's process group, not unrelated DHCP clients.
     child=subprocess.Popen(args,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
@@ -158,6 +205,9 @@ def dhcp_lease_path(iface):return Path(f'/var/lib/dhcp/dhclient.{iface}.leases')
 def dhcp_client_unit(iface):return 'hksdan-dhcp-client-'+iface
 
 def dhcp_background(iface,cfg):
+    if cfg.get('manager')=='dhcpcd':
+        if not dhcp_address(iface):dhcpcd_rebind(iface)
+        return
     # The lease owner must outlive both the action and recovery transient units.
     if dhcp_clients(iface,cfg.get('cleanup_unscoped') is True):return
     unit=dhcp_client_unit(iface)
@@ -168,9 +218,10 @@ def dhcp_background(iface,cfg):
         '-pf',f'/run/dhclient.{iface}.pid','-lf',str(dhcp_lease_path(iface)),iface],
         check=True,capture_output=True,timeout=15)
 
-def dhcp_stable(iface,address):
+def dhcp_stable(iface,address,cfg=None):
     for _ in range(6):
-        if dhcp_address(iface)!=address or not dhcp_clients(iface):return False
+        clients=dhcpcd_clients(iface) if cfg and cfg.get('manager')=='dhcpcd' else dhcp_clients(iface)
+        if dhcp_address(iface)!=address or not clients:return False
         route=subprocess.run(['ip','-4','route','show','default','dev',iface],capture_output=True,text=True,timeout=5,check=True).stdout.strip()
         if not route:return False
         time.sleep(2)
@@ -201,28 +252,31 @@ def dhcp_task(cid):
             while True:
                 result['attempts']+=1
                 dhcp_write(result)
-                clients=dhcp_clients(iface,cfg.get('cleanup_unscoped') is True)
-                subprocess.run(['systemctl','stop',dhcp_client_unit(iface)],capture_output=True,timeout=15,check=False)
-                dhcp_run([shutil.which('dhclient'),'-4','-r','-pf',f'/run/dhclient.{iface}.pid','-lf',f'/var/lib/dhcp/dhclient.{iface}.leases',iface],timeout=10)
-                for pid,args in clients:
-                    try:
-                        current=[x.decode() for x in (Path('/proc')/str(pid)/'cmdline').read_bytes().split(b'\0') if x]
-                        if current==args:os.kill(pid,signal.SIGTERM)
-                    except (OSError,UnicodeError):pass
-                time.sleep(3)
-                if dhcp_clients(iface,cfg.get('cleanup_unscoped') is True):raise ValueError('仍有 DHCP 客户端未退出')
-                # Remove only this interface's IPv4 lease; preserve IPv6 and other NICs.
-                lease=dhcp_lease_path(iface)
-                if lease.exists():
-                    backup=DHCP_STATE/'dhcp-lease.backup';backup.write_bytes(lease.read_bytes());backup.chmod(0o600)
-                    lease.unlink()
-                dhcp_background(iface,cfg)
+                if cfg.get('manager')=='dhcpcd':
+                    dhcpcd_cycle(iface)
+                else:
+                    clients=dhcp_clients(iface,cfg.get('cleanup_unscoped') is True)
+                    subprocess.run(['systemctl','stop',dhcp_client_unit(iface)],capture_output=True,timeout=15,check=False)
+                    dhcp_run([shutil.which('dhclient'),'-4','-r','-pf',f'/run/dhclient.{iface}.pid','-lf',f'/var/lib/dhcp/dhclient.{iface}.leases',iface],timeout=10)
+                    for pid,args in clients:
+                        try:
+                            current=[x.decode() for x in (Path('/proc')/str(pid)/'cmdline').read_bytes().split(b'\0') if x]
+                            if current==args:os.kill(pid,signal.SIGTERM)
+                        except (OSError,UnicodeError):pass
+                    time.sleep(3)
+                    if dhcp_clients(iface,cfg.get('cleanup_unscoped') is True):raise ValueError('仍有 DHCP 客户端未退出')
+                    # Remove only this interface's IPv4 lease; preserve IPv6 and other NICs.
+                    lease=dhcp_lease_path(iface)
+                    if lease.exists():
+                        backup=DHCP_STATE/'dhcp-lease.backup';backup.write_bytes(lease.read_bytes());backup.chmod(0o600)
+                        lease.unlink()
+                    dhcp_background(iface,cfg)
                 for _ in range(15):
                     time.sleep(2)
                     if dhcp_address(iface):break
                 new=dhcp_address(iface);result['new_ip']=new
                 if new and new!=old and new.startswith('42.'):
-                    if dhcp_stable(iface,new):
+                    if dhcp_stable(iface,new,cfg):
                         result['state']='changed';break
                 if not new:dhcp_background(iface,cfg)
                 time.sleep(5)
@@ -242,7 +296,9 @@ def dispatch_dhcp(cid):
     subprocess.run(['systemd-run','--unit=hksdan-dhcp-'+str(cid),'--collect','/usr/bin/python3',str(Path(__file__).resolve()),'--dhcp-task',str(cid)],check=True,timeout=10,capture_output=True)
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--once',action='store_true');p.add_argument('--config',default='/etc/hk-sdan-agent/config.json');p.add_argument('--dhcp-task',type=int);p.add_argument('--dhcp-recover',action='store_true');a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--once',action='store_true');p.add_argument('--config',default='/etc/hk-sdan-agent/config.json');p.add_argument('--dhcp-task',type=int);p.add_argument('--dhcp-recover',action='store_true');p.add_argument('--dhcp-detect');a=p.parse_args()
+    if a.dhcp_detect:
+        print(dhcp_manager(a.dhcp_detect));return
     if a.dhcp_recover:dhcp_recover();return
     if a.dhcp_task is not None:
         if a.dhcp_task<1:raise SystemExit('无效任务')

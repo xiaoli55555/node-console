@@ -215,6 +215,45 @@ class DHCPExecutor(unittest.TestCase):
         with patch.object(agent,'dhcp_address',return_value='1.1.1.1'),patch.object(agent,'dhcp_clients',return_value=[(1,[])]),patch.object(agent.subprocess,'run',return_value=SimpleNamespace(stdout='')),patch.object(agent.time,'sleep'):
             self.assertFalse(agent.dhcp_stable('ens18','1.1.1.1'))
 
+    def test_dhcpcd_selects_only_verified_interface_master(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);binary=root/'dhcpcd';binary.write_text('')
+            titles={1:'dhcpcd: ens18 [ip4] [ip6]',2:'dhcpcd: [privileged proxy] ens18 [ip4] [ip6]',3:'dhcpcd: [DHCP6 proxy] fe80::1',4:'dhcpcd: eth0 [ip4] [ip6]',5:'dhcpcd: [BOOTP proxy] 1.1.1.1',6:'dhcpcd: ens18 [ip4] [ip6]'}
+            other=root/'echo';other.write_text('')
+            for pid,title in titles.items():
+                path=root/str(pid);path.mkdir();(path/'cmdline').write_bytes(title.encode()+b'\0');(path/'exe').symlink_to(other if pid==6 else binary)
+            self.assertEqual(agent.dhcpcd_clients('ens18',root),[(1,titles[1])])
+    def test_dhcpcd_ipv4_release_keeps_dual_stack_rebind_and_never_kills(self):
+        master=[(690,'dhcpcd: ens18 [ip4] [ip6]')]
+        with patch.object(agent,'dhcpcd_clients',return_value=master),patch.object(agent,'dhcp_clients',return_value=[]),patch.object(agent,'dhcp_run',return_value=True) as run,patch.object(agent.shutil,'which',return_value='/usr/sbin/dhcpcd'),patch.object(agent.time,'sleep'),patch.object(agent.os,'kill') as kill:
+            agent.dhcpcd_cycle('ens18')
+            self.assertEqual(run.call_args_list[0].args[0],['/usr/sbin/dhcpcd','-4','-k','ens18'])
+            rebind=run.call_args_list[1].args[0]
+            self.assertIn('-n',rebind);self.assertIn('-I',rebind);self.assertNotIn('-4',rebind);self.assertNotIn('-6',rebind)
+            self.assertEqual(rebind[-1],'ens18');kill.assert_not_called()
+    def test_dhcpcd_mixed_managers_are_rejected_before_release(self):
+        with patch.object(agent,'dhcpcd_clients',return_value=[(690,'dhcpcd: ens18 [ip4] [ip6]')]),patch.object(agent,'dhcp_clients',return_value=[(9,['dhclient','ens18'])]),patch.object(agent,'dhcp_run') as run:
+            with self.assertRaises(ValueError):agent.dhcpcd_cycle('ens18')
+            with self.assertRaises(ValueError):agent.dhcp_manager('ens18')
+            run.assert_not_called()
+    def test_dhcpcd_missing_manager_does_not_start_new_daemon(self):
+        with patch.object(agent,'dhcpcd_clients',return_value=[]),patch.object(agent,'dhcp_run') as run:
+            with self.assertRaises(ValueError):agent.dhcpcd_rebind('ens18')
+            run.assert_not_called()
+    def test_dhcpcd_task_preserves_classic_leases_and_obeys_42_policy(self):
+        state,run=self.run_task(['112.118.57.212','119.236.115.55','119.236.115.55','42.98.100.156','42.98.100.156'])
+        with patch.object(agent,'dhcp_config',return_value={'interface':'ens18','manager':'dhcpcd'}),patch.object(agent,'dhcpcd_cycle') as cycle:
+            agent.dhcp_task(101)
+        result=json.loads((state/'dhcp-result.json').read_text())
+        self.assertEqual(result['state'],'changed');self.assertEqual(cycle.call_count,2)
+        self.assertTrue((state/'ens18.leases').exists());run.assert_not_called()
+    def test_dhcpcd_detection_requires_v10(self):
+        from types import SimpleNamespace
+        with patch.object(agent,'dhcpcd_clients',return_value=[(690,'dhcpcd: ens18 [ip4] [ip6]')]),patch.object(agent,'dhcp_clients',return_value=[]),patch.object(agent.shutil,'which',return_value='/usr/sbin/dhcpcd'),patch.object(agent.subprocess,'run',return_value=SimpleNamespace(stdout='dhcpcd 10.1.0\n')) as run:
+            self.assertEqual(agent.dhcp_manager('ens18'),'dhcpcd')
+            run.return_value.stdout='dhcpcd 9.4.1'
+            with self.assertRaises(ValueError):agent.dhcp_manager('ens18')
+
     def test_local_opt_in_required_before_launching_any_task(self):
         with patch.object(agent,'dhcp_config',side_effect=ValueError('disabled')),patch.object(agent.subprocess,'run') as run:
             with self.assertRaises(ValueError):agent.dispatch_dhcp(1)
