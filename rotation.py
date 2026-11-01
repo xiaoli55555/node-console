@@ -439,6 +439,7 @@ def _preferred_rotation_ip(db,sid,ip):
 def _fixed_ready(db,cipher,r,sid,now,verified_candidate=None):
     rotation_groups.target_guard(db,r,sid)
     if _offline(db,sid,now,r['offline_after_s']):raise IntegrationError('目标 VPS 心跳已超时，不能接替')
+    if not _fixed(r) and r['phase']=='draining' and r['drain_server_id']==sid:raise IntegrationError('旧 VPS 尚未完成排空、换 IP 和复检，不能重新承载')
     if r['phase'] in ('waiting_ip','waiting_probe') and r['drain_server_id']==sid:raise IntegrationError('目标 VPS 的换 IP / 复检尚未结束，不能接替')
     if _pending_action(db,sid,verified_candidate):raise IntegrationError('目标 VPS 有未结束的重启或换 IP 动作，不能接替')
     ip,port,metrics=_fresh_ip(db,sid,now,cipher)
@@ -591,6 +592,8 @@ def _dns_switch(connect,cipher,rotation,now,emergency=False,offline=False):
         if not binding:raise IntegrationError('轮换 DNS 绑定已删除')
         conn=load_connection(db,cipher,binding['connection_id'])
         target=r['other_server_id'] if r['active_server_id']==r['primary_server_id'] else r['primary_server_id']
+        if not _fixed(r) and r['phase']=='draining' and r['drain_server_id']==target:
+            raise IntegrationError('旧 VPS 尚未完成排空、换 IP 和复检，不能重新承载')
         _validated_plan(db,target,r['owner_id'])
         if emergency and not _fixed(r):_original_emergency_probe(db,r,target,now)
         _fixed_ready(db,cipher,r,target,now)
@@ -691,7 +694,7 @@ def _run_rotation(connect,cipher,rid,now):
             if healthy:
                 db.execute('UPDATE vps_rotations SET emergency_probe_after=NULL WHERE id=?',(rid,))
                 r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
-        if not _fixed(r) and r['phase'] in ('active','draining') and _offline(db,r['active_server_id'],now,r['offline_after_s']):
+        if not _fixed(r) and r['phase']=='active' and _offline(db,r['active_server_id'],now,r['offline_after_s']):
             target=r['other_server_id'] if r['active_server_id']==r['primary_server_id'] else r['primary_server_id']
             if _offline(db,target,now,r['offline_after_s']):raise IntegrationError('当前机和备用机均离线，没有可用备用机；保持 DNS 并等待恢复')
             last=db.execute('SELECT MAX(created) FROM detection_runs WHERE server_id=?',(target,)).fetchone()[0]
@@ -699,7 +702,7 @@ def _run_rotation(connect,cipher,rid,now):
                 db.execute('UPDATE detection_plans SET next_at=MIN(next_at,?) WHERE server_id=?',(now,target));db.commit()
             _dns_switch(connect,cipher,rid,now,emergency=True,offline=True)
             r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
-        if not _fixed(r) and r['phase'] in ('active','draining') and _failed_ip(db,r['active_server_id'],now):
+        if not _fixed(r) and r['phase']=='active' and _failed_ip(db,r['active_server_id'],now):
             target=r['other_server_id'] if r['active_server_id']==r['primary_server_id'] else r['primary_server_id']
             if not _failed_ip(db,target,now):
                 last=db.execute('SELECT MAX(created) FROM detection_runs WHERE server_id=?',(target,)).fetchone()[0]
@@ -837,6 +840,11 @@ def _run_rotation(connect,cipher,rid,now):
         elif r['phase']=='waiting_probe':
             try:ip,port,_=_fresh_ip(db,old,now,cipher)
             except IntegrationError as e:db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',(str(e),now,rid));return
+            if ip==r['old_ip'] and not (_fixed(r) and old==r['primary_server_id']):
+                message='候选 IP 已回退到旧 IP，换 IP 未完成；重新排空并重试，暂不加入轮换'
+                db.execute("UPDATE vps_rotations SET phase='draining',new_ip=NULL,action_started=NULL,last_sample_at=NULL,low_samples=?,status=?,updated=? WHERE id=?",(2 if r['emergency'] else 0,message,now,rid))
+                _event(db,rid,old,message,now)
+                return
             if ip!=r['new_ip']:
                 db.execute('UPDATE vps_rotations SET new_ip=?,action_started=?,status=?,updated=? WHERE id=?',(ip,now,'备用 VPS IP 再次变化，等待新一轮 BOCE 复检',now,rid));return
             try:_preferred_rotation_ip(db,old,ip)

@@ -33,11 +33,12 @@ class RotationConditions(unittest.TestCase):
     def test_normal_deadline_calls_dns_switch(self):
         with patch('rotation._failed_ip',return_value=False),patch('rotation._dns_switch') as switch:
             rotation._run_rotation(self.connect,None,1,1000);switch.assert_called_once_with(self.connect,None,1,1000)
-    def test_new_active_fails_during_drain_attempts_return(self):
+    def test_new_active_fails_during_drain_does_not_republish_unrenewed_old_machine(self):
         with self.connect() as db:db.execute("UPDATE vps_rotations SET phase='draining',drain_server_id=2")
-        with patch('rotation._failed_ip',side_effect=[True,False]),patch('rotation._dns_switch',side_effect=IntegrationError('simulated')) as switch:
-            with self.assertRaises(IntegrationError):rotation._run_rotation(self.connect,None,1,950)
-            self.assertTrue(switch.call_args.kwargs['emergency'])
+        with patch('rotation._failed_ip',side_effect=lambda db,sid,now:sid==1),patch('rotation._validated_plan',side_effect=IntegrationError('await repair')),patch('rotation._dns_switch') as switch:
+            rotation._run_rotation(self.connect,None,1,950)
+            switch.assert_not_called()
+        self.assertEqual(self.row()['drain_server_id'],2)
     def test_failure_during_standby_ip_change_does_not_deadlock_recovery(self):
         with self.connect() as db:db.execute("UPDATE vps_rotations SET phase='waiting_ip',drain_server_id=2,old_ip='8.8.8.8',action_started=940")
         with patch('rotation._failed_ip',return_value=True),patch('rotation._fresh_ip',return_value=('9.9.9.9',443,{})),patch('rotation._dns_switch') as switch:
@@ -45,7 +46,7 @@ class RotationConditions(unittest.TestCase):
         self.assertEqual(self.row()['phase'],'waiting_probe')
     def test_old_machine_failure_skips_drain_grace(self):
         with self.connect() as db:db.execute("UPDATE vps_rotations SET phase='draining',drain_server_id=2,drain_started=940,drain_grace_s=600")
-        with patch('rotation._failed_ip',side_effect=[False,True]),patch('rotation._validated_plan'),patch('rotation._fresh_ip',side_effect=IntegrationError('no report')):
+        with patch('rotation._failed_ip',return_value=True),patch('rotation._validated_plan'),patch('rotation._fresh_ip',side_effect=IntegrationError('no report')):
             rotation._run_rotation(self.connect,None,1,950)
         self.assertEqual(self.row()['emergency'],1);self.assertEqual(self.row()['drain_grace_s'],0)
     def test_failed_new_ip_reenters_immediate_replacement(self):
