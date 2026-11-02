@@ -68,7 +68,7 @@ def initialize(connect):
 
         if 'offline_after_s' not in {r[1] for r in db.execute('PRAGMA table_info(vps_rotations)')}:db.execute('ALTER TABLE vps_rotations ADD COLUMN offline_after_s INTEGER NOT NULL DEFAULT 15')
         columns={r[1] for r in db.execute('PRAGMA table_info(vps_rotations)')}
-        for name,definition in [('mode',"TEXT NOT NULL DEFAULT 'alternating'"),('takeover_s','INTEGER NOT NULL DEFAULT 600'),('first_switch_at','INTEGER'),('mobile_only_ack','INTEGER NOT NULL DEFAULT 0'),('dns_intent','TEXT'),('fault_recovery','INTEGER NOT NULL DEFAULT 0'),('reboot_command_id','INTEGER'),('emergency_probe_after','INTEGER')]:
+        for name,definition in [('mode',"TEXT NOT NULL DEFAULT 'alternating'"),('takeover_s','INTEGER NOT NULL DEFAULT 600'),('first_switch_at','INTEGER'),('mobile_only_ack','INTEGER NOT NULL DEFAULT 0'),('dns_intent','TEXT'),('fault_recovery','INTEGER NOT NULL DEFAULT 0'),('reboot_command_id','INTEGER'),('emergency_probe_after','INTEGER'),('standby_ready_at','INTEGER'),('standby_ready_server','INTEGER'),('preload_refresh_deadline','INTEGER')]:
             if name not in columns:db.execute(f'ALTER TABLE vps_rotations ADD COLUMN {name} {definition}')
         failover.initialize(db)
 
@@ -683,6 +683,7 @@ def _dns_switch(connect,cipher,rotation,now,emergency=False,offline=False):
             if r['active_server_id']==r['other_server_id'] and not (emergency and not offline):
                 db.execute('UPDATE vps_rotations SET emergency=0,low_samples=0,drain_grace_s=? WHERE id=?',(ttl+60,rotation))
         if emergency:db.execute('UPDATE vps_rotations SET fault_recovery=1 WHERE id=?',(rotation,))
+        db.execute('UPDATE vps_rotations SET standby_ready_at=NULL,standby_ready_server=NULL,preload_refresh_deadline=NULL WHERE id=?',(rotation,))
         _drain_timing(db,db.execute('SELECT * FROM vps_rotations WHERE id=?',(rotation,)).fetchone(),now,start=True)
         _event(db,rotation,r['active_server_id'],message,now)
 
@@ -755,6 +756,17 @@ def _run_rotation(connect,cipher,rid,now):
                 address,_,_=_fresh_ip(db,standby,now,cipher)
                 db.execute("UPDATE vps_rotations SET phase='draining',drain_server_id=?,old_ip=?,drain_started=?,drain_grace_s=0,emergency=1,low_samples=2,status=? WHERE id=?",(standby,address,now,'备用 IP 不通，保持当前 DNS 并主动修复备用机',rid))
                 if _fixed(r) and standby==r['other_server_id']:db.execute('UPDATE vps_rotations SET emergency=0,low_samples=0,last_sample_at=NULL WHERE id=?',(rid,))
+                return
+            # Refresh an already prepared, idle standby once in the final five
+            # minutes. Reuse the ordinary drain/action/probe gates, without DNS writes.
+            ready=r['standby_ready_at']
+            if (0<r['next_switch_at']-now<=300 and r['standby_ready_server']==standby
+                    and ready is not None and ready<r['next_switch_at']-300
+                    and r['preload_refresh_deadline']!=r['next_switch_at']):
+                address,_,_=_fresh_ip(db,standby,now,cipher)
+                message='承载前 5 分钟刷新备用 IP：重新确认连续两次 TCP 低于阈值，再换 IP 并复检；保留原定切换时间'
+                db.execute("UPDATE vps_rotations SET phase='draining',drain_server_id=?,drain_started=?,drain_grace_s=0,old_ip=?,new_ip=NULL,action_started=NULL,reboot_command_id=NULL,last_sample_at=NULL,low_samples=0,emergency=0,preload_refresh_deadline=?,status=?,updated=? WHERE id=?",(standby,now,address,r['next_switch_at'],message,now,rid))
+                _event(db,rid,standby,message,now)
                 return
             if r['next_switch_at']-now<=max(60,r['lead_s']):
                 for sid in (r['active_server_id'],standby):
@@ -912,6 +924,7 @@ def _run_rotation(connect,cipher,rid,now):
             message=f'旧 VPS #{old} 已换到 {ip}，业务端口及 BOCE 复检通过；已重新加入轮换'
             db.execute("UPDATE vps_rotations SET phase='active',emergency=0,drain_server_id=NULL,drain_started=NULL,drain_grace_s=0,old_ip=NULL,new_ip=NULL,action_started=NULL,reboot_command_id=NULL,last_sample_at=NULL,low_samples=0,next_switch_at=?,status=?,updated=? WHERE id=?",(next_at,message,now,rid))
             db.execute('UPDATE vps_rotations SET fault_recovery=0 WHERE id=?',(rid,))
+            if not _fixed(r):db.execute('UPDATE vps_rotations SET standby_ready_at=?,standby_ready_server=? WHERE id=?',(now,old,rid))
             _event(db,rid,old,message,now)
             if _fixed(r) and old==r['other_server_id'] and r['enabled'] and r['active_server_id']==r['primary_server_id']:
                 db.commit()

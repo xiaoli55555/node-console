@@ -45,7 +45,7 @@ class InsightStatistics(unittest.TestCase):
         self.assertEqual(r['dns']['proxied_unobservable'],1);self.assertEqual(r['dns']['trials_without_observations'],1);self.assertEqual(r['dns']['provider_readback']['p95_s'],3)
 
     def test_recovery_stages_are_separate_from_dns_propagation(self):
-        before={'id':1,'action_attempts':0,'drain_server_id':2,'phase':'draining','action_started':None,'old_ip':'1.1.1.1','emergency':0,'fault_recovery':0}
+        before={'id':1,'action_attempts':0,'drain_server_id':2,'phase':'draining','action_started':None,'old_ip':'1.1.1.1','emergency':0,'fault_recovery':0,'next_switch_at':200}
         sent=dict(before,action_attempts=1,phase='waiting_ip',action_started=100)
         seen=dict(sent,phase='waiting_probe',new_ip='8.8.8.8')
         ready=dict(seen,phase='active',drain_server_id=None)

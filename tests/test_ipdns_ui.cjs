@@ -198,3 +198,7 @@ test('overdue draining keeps deadline visible instead of promising a fresh cycle
  const html=ctx.rotationLiveMarkup({enabled:1,phase:'draining',next_switch_at:1,active_name:'A'});
  assert.match(html,/已到轮换时间，等待备用机换 IP 并复检；就绪后切换/);
 });
+test('preload refresh has a separate cause and observed change count',()=>{
+ const html=ctx.rotationIPActionMarkup({ip_actions:[{reason:'preload_refresh',old_ip:'1.1.1.1',new_ip:'8.8.8.8',ip_seen:10,started:1,attempt:1}]});
+ assert.match(html,/承载前 5 分钟补换 IP/);assert.match(html,/承载前补换：1 次/);assert.match(html,/定时轮换：0 次/);
+});

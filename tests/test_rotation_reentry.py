@@ -85,3 +85,40 @@ class ReentryGate(unittest.TestCase):
         self.assertEqual(f.row()['phase'],'waiting_probe')
         self.assertEqual(f.row()['next_switch_at'],deadline)
         self.assertEqual(f.value('mobile'),'8.8.8.8')
+    def test_early_ready_standby_refreshes_once_five_minutes_before_handoff(self):
+        f=self.f;deadline=f.clock[0]+600;self.ready_standby(deadline)
+        f.mocks[0].side_effect=lambda db,cipher,cid:{'kind':db.execute('SELECT kind FROM ip_connections WHERE id=?',(cid,)).fetchone()[0]}
+        f.tick();self.assertEqual(f.row()['standby_ready_server'],f.sid('B'))
+        f.advance(299,online=('A','B'));f.tick();self.assertEqual(f.row()['phase'],'active')
+        f.advance(1,online=('A','B'));f.tick()
+        self.assertEqual(f.row()['phase'],'draining');self.assertEqual(f.row()['emergency'],0)
+        self.assertEqual(f.row()['preload_refresh_deadline'],deadline)
+        self.assertEqual(f.row()['next_switch_at'],deadline);self.assertEqual(f.value('mobile'),'8.8.8.8')
+        f.tick();self.assertEqual(f.row()['low_samples'],1);f.change.assert_not_called()
+        f.advance(15,online=('A','B'));f.tick();self.assertEqual(f.row()['phase'],'waiting_ip')
+        self.assertEqual(f.change.call_count,1)
+        f.advance(15,online=('A','B'));f.refresh('B',ip='1.0.0.1');f.tick()
+        f.advance(15,online=('A','B'));f.tick();self.assertEqual(f.row()['phase'],'active')
+        f.tick();f.tick();self.assertEqual(f.change.call_count,1)
+        self.assertEqual(f.value('mobile'),'8.8.8.8');self.assertEqual(f.row()['next_switch_at'],deadline)
+        f.advance(deadline-f.clock[0],online=('A','B'));f.tick()
+        self.assertEqual(f.value('mobile'),'1.0.0.1')
+        self.assertIsNone(f.row()['preload_refresh_deadline'])
+
+    def test_recently_recovered_standby_does_not_refresh_again_in_final_window(self):
+        f=self.f;deadline=f.clock[0]+200;self.ready_standby(deadline)
+        f.tick();f.tick();f.tick()
+        self.assertEqual(f.row()['phase'],'active');f.change.assert_not_called()
+        self.assertEqual(f.row()['next_switch_at'],deadline)
+
+    def test_preload_refresh_still_waits_for_connection_threshold(self):
+        import json
+        f=self.f;deadline=f.clock[0]+600;self.ready_standby(deadline);f.tick()
+        f.advance(300,online=('A','B'));f.tick()
+        with server.connect() as db:
+            row=db.execute('SELECT metrics FROM servers WHERE id=?',(f.sid('B'),)).fetchone()
+            metrics=json.loads(row['metrics']);metrics['tcp']=1000
+            db.execute('UPDATE servers SET metrics=? WHERE id=?',(json.dumps(metrics),f.sid('B')))
+        f.tick();f.tick()
+        self.assertEqual(f.row()['phase'],'draining');self.assertEqual(f.row()['low_samples'],0)
+        f.change.assert_not_called();self.assertEqual(f.value('mobile'),'8.8.8.8')

@@ -61,7 +61,7 @@ def record_progress(db,before,after,now):
     if after['action_attempts']>before['action_attempts'] and after['drain_server_id']:
         sid=after['drain_server_id'];old_ip=after['old_ip']
         incident=db.execute('SELECT 1 FROM detection_incidents WHERE server_id=? AND ip=? AND confirmed_at IS NOT NULL AND confirmed_at<=? AND (closed_at IS NULL OR closed_at>=?) LIMIT 1',(sid,old_ip,now,now)).fetchone()
-        reason='probe_failure' if incident else ('unknown' if after['emergency'] or after['fault_recovery'] else 'scheduled_rotation')
+        reason='probe_failure' if incident else ('unknown' if after['emergency'] or after['fault_recovery'] else ('preload_refresh' if dict(after).get('preload_refresh_deadline')==after['next_switch_at'] else 'scheduled_rotation'))
         db.execute('INSERT OR IGNORE INTO rotation_recovery_timings(rotation_id,attempt,server_id,started,reason,old_ip) VALUES(?,?,?,?,?,?)',(after['id'],after['action_attempts'],sid,after['action_started'] or now,reason,old_ip))
     sid=after['drain_server_id'] or before['drain_server_id']
     if sid and after['phase']=='waiting_probe' and before['phase']!='waiting_probe':
