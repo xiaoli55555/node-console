@@ -1,5 +1,5 @@
 const test=require('node:test'),assert=require('node:assert/strict'),vm=require('node:vm'),fs=require('node:fs');
-const source=fs.readFileSync('web/ipdns.js','utf8');const ctx=vm.createContext({esc:v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),console});vm.runInContext(source,ctx);
+const source=fs.readFileSync('web/ipdns.js','utf8');const ctx=vm.createContext({page:'rotations',esc:v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),console});vm.runInContext(source,ctx);
 test('carrier timers use server time, advance without mutating response and separate deadlines',()=>{
  let now=500000;const clockCtx=vm.createContext({esc:String,Date:class extends Date{static now(){return now;}}});vm.runInContext(source,clockCtx);
  const r={enabled:1,timing:{server_now:1000,current:{started:900,censored:0},switch_deadline:990,drain_timeout_at:1030,force_threshold:200,action_observe_until:995}};
@@ -87,7 +87,7 @@ test('admin rotation form prechecks and saves the selected telecom record withou
  const form={mode:{value:'fixed_primary'},takeover_minutes:{value:'10'},first_switch:{value:''},mobile_only_ack:{checked:true},failover_server_id:{value:''},failover_recovery_s:{value:'60'},primary_server_id:{value:'1'},other_server_id:{value:'2'},binding_id:{value:'12'},interval_minutes:{value:'120'},lead_minutes:{value:'2'},offline_after_s:{value:'15'},connection_threshold:{value:'80'},enabled:{checked:true}};
  const elements={adminRotationForm:form,backAdminRotations:{},checkAdminRotation:{},adminRotationChecks:{},adminRotationError:{}};
  let html='',refreshed=0;const calls=[];
- ctx.$=id=>elements[id];ctx.modal=value=>{html=value;};ctx.bindFailoverChoices=()=>{};ctx.notice=()=>{};ctx.loadAdminRotations=async()=>{refreshed++;};
+ ctx.$=id=>elements[id];ctx.renderRotationPage=value=>{html=value;};ctx.bindFailoverChoices=()=>{};ctx.notice=()=>{};ctx.loadAdminRotations=async()=>{refreshed++;};
  ctx.api=async(path,method,body)=>{calls.push({path,method,body});return {checks:[{ok:true,name:'线路',message:'telecom'}],recommended_lead_s:660};};
  ctx.editAdminRotation({servers:[{id:1,name:'A'},{id:2,name:'B'}],bindings:[{id:11,server_id:1,rr:'edge',domain:'example.com',line:'mobile',expected_ip:'8.8.8.8',credential_owner:null},{id:12,server_id:1,rr:'edge',domain:'example.com',line:'telecom',expected_ip:'8.8.8.8',credential_owner:null}]},null);
  assert.match(html,/固定主机＋定时线路轮换/);assert.match(form.binding_id.innerHTML,/电信（telecom）/);
@@ -99,12 +99,12 @@ test('admin rotation form prechecks and saves the selected telecom record withou
 
 test('admin lifecycle buttons submit pause resume delete and recover after a failed delete',async()=>{
  // Fresh VM avoids replacing the form test's loader.
- const env=vm.createContext({esc:ctx.esc,console});vm.runInContext(source,env);
+ const env=vm.createContext({esc:ctx.esc,console,page:'rotations',clearInterval(){}});vm.runInContext(source,env);
  const r={id:5,primary_server_id:1,other_server_id:2,binding_id:12,primary_name:'A',other_name:'B',active_name:'B',mode:'fixed_primary',enabled:1,interval_s:7200,lead_s:0,offline_after_s:15,connection_threshold:80,events:[]};
  const buttons=['edit','toggle','delete'].map(name=>({dataset:{['rotation'+name[0].toUpperCase()+name.slice(1)]:String(r.id)},name}));
  const message={};let rejectDelete=true,removed=false;const calls=[];
  env.document={querySelectorAll(selector){return buttons.filter(b=>selector.includes('-'+b.name+']'));}};
- env.$=()=>message;env.modal=()=>{};env.startAdminRotationLive=()=>{};env.confirm=()=>true;
+ env.$=()=>message;env.renderRotationPage=()=>{};env.startAdminRotationLive=()=>{};env.confirm=()=>true;
  env.api=async(path,method,body)=>{calls.push({path,method,body});if(path==='admin/rotations')return {rotations:removed?[]:[r]};if(method==='PUT'){r.enabled=body.enabled;return {};}if(method==='DELETE'){if(rejectDelete)throw Error('轮换动作正在提交，请稍后重试删除');removed=true;return {};}};
  await env.loadAdminRotations();await buttons[1].onclick();assert.equal(r.enabled,false);
  await buttons[1].onclick();assert.equal(r.enabled,true);
@@ -127,7 +127,7 @@ test('HKT DHCP form generates scoped API without executing DHCP and shows result
 });
 
 test('unified change-IP entry routes MoonVM generic and HKT to their respective setup',()=>{
- const env=vm.createContext({esc:ctx.esc,console});vm.runInContext(source,env);
+ const env=vm.createContext({esc:ctx.esc,console,page:'rotations',clearInterval(){}});vm.runInContext(source,env);
  const form={},calls=[];let html='';env.$=()=>form;env.modal=x=>{html=x;};env.editIPConnection=(...args)=>calls.push(args);env.hktDHCPForm=()=>calls.push(['hkt']);
  env.chooseChangeIPAPI();for(const value of ['moonvm','agent_dhcp','generic'])assert.match(html,new RegExp('value="'+value+'"'));
  for(const provider of ['moonvm','generic','agent_dhcp'])form.onsubmit({preventDefault(){},target:{provider:{value:provider}}});

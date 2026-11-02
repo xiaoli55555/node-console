@@ -2,14 +2,14 @@ const test=require('node:test'),assert=require('node:assert/strict'),vm=require(
 const ipSource=fs.readFileSync('web/ipdns.js','utf8');
 const appSource=fs.readFileSync('web/app.js','utf8');
 const escape=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-function context(){const ctx=vm.createContext({esc:escape,console,FormData:class{constructor(f){this.values=f.values;}[Symbol.iterator](){return Object.entries(this.values)[Symbol.iterator]();}}});vm.runInContext(ipSource,ctx);return ctx;}
+function context(){const ctx=vm.createContext({page:'rotations',esc:escape,console,FormData:class{constructor(f){this.values=f.values;}[Symbol.iterator](){return Object.entries(this.values)[Symbol.iterator]();}}});vm.runInContext(ipSource,ctx);return ctx;}
 
 test('each plan has its own failover entry and saves only that plan backup',async()=>{
  const c=context(),r={id:7,primary_server_id:1,other_server_id:2,primary_name:'<main>',other_name:'C',next_switch_at:2000000000,interval_s:7200,lead_s:0,offline_after_s:15,enabled:1};
  const before=JSON.stringify(r);let html='';const calls=[];
  const form={failover_server_id:{value:'3'},failover_recovery_s:{value:'45'}};
  const elements={rotationFailoverForm:form,backRotationFailover:{},rotationFailoverError:{}};
- c.$=id=>elements[id];c.modal=x=>html=x;c.loadAdminRotations=async()=>{};c.notice=()=>{};c.api=async(...args)=>calls.push(args);
+ c.$=id=>elements[id];c.renderRotationPage=x=>html=x;c.loadAdminRotations=async()=>{};c.notice=()=>{};c.api=async(...args)=>calls.push(args);
  assert.match(c.adminRotationsMarkup({rotations:[r]}),/data-rotation-failover="7"/);
  c.editRotationFailover({servers:[{id:1,name:'A'},{id:2,name:'C'},{id:3,name:'<backup>'}]},r);
  assert.match(html,/value="1" disabled/);assert.match(html,/value="2" disabled/);assert.match(html,/&lt;backup&gt;/);

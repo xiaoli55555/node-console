@@ -1045,7 +1045,8 @@ def _run_rotation(connect,cipher,rid,now):
             # Keep overdue deadlines due; verified candidates may switch in this pass.
             next_at=r['next_switch_at']
             if _fixed(r) or r['fault_recovery']:next_at=now
-            message=f'旧 VPS #{old} 已换到 {ip}，业务端口及 BOCE 复检通过；已重新加入轮换'
+            message=f'旧 VPS #{old} 已换到 {ip}，业务端口及 BOCE 复检通过；备用机已就绪'
+            message+=('；定时已暂停，等待手动启用' if not r['enabled'] else '；承载已到期，准备切换解析' if next_at<=now else '；等待计划切换时间')
             db.execute("UPDATE vps_rotations SET phase='active',emergency=0,drain_server_id=NULL,drain_started=NULL,drain_grace_s=0,old_ip=NULL,new_ip=NULL,action_started=NULL,reboot_command_id=NULL,last_sample_at=NULL,low_samples=0,next_switch_at=?,status=?,updated=? WHERE id=?",(next_at,message,now,rid))
             db.execute('UPDATE vps_rotations SET fault_recovery=0 WHERE id=?',(rid,))
             if not _fixed(r):db.execute('UPDATE vps_rotations SET standby_ready_at=?,standby_ready_server=?,reused_ip=NULL,reused_server_id=NULL,drain_base_attempt=NULL WHERE id=?',(now,old,rid))
