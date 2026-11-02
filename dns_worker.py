@@ -3,7 +3,7 @@ import time
 import server
 from detectors import tick as detection_tick
 from ip_dns import run_binding, check_monitor, IntegrationError
-from rotation import tick as rotation_tick
+from rotation import tick as rotation_tick, expedite_recovery_probes
 from rotation_insights import collect_reports
 
 def tick():
@@ -22,15 +22,28 @@ def tick():
         except IntegrationError:pass # Safe status is available to admins, no credentials in logs.
         except Exception:print('DNS worker: internal error for binding #'+str(bid),flush=True)
 
+def rotation_detection_cycle():
+    try:detection_tick(server.connect,server.CIPHER)
+    except Exception:print('Detection worker: cycle failed',flush=True)
+    try:
+        rotation_tick(server.connect,server.CIPHER)
+        # Bounded submit/poll/confirm passes only for a failed carrier whose
+        # partner is mid-repair. Normal schedules and unrelated actions retain
+        # their cadence; no sleeps, unbounded loops or duplicate probe POSTs.
+        for _ in range(3):
+            rotations,servers=expedite_recovery_probes(server.connect,server.CIPHER)
+            if not rotations:break
+            if servers:detection_tick(server.connect,server.CIPHER,server_ids=servers)
+            rotation_tick(server.connect,server.CIPHER,rotation_ids=rotations)
+    except BlockingIOError:pass
+    except Exception:print('VPS rotation: cycle failed',flush=True)
+
+
 if __name__=='__main__':
     while True:
         try:tick()
         except Exception:print('DNS worker: cycle failed',flush=True)
-        try:detection_tick(server.connect,server.CIPHER)
-        except Exception:print("Detection worker: cycle failed",flush=True)
-        try:rotation_tick(server.connect,server.CIPHER)
-        except BlockingIOError:pass
-        except Exception:print("VPS rotation: cycle failed",flush=True)
+        rotation_detection_cycle()
         try:collect_reports(server.connect)
         except Exception:print("Rotation report: collection failed",flush=True)
         time.sleep(5)

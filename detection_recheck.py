@@ -69,10 +69,12 @@ def _budget(db,r,p,now):
     return used+1<=p['daily_limit']
 
 
-def tick(connect,cipher):
+def tick(connect,cipher,server_ids=None):
     import detectors as d
     now=int(time.time())
-    with connect() as db:jobs=[dict(x) for x in db.execute("SELECT * FROM detection_rechecks WHERE state IN ('queued','creating','pending') ORDER BY parent_id LIMIT 50")]
+    if server_ids is not None and not server_ids:return
+    clause='' if server_ids is None else ' AND parent_id IN (SELECT id FROM detection_runs WHERE server_id IN ('+','.join('?' for _ in server_ids)+'))'
+    with connect() as db:jobs=[dict(x) for x in db.execute("SELECT * FROM detection_rechecks WHERE state IN ('queued','creating','pending')"+clause+' ORDER BY parent_id LIMIT 50',() if server_ids is None else tuple(server_ids))]
     for job in jobs:
         with connect() as db:
             db.execute('BEGIN IMMEDIATE')

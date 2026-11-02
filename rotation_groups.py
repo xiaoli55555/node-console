@@ -1,5 +1,16 @@
 """One plan can own several records; fixed plans may share only their primary."""
+import json
 from ip_dns import IntegrationError
+
+
+def forced_drain_satisfied(r,now):
+    try:
+        state=json.loads(r['force_drain_samples'] or '{}')
+        return bool(r['force_drain_threshold'] and r['drain_started'] is not None
+                    and now-r['drain_started']>=3600 and state['started']==r['drain_started']
+                    and state['threshold']==r['force_drain_threshold'] and state['count']>=2
+                    and r['drain_started']+3600<=state['stamp']<=now and now-state['stamp']<=45)
+    except (KeyError,IndexError,TypeError,ValueError):return False
 
 
 def members(db,r):
@@ -27,7 +38,7 @@ def action_guard(db,r,sid,now):
             lease=db.execute('SELECT 1 FROM vps_failover_leases l JOIN dns_bindings b ON b.id=l.binding_id WHERE l.binding_id=? AND l.intent IS NULL AND l.current_ip=b.expected_ip',(p['binding_id'],)).fetchone()
             if not lease:raise IntegrationError('等待所有关联线路移出此 VPS 后再换 IP')
     for p in peers:
-        if p['drain_server_id']==sid and p['phase']=='draining' and not p['emergency'] and (p['low_samples']<2 or now-(p['drain_started'] or now)<p['drain_grace_s']):raise IntegrationError('等待关联记录的 TTL 排空及连续 TCP 低值采样')
+        if p['drain_server_id']==sid and p['phase']=='draining' and not p['emergency'] and ((p['low_samples']<2 and not forced_drain_satisfied(p,now)) or now-(p['drain_started'] or now)<p['drain_grace_s']):raise IntegrationError('等待关联记录的 TTL 排空及连续 TCP 低值采样')
     inflight=[p['id'] for p in peers if p['drain_server_id']==sid and p['phase']=='waiting_ip' and p['action_started'] is not None]
     if inflight:
         if r['id']!=min(inflight):raise IntegrationError('共享 VPS 已由计划 #'+str(min(inflight))+' 发起换 IP，等待该动作完成')

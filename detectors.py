@@ -308,14 +308,17 @@ def start_run(connect,cipher,sid,scheduled=False):
         db.execute("DELETE FROM detection_runs WHERE created<? AND status NOT IN ('pending','queued','issued','creating') AND (action_command_id IS NOT NULL OR action_status IS NULL OR action_status NOT IN ('queued','issued','submitted','uncertain','verifying'))",(now-30*86400,))
         return rid
 
-def tick(connect,cipher):
+def tick(connect,cipher,server_ids=None):
+    scope=None if server_ids is None else set(server_ids)
     now=int(time.time())
     with connect() as db:
         # Timed-out self probes and expired BOCE jobs never imply target is blocked.
         expired=db.execute("SELECT r.* FROM detection_runs r JOIN detection_sources s ON s.id=r.source_id WHERE r.status IN ('pending','queued','issued','creating') AND r.created<?-CASE WHEN s.kind='baota' THEN 300 ELSE 120 END",(now,)).fetchall()
-        for r in expired:finish(db,r,'检测超时（不能判定目标不通）',[])
+        for r in expired:
+            if scope is None or r['server_id'] in scope:finish(db,r,'检测超时（不能判定目标不通）',[])
         pending=[dict(r) for r in db.execute("SELECT r.*,s.secret,s.enabled,s.kind FROM detection_runs r JOIN detection_sources s ON s.id=r.source_id WHERE r.status='pending' AND r.poll_at<=?",(now,))]
     for r in pending:
+        if scope is not None and r['server_id'] not in scope:continue
         with connect() as db:db.execute('UPDATE detection_runs SET poll_at=? WHERE id=?',(now+10,r['id']))
         try:
             if r['kind']=='baota':
@@ -341,10 +344,12 @@ def tick(connect,cipher):
             status='检测接口异常（不能判定目标不通）'
             if r['kind'] in ('aliyun','baota'):status+='：'+str(e)[:400]
             with connect() as db:finish(db,r,status,[])
-    detection_recheck.tick(connect,cipher)
+    if scope is None:detection_recheck.tick(connect,cipher)
+    else:detection_recheck.tick(connect,cipher,server_ids=scope)
     with connect() as db:
         due=[r[0] for r in db.execute('SELECT p.server_id FROM detection_plans p JOIN ip_monitors m ON m.server_id=p.server_id JOIN detection_sources s ON s.id=p.source_id WHERE p.automatic=1 AND m.enabled=1 AND s.enabled=1 AND p.next_at<=?',(now,))]
     for sid in due:
+        if scope is not None and sid not in scope:continue
         from failover import probe_blocked, parent_probe_suspended
         with connect() as db:
             if parent_probe_suspended(db,sid,now):
@@ -355,7 +360,7 @@ def tick(connect,cipher):
         except IntegrationError as e:
             retry_after=5 if '已有检测任务进行中' in str(e) else 60
             with connect() as db:db.execute('UPDATE detection_plans SET next_at=?,status=? WHERE server_id=?',(now+retry_after,str(e),sid))
-    execute_change_ip_actions(connect,cipher)
+    if scope is None:execute_change_ip_actions(connect,cipher)
 
 # A successful/uncertain request needs an observation window, not an action cooldown.
 CHANGE_IP_OBSERVE_SECONDS=60

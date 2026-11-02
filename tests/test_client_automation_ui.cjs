@@ -80,3 +80,16 @@ test('rotation payload submits optional C without limiting failover to a subset 
  const body=ctx.rotationModePayload({mode:{value:'fixed_primary'},takeover_minutes:{value:'10'},first_switch:{value:''},mobile_only_ack:{checked:true},failover_server_id:{value:'3'},failover_recovery_s:{value:'60'}});
  assert.equal(body.failover_server_id,3);assert.equal(body.failover_recovery_s,60);assert.ok(!('failover_binding_ids' in body));
 });
+
+test('one-hour forced drain threshold is optional and supplied by the operator',()=>{
+ const html=ctx.rotationModeFields(null);
+ assert.match(html,/排空满 1 小时强制回收/);
+ assert.match(html,/name="force_drain_threshold"[^>]*value=""/);
+ assert.match(html,/剩余连接可能中断/);
+ const saved=ctx.rotationModeFields({force_drain_threshold:170});
+ assert.match(saved,/name="force_drain_threshold"[^>]*value="170"/);
+ vm.runInContext(source.match(/function rotationModePayload\([^\n]+/)[0],ctx);
+ const form={mode:{value:'alternating'},takeover_minutes:{value:'10'},first_switch:{value:''},mobile_only_ack:{checked:false},force_drain_threshold:{value:'170'}};
+ assert.equal(ctx.rotationModePayload(form).force_drain_threshold,170);
+ form.force_drain_threshold.value='';assert.equal(ctx.rotationModePayload(form).force_drain_threshold,0);
+});

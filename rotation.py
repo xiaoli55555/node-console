@@ -72,6 +72,8 @@ def initialize(connect):
         columns={r[1] for r in db.execute('PRAGMA table_info(vps_rotations)')}
         for name,definition in [('mode',"TEXT NOT NULL DEFAULT 'alternating'"),('takeover_s','INTEGER NOT NULL DEFAULT 600'),('first_switch_at','INTEGER'),('mobile_only_ack','INTEGER NOT NULL DEFAULT 0'),('dns_intent','TEXT'),('fault_recovery','INTEGER NOT NULL DEFAULT 0'),('reboot_command_id','INTEGER'),('emergency_probe_after','INTEGER'),('standby_ready_at','INTEGER'),('standby_ready_server','INTEGER'),('preload_refresh_deadline','INTEGER'),('preload_base_attempt','INTEGER'),('reused_ip','TEXT'),('reused_server_id','INTEGER'),('drain_base_attempt','INTEGER'),('external_dns_check_at','INTEGER'),('external_dns_pending','INTEGER NOT NULL DEFAULT 0')]:
             if name not in columns:db.execute(f'ALTER TABLE vps_rotations ADD COLUMN {name} {definition}')
+        for name,definition in [('force_drain_threshold','INTEGER NOT NULL DEFAULT 0'),('force_drain_samples','TEXT'),('urgent_probe_floors','TEXT')]:
+            if name not in columns:db.execute(f'ALTER TABLE vps_rotations ADD COLUMN {name} {definition}')
         failover.initialize(db)
 
 
@@ -89,6 +91,24 @@ def _rotation_tcp_count(metrics,now):
     return count,stamp
 
 
+def _force_drain_ready(db,r,count,stamp,now):
+    """Opt-in one-hour escape hatch; never reinterpret normal low samples."""
+    threshold=r['force_drain_threshold']
+    if not threshold or r['drain_started'] is None or now-r['drain_started']<3600 or stamp<r['drain_started']+3600:
+        db.execute('UPDATE vps_rotations SET force_drain_samples=NULL WHERE id=?',(r['id'],))
+        return False
+    try:state=json.loads(r['force_drain_samples'] or '{}')
+    except (ValueError,TypeError):state={}
+    if not isinstance(state,dict) or state.get('started')!=r['drain_started'] or state.get('threshold')!=threshold:
+        state={'started':r['drain_started'],'threshold':threshold,'count':0,'stamp':0}
+    if not 0<=now-state['stamp']<=45:state['count']=0
+    if stamp>state['stamp']:
+        state.update(stamp=stamp,count=min(2,state['count']+1) if count<threshold else 0)
+        db.execute('UPDATE vps_rotations SET force_drain_samples=? WHERE id=?',(json.dumps(state),r['id']))
+    db.execute('UPDATE vps_rotations SET status=? WHERE id=?',(f'排空已满 1 小时；强制阈值 TCP < {threshold}，当前 {count}，连续低值采样 {state["count"]}/2',r['id']))
+    return state['count']>=2
+
+
 def _drain_timing(db,r,now,outcome=None,tcp=None,start=False):
     """Observe one DNS handoff; never count action retries as new drains."""
     if not r['drain_server_id'] or r['drain_started'] is None:return
@@ -96,6 +116,8 @@ def _drain_timing(db,r,now,outcome=None,tcp=None,start=False):
                (r['id'],r['drain_server_id'],r['old_ip'],r['drain_started'],r['connection_threshold'],r['drain_grace_s']))
     db.execute("UPDATE vps_rotation_drain_timings SET threshold=? WHERE rotation_id=? AND server_id=? AND started=? AND outcome='pending'",(r['connection_threshold'],r['id'],r['drain_server_id'],r['drain_started']))
     if r['emergency']:outcome='skipped'
+    if outcome=='forced':
+        db.execute("UPDATE vps_rotation_drain_timings SET threshold=? WHERE rotation_id=? AND server_id=? AND started=? AND outcome='pending'",(r['force_drain_threshold'],r['id'],r['drain_server_id'],r['drain_started']))
     if outcome:
         db.execute("UPDATE vps_rotation_drain_timings SET outcome=?,finished=?,elapsed_s=?,tcp=? WHERE rotation_id=? AND server_id=? AND started=? AND outcome='pending'",
                    (outcome,now,max(0,now-r['drain_started']) if outcome=='completed' else None,tcp,r['id'],r['drain_server_id'],r['drain_started']))
@@ -207,6 +229,9 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
                 if len(existing)>1:return error('VPS 或 DNS 记录已用于其他轮换任务',409)
                 rotation=existing[0] if existing else None
                 if rotation and g.user['role']!='admin' and rotation['owner_id']!=g.user['id']:return error('轮换计划不属于当前客户',403)
+                force_threshold=d.get('force_drain_threshold',rotation['force_drain_threshold'] if rotation else 0)
+                if type(force_threshold)is not int or not 0<=force_threshold<=10000:
+                    return error('满 1 小时强制换 IP 的连接数阈值应为 1～10000，或 0 关闭')
                 effective_uid=rotation['owner_id'] if rotation else g.user['id']
                 mode=d.get('mode',rotation['mode'] if rotation else 'alternating')
                 takeover=d.get('takeover_s',rotation['takeover_s'] if rotation else 600)
@@ -224,6 +249,7 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
                 if rotation and failover_changed and db.execute('SELECT 1 FROM vps_failover_leases WHERE rotation_id=?',(rotation['id'],)).fetchone():raise IntegrationError('A 故障转移正在接替，解析切回前不能修改备用机或接替记录')
                 if rotation and not enabled and (rotation['enabled'] or mode==rotation['mode']) and not failover_changed:
                     kept_threshold=d.get('connection_threshold',rotation['connection_threshold'])
+                    db.execute('UPDATE vps_rotations SET force_drain_samples=CASE WHEN force_drain_threshold<>? THEN NULL ELSE force_drain_samples END,force_drain_threshold=? WHERE id=?',(force_threshold,force_threshold,rotation['id']))
                     db.execute("UPDATE vps_rotations SET enabled=0,status='轮换已暂停',interval_s=?,low_samples=CASE WHEN connection_threshold<>? THEN 0 ELSE low_samples END,last_sample_at=CASE WHEN connection_threshold<>? THEN NULL ELSE last_sample_at END,connection_threshold=?,lead_s=?,offline_after_s=?,takeover_s=?,first_switch_at=?,mobile_only_ack=?,updated=? WHERE id=?",(d.get('interval_s',rotation['interval_s']),kept_threshold,kept_threshold,kept_threshold,0 if mode=='fixed_primary' else d.get('lead_s',rotation['lead_s']),d.get('offline_after_s',rotation['offline_after_s']),takeover,first,int(ack),now,rotation['id']))
                     audit(db,'暂停双 VPS 定时轮换 #'+str(rotation['id']))
                     return jsonify(ok=True,rotation=_rotation_json(db,db.execute('SELECT * FROM vps_rotations WHERE id=?',(rotation['id'],)).fetchone()))
@@ -257,6 +283,7 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
                 else:
                     rid=db.execute("INSERT INTO vps_rotations(owner_id,primary_server_id,other_server_id,binding_id,active_server_id,enabled,interval_s,connection_threshold,phase,next_switch_at,status,updated) VALUES(?,?,?,?,?,1,?,?,'active',?,'轮换已开启',?)",(g.user['id'],sid,other,binding_id,sid,interval,threshold,now+interval-lead,now)).lastrowid
                 db.execute('UPDATE vps_rotations SET lead_s=?,offline_after_s=? WHERE id=?',(lead,offline_after,rid))
+                db.execute('UPDATE vps_rotations SET force_drain_samples=CASE WHEN force_drain_threshold<>? THEN NULL ELSE force_drain_samples END,force_drain_threshold=? WHERE id=?',(force_threshold,force_threshold,rid))
                 db.execute('UPDATE vps_rotations SET mode=?,takeover_s=?,first_switch_at=?,mobile_only_ack=? WHERE id=?',(mode,takeover,first,int(ack),rid))
                 if rotation and threshold!=rotation['connection_threshold']:
                     db.execute('UPDATE vps_rotations SET low_samples=0,last_sample_at=NULL WHERE id=?',(rid,))
@@ -469,6 +496,13 @@ def _request_probe(db,sid,now):
         db.execute('UPDATE detection_plans SET next_at=MIN(next_at,?) WHERE server_id=?',(now,sid))
 
 
+def _request_new_ip_probe(db,sid,ip,port,now,urgent=False):
+    # The worker may already have submitted this exact new-IP round before
+    # rotation observes the agent update. Do not queue a second paid task.
+    existing=urgent and db.execute("SELECT 1 FROM detection_runs r JOIN detection_plans p ON p.server_id=r.server_id WHERE r.server_id=? AND r.ip=? AND r.port=? AND r.source_id=p.source_id AND r.nodes=p.nodes AND (r.status IN ('creating','pending','queued','issued') OR r.created>=?) LIMIT 1",(sid,ip,port,now)).fetchone()
+    if not existing:db.execute('UPDATE detection_plans SET next_at=MIN(next_at,?) WHERE server_id=?',(now,sid))
+
+
 def _preferred_rotation_ip(db,sid,ip):
     # Registered HKT DHCP machines must never be published with a nonpreferred IP.
     if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hkt_dhcp_apis'").fetchone():
@@ -642,8 +676,13 @@ def _original_emergency_probe(db,r,target,now):
         db.execute('UPDATE detection_plans SET next_at=MIN(next_at,?) WHERE server_id=?',(after,target))
         db.commit()
         raise IntegrationError('当前承载异常，已请求刚换下 VPS #'+str(target)+' 加测一轮；通过后立即接替')
-    last=db.execute("SELECT created FROM detection_runs WHERE server_id=? AND status NOT IN ('creating','pending','queued','issued') ORDER BY id DESC LIMIT 1",(target,)).fetchone()
-    if not last or last['created']<after:
+    last=db.execute("SELECT id,created FROM detection_runs WHERE server_id=? AND status NOT IN ('creating','pending','queued','issued') ORDER BY id DESC LIMIT 1",(target,)).fetchone()
+    try:floor=json.loads(r['urgent_probe_floors'] or '{}').get(str(target))
+    except (ValueError,TypeError):floor=None
+    # A task ID reserved after the incident floor proves freshness even when
+    # submission and completion happen inside the same timestamp second.
+    post_incident=last and type(floor)is int and last['id']>floor
+    if not last or (last['created']<after and not post_incident):
         db.execute('UPDATE detection_plans SET next_at=MIN(next_at,?) WHERE server_id=?',(max(after,now),target))
         db.commit()
         raise IntegrationError('等待换下 VPS #'+str(target)+' 完成本次故障后的新一轮探测')
@@ -898,20 +937,25 @@ def _run_rotation(connect,cipher,rid,now):
             if ip!=r['old_ip']:
                 _drain_timing(db,r,now,'unobserved')
                 db.execute("UPDATE vps_rotations SET phase='waiting_probe',new_ip=?,action_started=COALESCE(action_started,?),status=?,updated=? WHERE id=?",(ip,now,'旧 VPS IP 已变化，等待 BOCE 复检',now,rid))
-                db.execute('UPDATE detection_plans SET next_at=MIN(next_at,?) WHERE server_id=?',(now,old))
+                _request_new_ip_probe(db,old,ip,port,now,urgent=bool(r['urgent_probe_floors']))
                 return
             stamp=metrics.get('connections_sampled');count=metrics.get('tcp')
             if not r['emergency']:
                 try:count,stamp=_rotation_tcp_count(metrics,now)
                 except IntegrationError as e:
-                    db.execute('UPDATE vps_rotations SET status=?,updated=?,low_samples=0 WHERE id=?',(str(e),now,rid));return
+                    db.execute('UPDATE vps_rotations SET status=?,updated=?,low_samples=0,force_drain_samples=NULL WHERE id=?',(str(e),now,rid));return
 
             if not r['emergency'] and stamp>(r['last_sample_at'] or 0):
                 lows=r['low_samples']+1 if count<r['connection_threshold'] else 0
                 db.execute('UPDATE vps_rotations SET low_samples=?,last_sample_at=?,status=?,updated=? WHERE id=?',(lows,stamp,f'旧 VPS 当前 {count} 条 TCP 连接；阈值 < {r["connection_threshold"]}，连续低值采样 {lows}/2',now,rid))
                 r=dict(r);r['low_samples']=lows
-            if r['low_samples']<2:return
-            _drain_timing(db,r,now,'completed',count if not r['emergency'] else None)
+            forced=not r['emergency'] and _force_drain_ready(db,r,count,stamp,now) and r['low_samples']<2
+            if r['low_samples']<2 and not forced:return
+            if forced:
+                try:_fixed_ready(db,cipher,r,r['active_server_id'],now)
+                except IntegrationError as e:
+                    db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('超时强制换 IP 暂缓：'+str(e),now,rid));return
+            if not forced:_drain_timing(db,r,now,'completed',count if not r['emergency'] else None)
             if _fixed(r):
                 try:_fixed_action_safe(db,cipher,r,old,now)
                 except IntegrationError as e:
@@ -931,6 +975,9 @@ def _run_rotation(connect,cipher,rid,now):
             reason=before_action(db,old,now,cipher)
             if reason:
                 db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',(reason,now,rid));return
+            if forced:
+                _drain_timing(db,r,now,'forced',count)
+                _event(db,rid,old,f'排空超过 1 小时：连续两次 TCP < {r["force_drain_threshold"]}（当前 {count}）；按配置强制换 IP，剩余连接可能中断',now)
             if plan.get('rotation_action')=='reboot':
                 message=queue_reboot(db,old,now,cipher)
                 if not message.startswith('已排队'):
@@ -947,7 +994,7 @@ def _run_rotation(connect,cipher,rid,now):
             except IntegrationError as e:db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',(str(e),now,rid));return
             if ip!=r['old_ip']:
                 db.execute("UPDATE vps_rotations SET phase='waiting_probe',new_ip=?,action_started=CASE WHEN mode='fixed_primary' THEN ? ELSE action_started END,status=?,updated=? WHERE id=?",(ip,now,'新 IP 已上报，等待所选检测点复检',now,rid))
-                db.execute('UPDATE detection_plans SET next_at=MIN(next_at,?) WHERE server_id=?',(now,old))
+                _request_new_ip_probe(db,old,ip,port,now,urgent=bool(r['urgent_probe_floors']))
                 return
             if r['action_started'] and now-r['action_started']<60:
                 db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('换 IP 请求已发出，观察 60 秒内的 IP 变化',now,rid));return
@@ -1115,13 +1162,62 @@ def _sync_external_dns(connect,cipher,rid,now,force=False):
         return True
 
 
-def tick(connect,cipher):
+def expedite_recovery_probes(connect,cipher):
+    """Claim one fresh round per incident/IP; accelerate existing result polling."""
+    now=int(time.time());rotations=[];servers=set()
+    with connect() as db:
+        rows=db.execute('SELECT * FROM vps_rotations WHERE enabled=1 OR fault_recovery=1 OR urgent_probe_floors IS NOT NULL').fetchall()
+        for r in rows:
+            urgent=(r['phase'] in ('waiting_ip','waiting_probe') and r['drain_server_id']
+                    and r['drain_server_id']!=r['active_server_id']
+                    and (r['enabled'] or r['fault_recovery']) and not r['dns_intent']
+                    and not db.execute('SELECT 1 FROM vps_failover_leases WHERE rotation_id=?',(r['id'],)).fetchone())
+            if urgent:
+                active=r['active_server_id']
+                urgent=_offline(db,active,now,r['offline_after_s']) or (_fixed_failure(db,active,now) if _fixed(r) else _failed_ip(db,active,now))
+                if not urgent and r['urgent_probe_floors']:
+                    # A pending independent confirmation is not recovery.
+                    # Keep the already established incident expedited until a
+                    # current healthy result actually clears it.
+                    try:
+                        address,port,_=_fresh_ip(db,active,now,cipher)
+                        urgent=bool(boce_dns_gate(db,active,address,port,require_plan=True))
+                    except IntegrationError:urgent=True
+            if not urgent:
+                if r['urgent_probe_floors']:db.execute('UPDATE vps_rotations SET urgent_probe_floors=NULL WHERE id=?',(r['id'],))
+                continue
+            try:floors=json.loads(r['urgent_probe_floors'] or '{}')
+            except (TypeError,ValueError):floors={}
+            for sid in (r['active_server_id'],r['drain_server_id']):
+                plan=db.execute('SELECT p.*,m.port,m.enabled AS monitor_enabled,s.enabled AS source_enabled FROM detection_plans p JOIN ip_monitors m ON m.server_id=p.server_id JOIN detection_sources s ON s.id=p.source_id WHERE p.server_id=?',(sid,)).fetchone()
+                if not plan or not plan['automatic'] or not plan['monitor_enabled'] or not plan['source_enabled']:continue
+                key=str(sid)
+                if key not in floors:
+                    floors[key]=db.execute('SELECT COALESCE(MAX(id),0) FROM detection_runs WHERE server_id=?',(sid,)).fetchone()[0]
+                try:address,_,_=_fresh_ip(db,sid,now,cipher)
+                except IntegrationError:continue
+                pending=db.execute("SELECT 1 FROM detection_runs WHERE server_id=? AND status IN ('creating','pending','queued','issued')",(sid,)).fetchone()
+                confirm=db.execute("SELECT 1 FROM detection_rechecks c JOIN detection_runs p ON p.id=c.parent_id WHERE p.server_id=? AND c.state IN ('queued','creating','pending')",(sid,)).fetchone()
+                fresh=db.execute('SELECT 1 FROM detection_runs WHERE server_id=? AND id>? AND ip=? AND port=? AND source_id=? AND nodes=? LIMIT 1',(sid,floors[key],address,plan['port'],plan['source_id'],plan['nodes'])).fetchone()
+                if not pending and not confirm and not fresh:
+                    db.execute('UPDATE detection_plans SET next_at=MIN(next_at,?) WHERE server_id=?',(now,sid))
+                if pending or confirm or not fresh:
+                    db.execute("UPDATE detection_runs SET poll_at=MIN(poll_at,?) WHERE server_id=? AND status='pending'",(now,sid))
+                    db.execute("UPDATE detection_rechecks SET poll_at=MIN(poll_at,?) WHERE parent_id IN (SELECT id FROM detection_runs WHERE server_id=?) AND state='pending'",(now,sid))
+                    servers.add(sid)
+            db.execute('UPDATE vps_rotations SET urgent_probe_floors=? WHERE id=?',(json.dumps(floors),r['id']))
+            rotations.append(r['id'])
+    return rotations,sorted(servers)
+
+
+def tick(connect,cipher,rotation_ids=None):
     now=int(time.time())
     with connect() as db:db_path=db.execute('PRAGMA database_list').fetchone()[2]
     path=Path(db_path).with_suffix('.rotation.lock')
     with open(str(path),'a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         with connect() as db:ids=[r[0] for r in db.execute('SELECT id FROM vps_rotations ORDER BY id')]
+        if rotation_ids is not None:ids=[rid for rid in ids if rid in rotation_ids]
         for rid in ids:
             try:
                 with connect() as db:before=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
