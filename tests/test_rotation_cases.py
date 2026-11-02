@@ -9,9 +9,9 @@ class RotationConditions(unittest.TestCase):
         self.tmp=tempfile.TemporaryDirectory();self.path=Path(self.tmp.name)/'test.db'
         rotation.initialize(self.connect)
         with self.connect() as db:
-            db.executescript('CREATE TABLE servers(id INTEGER,seen INTEGER);INSERT INTO servers VALUES(1,990);INSERT INTO servers VALUES(2,990);CREATE TABLE detection_runs(server_id INTEGER,created INTEGER);CREATE TABLE detection_plans(server_id INTEGER,next_at INTEGER);')
+            db.executescript("""CREATE TABLE servers(id INTEGER,seen INTEGER);INSERT INTO servers VALUES(1,990);INSERT INTO servers VALUES(2,990);CREATE TABLE detection_runs(id INTEGER PRIMARY KEY,server_id INTEGER,created INTEGER,ip TEXT DEFAULT '8.8.8.8',port INTEGER DEFAULT 443,status TEXT DEFAULT 'completed');CREATE TABLE detection_plans(server_id INTEGER,next_at INTEGER);""")
             db.execute("INSERT INTO vps_rotations(owner_id,primary_server_id,other_server_id,binding_id,active_server_id,enabled,phase,next_switch_at,updated,interval_s,lead_s) VALUES(1,1,2,1,1,1,'active',1000,900,120,20)")
-            db.execute('INSERT INTO detection_runs VALUES(1,990)');db.execute('INSERT INTO detection_runs VALUES(2,990)')
+            db.execute('INSERT INTO detection_runs(server_id,created) VALUES(1,990)');db.execute('INSERT INTO detection_runs(server_id,created) VALUES(2,990)')
     def tearDown(self):self.tmp.cleanup()
     def connect(self):
         db=sqlite3.connect(self.path);db.row_factory=sqlite3.Row;return db

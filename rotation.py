@@ -665,6 +665,22 @@ def _offline(db,sid,now,timeout=15):
     node=db.execute('SELECT seen FROM servers WHERE id=?',(sid,)).fetchone()
     return not node or not node['seen'] or now-node['seen']>=timeout
 
+def _carrier_alert_status(status):
+    status=status or ''
+    return (status.startswith('轮换暂缓：当前承载异常') or
+            (status.startswith('轮换暂缓：等待换下 VPS #') and '本次故障后的新一轮探测' in status))
+
+def _carrier_fault_reason(db,r,now):
+    sid=r['active_server_id']
+    if _offline(db,sid,now,r['offline_after_s']):
+        node=db.execute('SELECT seen FROM servers WHERE id=?',(sid,)).fetchone()
+        age=f'已 {max(0,now-node["seen"])} 秒未收到上报' if node and node['seen'] else '尚无有效心跳'
+        return f'心跳超时：{age}，阈值 {r["offline_after_s"]} 秒；不能据此认定业务不通或被墙'
+    if _failed_ip(db,sid,now):
+        run=db.execute("SELECT ip,port FROM detection_runs WHERE server_id=? AND status NOT IN ('creating','pending','queued','issued') ORDER BY id DESC LIMIT 1",(sid,)).fetchone()
+        return f'国内 TCP 检测不通：{run["ip"]}:{run["port"]}，所选节点已满足当前故障确认条件'
+    return '本次故障接替来源待核对，当前没有可确认的心跳超时或国内 TCP 不通证据'
+
 def _original_emergency_probe(db,r,target,now):
     """Require a new probe round after the incident, not a cached healthy result."""
     after=r['emergency_probe_after']
@@ -674,8 +690,10 @@ def _original_emergency_probe(db,r,target,now):
         after=now+1
         db.execute('UPDATE vps_rotations SET emergency_probe_after=? WHERE id=?',(after,r['id']))
         db.execute('UPDATE detection_plans SET next_at=MIN(next_at,?) WHERE server_id=?',(after,target))
+        reason=_carrier_fault_reason(db,r,now)
+        _event(db,r['id'],r['active_server_id'],'承载检测异常：'+reason,now)
         db.commit()
-        raise IntegrationError('当前承载异常，已请求刚换下 VPS #'+str(target)+' 加测一轮；通过后立即接替')
+        raise IntegrationError('当前承载异常，原因：'+reason+'；已请求刚换下 VPS #'+str(target)+' 加测一轮；通过后立即接替')
     last=db.execute("SELECT id,created FROM detection_runs WHERE server_id=? AND status NOT IN ('creating','pending','queued','issued') ORDER BY id DESC LIMIT 1",(target,)).fetchone()
     try:floor=json.loads(r['urgent_probe_floors'] or '{}').get(str(target))
     except (ValueError,TypeError):floor=None
@@ -809,13 +827,18 @@ def _run_rotation(connect,cipher,rid,now):
         if not r or (not r['enabled'] and not r['fault_recovery']):return
         # A recovered carrier ends this fault attempt. A later fault must request
         # another standby round, rather than reuse the previous incident's marker.
-        if not _fixed(r) and r['emergency_probe_after'] is not None and not _offline(db,r['active_server_id'],now,r['offline_after_s']):
+        stale_alert=r['phase']=='active' and _carrier_alert_status(r['status'])
+        if not _fixed(r) and (r['emergency_probe_after'] is not None or stale_alert) and not _offline(db,r['active_server_id'],now,r['offline_after_s']):
             try:
                 address,port,_=_fresh_ip(db,r['active_server_id'],now,cipher)
                 healthy=not boce_dns_gate(db,r['active_server_id'],address,port,require_plan=True)
             except IntegrationError:healthy=False
             if healthy:
                 db.execute('UPDATE vps_rotations SET emergency_probe_after=NULL WHERE id=?',(rid,))
+                message='当前承载机心跳及所选国内 TCP 检测已恢复正常；保留当前 DNS 和原轮换截止时间'
+                if stale_alert:
+                    db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',(message,now,rid))
+                _event(db,rid,r['active_server_id'],message,now)
                 r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
         if not _fixed(r) and r['phase']!='active' and (_offline(db,r['active_server_id'],now,r['offline_after_s']) or _failed_ip(db,r['active_server_id'],now)):
             # A carrier incident preempts optional preparation, but never an
@@ -825,7 +848,7 @@ def _run_rotation(connect,cipher,rid,now):
             if after is None:
                 after=now+1
                 db.execute('UPDATE vps_rotations SET emergency_probe_after=? WHERE id=?',(after,rid))
-                _event(db,rid,r['active_server_id'],'当前承载异常：优先请求备用机新一轮探测；就绪后接替，不等待定时轮换',now)
+                _event(db,rid,r['active_server_id'],'承载检测异常：'+_carrier_fault_reason(db,r,now)+'；优先请求备用机新一轮探测，就绪后接替',now)
             db.execute('UPDATE detection_plans SET next_at=MIN(next_at,?) WHERE server_id=?',(max(now,after),target))
             db.execute('UPDATE vps_rotations SET next_switch_at=MIN(next_switch_at,?) WHERE id=?',(now,rid))
             cancellable=(r['phase']=='draining' and r['drain_server_id']==target

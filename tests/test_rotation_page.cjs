@@ -25,6 +25,6 @@ test('live response cannot overwrite an open editor or navigate back after leavi
  c.page='servers';await timers[0]();assert.match(elements.adminRotationsContent.innerHTML,/unsaved changes/);
 });
 test('live refresh updates data used by controls rather than retaining stale enabled state',async()=>{
- const {c,timers,elements}=setup();const data={rotations:[{...plan,urgent_probe_floors:'{}'}],bindings:[]};elements['rotationLive-7']={};
- c.api=async()=>({rotations:[{...plan,enabled:0,status:'已暂停'}],bindings:[]});c.startAdminRotationLive(data);await timers[0]();assert.equal(data.rotations[0].enabled,0);assert.match(elements['rotationLive-7'].innerHTML,/已暂停/);
+ const {c,timers,elements}=setup();const data={rotations:[{...plan,urgent_probe_floors:'{}'}],bindings:[]};elements['rotationLive-7']={};elements['rotationSummary-7']={};
+ c.api=async()=>({rotations:[{...plan,enabled:0,status:'已暂停'}],bindings:[]});c.startAdminRotationLive(data);await timers[0]();assert.equal(data.rotations[0].enabled,0);assert.match(elements['rotationLive-7'].innerHTML,/已暂停/);assert.equal(elements['rotationSummary-7'].innerHTML,'已暂停');
 });
