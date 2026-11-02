@@ -654,11 +654,19 @@ def report():
         history_ips=clean.get('public_ips') or None
         if clean.get('egress_ips') and 0<=int(time.time())-clean.get('egress_checked',0)<=90:
             history_ips=clean['egress_ips']
+        ipv4_only=_hkt_ipv4_history(db,row['id'],clean)
+        if ipv4_only:
+            history_ips=_ipv4_addresses(history_ips) or _ipv4_addresses(clean.get('public_ips'))
         if history_ips:
-            last=db.execute('SELECT addresses FROM ip_events WHERE server_id=? ORDER BY id DESC LIMIT 1',(row['id'],)).fetchone()
-            addresses=json.dumps(history_ips)
-            if not last or last['addresses']!=addresses:
-                db.execute('INSERT INTO ip_events(server_id,addresses,observed) VALUES(?,?,?)',(row['id'],addresses,int(time.time())))
+            if ipv4_only:
+                last=db.execute("SELECT addresses FROM ip_events WHERE server_id=? AND EXISTS(SELECT 1 FROM json_each(ip_events.addresses) WHERE instr(value,':')=0) ORDER BY id DESC LIMIT 1",(row['id'],)).fetchone()
+                previous=_ipv4_addresses(json.loads(last['addresses'])) if last else None
+                changed=previous!=history_ips
+            else:
+                last=db.execute('SELECT addresses FROM ip_events WHERE server_id=? ORDER BY id DESC LIMIT 1',(row['id'],)).fetchone()
+                changed=not last or last['addresses']!=json.dumps(history_ips)
+            if changed:
+                db.execute('INSERT INTO ip_events(server_id,addresses,observed) VALUES(?,?,?)',(row['id'],json.dumps(history_ips),int(time.time())))
         db.execute('UPDATE servers SET metrics=?,seen=? WHERE id=?',(json.dumps(clean),int(time.time()),row['id']))
         # Fetch at most one command, and mark it issued before replying (no redelivery).
         command=None;now=int(time.time())
@@ -741,6 +749,34 @@ def metric_history(sid):
                        bucket=bucket,seconds=seconds,traffic=traffic_summary(db,sid,now),
                        rx_bps=metrics.get('rx_bps') if online else None,tx_bps=metrics.get('tx_bps') if online else None)
 
+def _ipv4_addresses(addresses):
+    result=set()
+    for value in addresses or []:
+        try:ip=ipaddress.ip_address(value)
+        except (ValueError,TypeError):continue
+        if ip.version==4:result.add(str(ip))
+    return sorted(result)
+
+
+def _hkt_ipv4_history(db,sid,metrics):
+    return ('hkt_dhcp' in metrics.get('capabilities',[]) or
+            bool(db.execute('SELECT 1 FROM hkt_dhcp_apis WHERE server_id=?',(sid,)).fetchone()))
+
+
+_IPV4_HISTORY="""WITH normalized AS (
+    SELECT e.id,e.observed,(SELECT json_group_array(value) FROM (
+        SELECT DISTINCT value FROM json_each(e.addresses)
+        WHERE instr(value,':')=0 ORDER BY value)) AS addresses
+    FROM ip_events e WHERE e.server_id=?
+), observations AS (
+    SELECT * FROM normalized WHERE addresses<>'[]'
+), previous AS (
+    SELECT *,LAG(addresses) OVER (ORDER BY id) AS previous_addresses FROM observations
+), changes AS (
+    SELECT * FROM previous WHERE previous_addresses IS NULL OR addresses<>previous_addresses
+) """
+
+
 @app.get('/api/servers/<int:sid>/ip-history')
 @auth()
 def ip_history(sid):
@@ -752,19 +788,26 @@ def ip_history(sid):
     with connect() as db:
         row=db.execute('SELECT owner_id,metrics,seen FROM servers WHERE id=?',(sid,)).fetchone()
         if not row or (g.user['role']!='admin' and row['owner_id']!=g.user['id']):return error('服务器不存在',404)
+        metrics=json.loads(row['metrics']) if row['metrics'] else {}
+        ipv4_only=_hkt_ipv4_history(db,sid,metrics)
         query="""SELECT e.id,e.addresses,e.observed,
                  (SELECT previous.addresses FROM ip_events previous WHERE previous.server_id=e.server_id AND previous.id<e.id ORDER BY previous.id DESC LIMIT 1) AS previous_addresses
                  FROM ip_events e WHERE e.server_id=?"""
+        if ipv4_only:query=_IPV4_HISTORY+'SELECT id,addresses,observed,previous_addresses FROM changes WHERE 1=1'
         params=[sid]
-        if before is not None:query+=' AND e.id<?';params.append(before)
-        events=db.execute(query+' ORDER BY e.id DESC LIMIT 51',params).fetchall()
+        if before is not None:query+=(' AND id<?' if ipv4_only else ' AND e.id<?');params.append(before)
+        events=db.execute(query+(' ORDER BY id DESC LIMIT 51' if ipv4_only else ' ORDER BY e.id DESC LIMIT 51'),params).fetchall()
         more=len(events)>50;events=events[:50]
-        metrics=json.loads(row['metrics']) if row['metrics'] else {}
-        latest=db.execute('SELECT addresses,observed FROM ip_events WHERE server_id=? ORDER BY id DESC LIMIT 1',(sid,)).fetchone()
-        count=db.execute('SELECT COUNT(*) FROM ip_events WHERE server_id=?',(sid,)).fetchone()[0]
-        return jsonify(events=[{'id':e['id'],'addresses':json.loads(e['addresses']),'observed':e['observed'],
+        if ipv4_only:
+            latest=db.execute(_IPV4_HISTORY+'SELECT addresses,observed FROM changes ORDER BY id DESC LIMIT 1',(sid,)).fetchone()
+            count=db.execute(_IPV4_HISTORY+'SELECT COUNT(*) FROM changes',(sid,)).fetchone()[0]
+        else:
+            latest=db.execute('SELECT addresses,observed FROM ip_events WHERE server_id=? ORDER BY id DESC LIMIT 1',(sid,)).fetchone()
+            count=db.execute('SELECT COUNT(*) FROM ip_events WHERE server_id=?',(sid,)).fetchone()[0]
+        available=bool(_ipv4_addresses(metrics.get('public_ips')) or _ipv4_addresses(metrics.get('egress_ips'))) if ipv4_only else bool(metrics.get('public_ips') or metrics.get('egress_ips'))
+        return jsonify(address_family='ipv4' if ipv4_only else 'all',change_count=max(0,count-1),events=[{'id':e['id'],'addresses':json.loads(e['addresses']),'observed':e['observed'],
                                 'previous_addresses':json.loads(e['previous_addresses']) if e['previous_addresses'] is not None else None} for e in events],
-                       available=bool(metrics.get('public_ips') or metrics.get('egress_ips')),error=metrics.get('egress_error','') if metrics.get('egress_ips') else metrics.get('ip_error',''),seen=row['seen'],
+                       available=available,error=metrics.get('egress_error','') if metrics.get('egress_ips') else metrics.get('ip_error',''),seen=row['seen'],
                        current_addresses=json.loads(latest['addresses']) if latest else None,
                        latest_observed=latest['observed'] if latest else None,total=count,has_more=more,
                        next_cursor=events[-1]['id'] if more else None)
