@@ -86,7 +86,7 @@ def register(app,connect,cipher,auth,body,error,audit):
                 prepared=[]
                 for record in selected:
                     rid=str(record['RecordId']);address=dns.public_v4(record['Value'])
-                    if address!=current:raise dns.IntegrationError('所选线路当前解析不是主 VPS 的新鲜公网 IP，请核对机器与线路')
+                    if address!=current:raise dns.IntegrationError(f'所选线路当前解析不是主 VPS 的新鲜公网 IP：记录 {record["RR"]}.{domain} · {record["Line"]} 当前为 {address}，所选主 VPS 当前为 {current}。请只选择本次需要轮换的线路；已有轮换中的记录请从原计划编辑。')
                     binding={'record_id':rid,'rr':str(record['RR']),'line':str(record['Line']),'domain':domain,'expected_ip':address}
                     fresh=dns.get_dns_record(c,binding);dns.validate_dns_record(fresh,binding,c)
                     existing=db.execute('SELECT * FROM dns_bindings WHERE connection_id=? AND record_id=?',(cid,rid)).fetchone()

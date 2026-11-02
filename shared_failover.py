@@ -45,7 +45,7 @@ def context(db,kind,key):
 def _profile(db,r):
     from failover import probe_config
     p=probe_config(db,r['primary'],r['owner_id'])
-    sig=json.dumps([p['source_id'],p['nodes'],p['interval_s'],p['daily_limit'],p['failure_threshold'],p['monitor_port']])
+    sig=json.dumps([p['source_id'],p['nodes'],p['interval_s'],p['daily_limit'],p['failure_threshold'],dict(p).get('confirm_node'),p['monitor_port']])
     return p,sig
 
 
@@ -98,6 +98,7 @@ def activate(db,kind,key,now):
     db.execute('INSERT INTO shared_failover_attempt(kind,parent_id,attempted_at) VALUES(?,?,?) ON CONFLICT(kind,parent_id) DO UPDATE SET attempted_at=excluded.attempted_at',(kind,key,now))
     db.execute('INSERT INTO ip_monitors(server_id,port,enabled) VALUES(?,?,1) ON CONFLICT(server_id) DO UPDATE SET port=excluded.port,enabled=1,source_id=NULL',(sid,p['monitor_port']))
     db.execute("INSERT INTO detection_plans(server_id,source_id,nodes,interval_s,daily_limit,automatic,next_at,response_mode,action_enabled,owner_id,failure_threshold) VALUES(?,?,?,?,?,1,?,'none',0,?,?) ON CONFLICT(server_id) DO UPDATE SET source_id=excluded.source_id,nodes=excluded.nodes,interval_s=excluded.interval_s,daily_limit=excluded.daily_limit,automatic=1,next_at=excluded.next_at,response_mode='none',action_enabled=0,owner_id=excluded.owner_id,failure_threshold=excluded.failure_threshold,failure_streak=0",(sid,p['source_id'],p['nodes'],p['interval_s'],p['daily_limit'],now,r['owner_id'],p['failure_threshold']))
+    db.execute('UPDATE detection_plans SET confirm_node=? WHERE server_id=?',(dict(p).get('confirm_node'),sid))
     db.execute('INSERT INTO shared_failover_probe(backup_id,kind,parent_id,signature,switched_at,run_floor) VALUES(?,?,?,?,?,?) ON CONFLICT(backup_id) DO UPDATE SET kind=excluded.kind,parent_id=excluded.parent_id,signature=excluded.signature,switched_at=excluded.switched_at,run_floor=excluded.run_floor',(sid,kind,key,sig,now,floor))
 
 

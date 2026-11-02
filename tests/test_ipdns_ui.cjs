@@ -206,3 +206,7 @@ test('carrier incident while standby repairs is visible as fault handoff, not a 
  const html=ctx.rotationLiveMarkup({enabled:1,phase:'waiting_ip',emergency_probe_after:10,next_switch_at:1,active_name:'A'});
  assert.match(html,/承载异常，备用机恢复中/);assert.match(html,/故障接替优先/);
 });
+test('young-IP reuse is labelled separately from draining and IP changes',()=>{
+ const html=ctx.rotationDrainHistory({drain_statistics:{records:[{server_id:1,old_ip:'8.8.8.8',started:1,outcome:'reused',threshold:80}]}});
+ assert.match(html,/复用，未换 IP/);assert.match(html,/不计排空平均/);
+});
