@@ -149,7 +149,7 @@ function rotationLiveMarkup(r){
  const phase=(r.failover_leases?.length||r.primary_failover_active)?'A 故障转移接替中':r.group_pending?'多记录协调中':{active:r.mode==='fixed_primary'?(r.active_server_id===r.primary_server_id?'主机服务中，等待切入':'轮换机接替中，等待切回'):'等待轮换',draining:'旧机连接排空',waiting_ip:'等待新 IP',waiting_probe:'新 IP 探测中'}[r.phase]||r.phase;
  const left=Math.max(0,Math.ceil(r.next_switch_at-Date.now()/1000));
  const clock=[Math.floor(left/3600),Math.floor(left%3600/60),left%60].map(x=>String(x).padStart(2,'0')).join(':');
- const countdown=(r.failover_leases?.length||r.primary_failover_active)?'故障接替期间暂停定时轮换':r.group_pending?'等待全部记录完成切换与恢复':!r.enabled?'已暂停':r.phase!=='active'?'恢复流程中；完成后继续轮换':left?clock:'已到计划时间，等待切换条件满足';
+ const countdown=(r.failover_leases?.length||r.primary_failover_active)?'故障接替期间暂停定时轮换':r.group_pending?'等待全部记录完成切换与恢复':!r.enabled?'已暂停':r.phase!=='active'?(left?'恢复流程中；保留原定轮换时间':'已到轮换时间，等待备用机换 IP 并复检；就绪后切换'):left?clock:'已到计划时间，等待切换条件满足';
  return `<p><strong>轮换状态：${r.enabled?esc(phase):'定时轮换已暂停，故障切换保留'}</strong> · 当前承载 ${esc(r.active_name)}<br>下次 DNS 切换：${esc(new Date(r.next_switch_at*1000).toLocaleString())}<br><strong>轮换倒计时：${countdown}</strong><br>${esc(r.status||'等待执行')}</p>${rotationDrainMarkup(r)}`;
 }
 function rotationHistoryMarkup(r){return `${rotationDrainHistory(r)}<h4>最近轮换记录</h4>${(r.events||[]).map(e=>`<div class="audit-row">${esc(e.message)}<small>${esc(new Date(e.created*1000).toLocaleString())} · VPS #${e.server_id}</small></div>`).join('')||'<p>暂无轮换记录；首次执行后显示。</p>'}`;}

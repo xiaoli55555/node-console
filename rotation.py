@@ -905,7 +905,9 @@ def _run_rotation(connect,cipher,rid,now):
                 with socket.create_connection((ip,port),timeout=4):pass
             except OSError:
                 db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('BOCE 已通过，但新 IP 业务端口仍不可达',now,rid));return
-            next_at=r['next_switch_at'] if r['next_switch_at']>now else now+max(60,r['interval_s']-r['lead_s'])
+            # Repair time must not extend the current carrier's scheduled tenure.
+            # Keep overdue deadlines due; the next worker pass performs the gated DNS switch.
+            next_at=r['next_switch_at']
             if _fixed(r):next_at=now
             message=f'旧 VPS #{old} 已换到 {ip}，业务端口及 BOCE 复检通过；已重新加入轮换'
             db.execute("UPDATE vps_rotations SET phase='active',emergency=0,drain_server_id=NULL,drain_started=NULL,drain_grace_s=0,old_ip=NULL,new_ip=NULL,action_started=NULL,reboot_command_id=NULL,last_sample_at=NULL,low_samples=0,next_switch_at=?,status=?,updated=? WHERE id=?",(next_at,message,now,rid))

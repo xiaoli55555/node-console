@@ -193,3 +193,8 @@ test('IP statistics distinguish scheduled changes, failures and mere action requ
  assert.match(html,/定时轮换：1 次/);assert.match(html,/连续不通触发：0 次/);assert.match(html,/未确认 IP 变化/);assert.match(html,/&lt;A&gt;/);
  assert.match(ctx.confirmedFailureMarkup([]),/事件次数与换 IP 次数分开/);
 });
+
+test('overdue draining keeps deadline visible instead of promising a fresh cycle',()=>{
+ const html=ctx.rotationLiveMarkup({enabled:1,phase:'draining',next_switch_at:1,active_name:'A'});
+ assert.match(html,/已到轮换时间，等待备用机换 IP 并复检；就绪后切换/);
+});

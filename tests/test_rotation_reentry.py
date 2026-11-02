@@ -56,3 +56,32 @@ class ReentryGate(unittest.TestCase):
         self.assertEqual(f.row()['phase'],'draining')
         rotation._dns_switch(server.connect,server.CIPHER,f.rid,f.clock[0])
         self.assertEqual(f.value('mobile'),'8.8.8.8')
+
+    def ready_standby(self,deadline):
+        f=self.f
+        with server.connect() as db:
+            db.execute("UPDATE vps_rotations SET phase='waiting_probe',drain_server_id=?,old_ip='1.1.1.1',new_ip='8.8.4.4',action_started=?,next_switch_at=? WHERE id=?",(f.sid('B'),f.clock[0]-30,deadline,f.rid))
+        f.refresh('B',ip='8.8.4.4')
+
+    def test_overdue_repair_keeps_deadline_and_switches_next_pass(self):
+        f=self.f;deadline=f.clock[0]-3600;self.ready_standby(deadline)
+        f.tick()
+        self.assertEqual(f.row()['phase'],'active')
+        self.assertEqual(f.row()['next_switch_at'],deadline)
+        self.assertEqual(f.value('mobile'),'8.8.8.8')
+        f.tick()
+        self.assertEqual(f.value('mobile'),'8.8.4.4')
+        self.assertEqual(f.row()['next_switch_at'],f.clock[0]+f.row()['interval_s']-f.row()['lead_s'])
+
+    def test_early_repair_keeps_original_future_deadline(self):
+        f=self.f;deadline=f.clock[0]+3600;self.ready_standby(deadline)
+        f.tick();f.tick()
+        self.assertEqual(f.row()['next_switch_at'],deadline)
+        self.assertEqual(f.value('mobile'),'8.8.8.8')
+
+    def test_overdue_failed_business_port_cannot_handoff_or_reset_deadline(self):
+        f=self.f;deadline=f.clock[0]-3600;self.ready_standby(deadline)
+        with patch('rotation.socket.create_connection',side_effect=OSError('port down')):f.tick()
+        self.assertEqual(f.row()['phase'],'waiting_probe')
+        self.assertEqual(f.row()['next_switch_at'],deadline)
+        self.assertEqual(f.value('mobile'),'8.8.8.8')
