@@ -449,7 +449,17 @@ def register(app,connect,cipher,auth,body,error,audit):
     @auth(admin=True)
     def overview():
         with connect() as db:
-            return jsonify(connections=[safe_config(r) for r in db.execute('SELECT * FROM ip_connections WHERE owner_id IS NULL')],
+            connections=[]
+            has_actions='action_connection_id' in {r[1] for r in db.execute('PRAGMA table_info(detection_plans)')}
+            for r in db.execute('SELECT * FROM ip_connections WHERE owner_id IS NULL'):
+                item=safe_config(r)
+                used={x[0] for x in db.execute('SELECT server_id FROM dns_bindings WHERE connection_id=?',(r['id'],))}
+                used.update(x[0] for x in db.execute('SELECT server_id FROM ip_monitors WHERE source_id=?',(r['id'],)))
+                if r['server_id'] is not None:used.add(r['server_id'])
+                if has_actions:used.update(x[0] for x in db.execute('SELECT server_id FROM detection_plans WHERE action_connection_id=?',(r['id'],)))
+                item['used_by']=[dict(x) for x in db.execute('SELECT id,name FROM servers WHERE id IN ('+','.join('?' for _ in used)+') ORDER BY id',tuple(used))] if used else []
+                connections.append(item)
+            return jsonify(connections=connections,
                 bindings=[dict(r) for r in db.execute('SELECT b.* FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id WHERE c.owner_id IS NULL')],
                 events=[dict(r) for r in db.execute('SELECT * FROM dns_events ORDER BY id DESC LIMIT 50')],
                 servers=[dict(r) for r in db.execute('SELECT id,name FROM servers')],
@@ -701,6 +711,20 @@ def register(app,connect,cipher,auth,body,error,audit):
         try:return jsonify(check_monitor(connect,sid,cipher))
         except IntegrationError as e:return error(str(e))
 
+    @app.patch('/api/ip-dns/connections/<int:cid>')
+    @auth(admin=True)
+    def rename_connection(cid):
+        d=body();name=d.get('name')
+        if set(d)!={'name'} or not isinstance(name,str) or not 1<=len(name.strip())<=80:
+            return error('API 名称需为 1～80 字符；改名入口只接受名称')
+        with connect() as db:
+            row=db.execute('SELECT name,owner_id FROM ip_connections WHERE id=?',(cid,)).fetchone()
+            if not row:return error('API 连接不存在',404)
+            if row['owner_id'] is not None:return error('客户专属 API 不可通过管理员入口改名',403)
+            db.execute('UPDATE ip_connections SET name=? WHERE id=?',(name.strip(),cid))
+            audit(db,'修改 API 名称 #'+str(cid)+'：'+row['name']+' → '+name.strip())
+        return jsonify(ok=True,id=cid,name=name.strip())
+
     @app.post('/api/ip-dns/connections')
     @auth(admin=True)
     def save_connection():
@@ -732,7 +756,6 @@ def register(app,connect,cipher,auth,body,error,audit):
                 if url:
                     product,secret=parse_moonvm_url(url)
                     config={'provider':'moonvm','product':product}
-                    name='MoonVM 产品 '+product
                 elif d.get('id'):
                     with connect() as db:old=load_connection(db,cipher,d['id'])
                     if old['kind']!='change_ip' or old['config'].get('provider')!='moonvm':raise IntegrationError('请粘贴完整的 MoonVM API 链接')

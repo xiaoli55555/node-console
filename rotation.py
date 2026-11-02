@@ -423,6 +423,26 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
     def admin_rotations():
         with connect() as db:
             return jsonify(rotations=[dict(_rotation_json(db,r),owner_role=db.execute('SELECT role FROM users WHERE id=?',(r['owner_id'],)).fetchone()['role']) for r in rotation_groups.roots(db)],servers=[dict(x) for x in db.execute('SELECT id,name FROM servers')],bindings=[dict(x) for x in db.execute('SELECT b.id,b.server_id,b.domain,b.rr,b.line,b.expected_ip,c.owner_id AS credential_owner FROM dns_bindings b JOIN ip_connections c ON c.id=b.connection_id')],dns_connections=[dict(x) for x in db.execute("SELECT id,name,kind,json_extract(config,'$.zone_name') AS zone_name FROM ip_connections WHERE owner_id IS NULL AND kind IN ('alidns','cloudflare')")])
+    @app.patch('/api/admin/rotations/<int:rid>/failover')
+    @auth(admin=True)
+    def admin_rotation_failover(rid):
+        d=body()
+        if not isinstance(d,dict) or not d or set(d)-{'failover_server_id','failover_recovery_s'}:
+            return error('此入口只保存故障转移 VPS 和恢复稳定时间')
+        if 'failover_server_id' in d and d['failover_server_id'] is not None and type(d['failover_server_id'])is not int:
+            return error('请选择故障转移 VPS，或选择不启用')
+        now=int(time.time())
+        try:
+            with connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                root=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
+                if not root:return error('轮换计划不存在',404)
+                group=rotation_groups.members(db,root)
+                for member in group:failover.configure(db,cipher,member['id'],d,now)
+                audit(db,'配置轮换计划故障转移 #'+str(rid))
+                result=_rotation_json(db,db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone())
+            return jsonify(ok=True,rotation=result)
+        except IntegrationError as e:return error(str(e),409)
     @app.get('/api/admin/rotation-drain-statistics')
     @auth(admin=True)
     def admin_drain_statistics():

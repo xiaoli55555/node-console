@@ -81,6 +81,8 @@ def register(app,connect,cipher,auth,body,error,audit):
     @app.post('/api/admin/servers/<int:sid>/hkt-dhcp/api')
     @auth(admin=True)
     def generate(sid):
+        name=body().get('name')
+        if name is not None and (not isinstance(name,str) or not 1<=len(name.strip())<=80):return error('API 名称需为 1～80 字符')
         token=secrets.token_urlsafe(40)
         with connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -93,7 +95,8 @@ def register(app,connect,cipher,auth,body,error,audit):
             config=json.dumps({'provider':'agent_dhcp','server_id':sid})
             if old:
                 cid=old['connection_id'];db.execute('UPDATE ip_connections SET config=?,secret=? WHERE id=?',(config,cipher.encrypt(token.encode()).decode(),cid))
-            else:cid=db.execute("INSERT INTO ip_connections(name,kind,config,secret,server_id) VALUES(?,'change_ip',?,?,?)",('HKT DHCP VPS #'+str(sid),config,cipher.encrypt(token.encode()).decode(),sid)).lastrowid
+                if name is not None:db.execute('UPDATE ip_connections SET name=? WHERE id=?',(name.strip(),cid))
+            else:cid=db.execute("INSERT INTO ip_connections(name,kind,config,secret,server_id) VALUES(?,'change_ip',?,?,?)",(name.strip() if name is not None else node['name']+' · HKT 换 IP',config,cipher.encrypt(token.encode()).decode(),sid)).lastrowid
             floor=db.execute('SELECT COALESCE(MAX(id),0) FROM commands WHERE server_id=?',(sid,)).fetchone()[0]
             db.execute('INSERT OR REPLACE INTO hkt_dhcp_apis VALUES(?,?,?,?)',(sid,cid,hashlib.sha256(token.encode()).hexdigest(),floor))
             audit(db,'生成 HKT DHCP 专属 API VPS #'+str(sid))

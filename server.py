@@ -493,11 +493,13 @@ def add_server():
 @app.patch('/api/servers/<int:sid>')
 @auth(True)
 def assign(sid):
-    owner=body().get('owner_id')
-    if owner is not None and type(owner) is not int:return error('客户编号无效')
+    d=body();name=d.get('name')
+    if 'name' in d and (not isinstance(name,str) or not 1<=len(name.strip())<=64):return error('服务器名称需为 1～64 字符')
     with connect() as db:
-        current=db.execute('SELECT id,owner_id FROM servers WHERE id=?',(sid,)).fetchone()
+        current=db.execute('SELECT id,name,owner_id FROM servers WHERE id=?',(sid,)).fetchone()
         if not current:return error('服务器不存在',404)
+        owner=d.get('owner_id',current['owner_id'])
+        if owner is not None and type(owner) is not int:return error('客户编号无效')
         if owner is not None and not db.execute("SELECT id FROM users WHERE id=? AND role='client'",(owner,)).fetchone():return error('客户不存在')
         if current['owner_id']!=owner and db.execute('SELECT 1 FROM server_failovers WHERE server_id=? OR backup_id=?',(sid,sid)).fetchone():return error('请先安全移除该服务器的故障转移配置再变更归属',409)
         if current['owner_id']!=owner and db.execute('SELECT 1 FROM vps_rotations r WHERE (r.primary_server_id=? OR r.other_server_id=? OR r.failover_server_id=?) AND r.failover_server_id IS NOT NULL',(sid,sid,sid)).fetchone():return error('服务器已配置冷备用，请先安全停用故障转移再变更归属',409)
@@ -521,7 +523,12 @@ def assign(sid):
                 db.execute('UPDATE detection_sources SET enabled=0,secret=?,verified_at=NULL WHERE id IN ('+marks+')',(empty_secret,*private_ids))
                 db.execute("UPDATE detection_plans SET automatic=0,action_enabled=0,response_mode='none',action_connection_id=NULL,owner_id=NULL,failure_streak=0,failure_ip=NULL,failure_port=NULL,status='客户变更，等待新探测配置' WHERE server_id=? AND source_id IN ("+marks+")",(sid,*private_ids))
                 db.execute("UPDATE detection_runs SET action_status='cancelled',action_result='服务器归属已变更，旧客户的探测 Key 已停用' WHERE server_id=? AND source_id IN ("+marks+") AND action_status IN ('queued','issued','submitted','uncertain','verifying')",(sid,*private_ids))
-        db.execute('UPDATE servers SET owner_id=? WHERE id=?',(owner,sid));audit(db,f'服务器 #{sid} 分配给客户 #{owner}')
+        if 'owner_id' in d:
+            db.execute('UPDATE servers SET owner_id=? WHERE id=?',(owner,sid))
+            audit(db,f'服务器 #{sid} 分配给客户 #{owner}')
+        if 'name' in d:
+            db.execute('UPDATE servers SET name=? WHERE id=?',(name.strip(),sid))
+            audit(db,f'修改服务器 #{sid} 名称：{current["name"]} → {name.strip()}')
     return jsonify(ok=True)
 
 @app.post('/api/servers/<int:sid>/rotate')
