@@ -299,7 +299,7 @@ class SelectedNodeFailure(unittest.TestCase):
         CREATE TABLE ip_monitors(server_id INTEGER,port INTEGER,enabled INTEGER);
         CREATE TABLE detection_sources(id INTEGER,enabled INTEGER);
         INSERT INTO detection_sources VALUES(7,1);
-        CREATE TABLE detection_runs(id INTEGER PRIMARY KEY,server_id INTEGER,source_id INTEGER,nodes TEXT,ip TEXT,port INTEGER,updated INTEGER,details TEXT);
+        CREATE TABLE detection_runs(id INTEGER PRIMARY KEY,server_id INTEGER,source_id INTEGER,nodes TEXT,ip TEXT,port INTEGER,updated INTEGER,details TEXT,status TEXT NOT NULL DEFAULT 'completed');
         INSERT INTO detection_plans VALUES(1,7,'["13","42"]',3,120,1);
         INSERT INTO ip_monitors VALUES(1,443,1);''')
         self.rows=[{'node_id':'13','state':'unreachable'},{'node_id':'42','state':'unreachable'}]
@@ -307,6 +307,11 @@ class SelectedNodeFailure(unittest.TestCase):
     def tearDown(self):self.guard.stop();self.db.close()
     def add(self,rows=None,ip='8.8.8.8',source=7,port=443,updated=1000):
         self.db.execute('INSERT INTO detection_runs(server_id,source_id,nodes,ip,port,updated,details) VALUES(1,?,?,?,?,?,?)',(source,'["13","42"]',ip,port,updated,json.dumps(self.rows if rows is None else rows)))
+    def test_pending_job_does_not_hide_three_completed_selected_node_failures(self):
+        self.add();self.add();self.add();self.add(rows=[])
+        self.db.execute("UPDATE detection_runs SET status='pending' WHERE id=(SELECT MAX(id) FROM detection_runs)")
+        self.assertTrue(rotation._fixed_failure(self.db,1,1000))
+
     def test_only_selected_nodes_and_configured_failure_threshold_are_required(self):
         self.add();self.add()
         self.assertFalse(rotation._fixed_failure(self.db,1,1000))

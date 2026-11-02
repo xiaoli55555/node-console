@@ -202,3 +202,7 @@ test('preload refresh has a separate cause and observed change count',()=>{
  const html=ctx.rotationIPActionMarkup({ip_actions:[{reason:'preload_refresh',old_ip:'1.1.1.1',new_ip:'8.8.8.8',ip_seen:10,started:1,attempt:1}]});
  assert.match(html,/承载前 5 分钟补换 IP/);assert.match(html,/承载前补换：1 次/);assert.match(html,/定时轮换：0 次/);
 });
+test('carrier incident while standby repairs is visible as fault handoff, not a scheduled wait',()=>{
+ const html=ctx.rotationLiveMarkup({enabled:1,phase:'waiting_ip',emergency_probe_after:10,next_switch_at:1,active_name:'A'});
+ assert.match(html,/承载异常，备用机恢复中/);assert.match(html,/故障接替优先/);
+});
