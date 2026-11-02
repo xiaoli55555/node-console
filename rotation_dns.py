@@ -1,6 +1,7 @@
 """Admin rotation DNS picker: read provider records, explicitly save a local binding."""
 import re
 import sqlite3
+import time
 from flask import jsonify
 import ip_dns as dns
 
@@ -91,13 +92,18 @@ def register(app,connect,cipher,auth,body,error,audit):
                     fresh=dns.get_dns_record(c,binding);dns.validate_dns_record(fresh,binding,c)
                     existing=db.execute('SELECT * FROM dns_bindings WHERE connection_id=? AND record_id=?',(cid,rid)).fetchone()
                     if existing:
-                        if existing['server_id']!=sid:raise dns.IntegrationError('该记录已绑定其他 VPS，不能在这里抢占')
-                        if db.execute('SELECT 1 FROM vps_rotations WHERE binding_id=?',(existing['id'],)).fetchone():raise dns.IntegrationError('该记录已用于轮换，请从原计划编辑')
-                        if (existing['domain'],existing['rr'],existing['line'],existing['expected_ip'])!=(domain,binding['rr'],binding['line'],address):raise dns.IntegrationError('已有绑定与当前记录不一致，请先核对原绑定')
+                        owner=db.execute('SELECT id FROM vps_rotations WHERE binding_id=?',(existing['id'],)).fetchone()
+                        if owner:raise dns.IntegrationError('该记录仍由轮换计划 #'+str(owner['id'])+' 管理；暂停不释放记录，请先删除该计划')
+                        from failover import guarded
+                        if guarded(db,existing['id']):raise dns.IntegrationError('该记录仍由故障转移接管，不能重新绑定')
+                        if existing['server_id']!=sid and existing['automatic']:raise dns.IntegrationError('该记录仍开启另一台 VPS 的自动解析，请先停用后再重新选择')
+                        if (existing['domain'],existing['rr'],existing['line'])!=(domain,binding['rr'],binding['line']):raise dns.IntegrationError('已有绑定的域名、主机名或线路身份不一致，请先核对')
                     prepared.append((existing,binding))
                 chosen=[]
                 for existing,binding in prepared:
                     bid=existing['id'] if existing else db.execute('INSERT INTO dns_bindings(server_id,connection_id,domain,record_id,rr,line,expected_ip,port,automatic) VALUES(?,?,?,?,?,?,?,?,0)',(sid,cid,domain,binding['record_id'],binding['rr'],binding['line'],current,monitor['port'])).lastrowid
+                    if existing:
+                        db.execute("UPDATE dns_bindings SET server_id=?,expected_ip=?,port=?,source_id=NULL,automatic=0,candidate=NULL,candidate_since=NULL,status='记录已重新选用，等待新轮换配置',updated=? WHERE id=?",(sid,current,monitor['port'],int(time.time()),bid))
                     chosen.append({'id':bid,'server_id':sid,**binding,'credential_owner':None})
                     audit(db,'后台轮换选择 DNS 记录（仅面板绑定，未修改 DNS） #'+str(bid))
                 return jsonify(ok=True,binding=chosen[0],bindings=chosen,message='已选用 '+str(len(chosen))+' 条记录，仅保存面板绑定；未修改供应商 DNS')

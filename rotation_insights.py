@@ -63,7 +63,10 @@ def record_progress(db,before,after,now):
         incident=db.execute('SELECT 1 FROM detection_incidents WHERE server_id=? AND ip=? AND confirmed_at IS NOT NULL AND confirmed_at<=? AND (closed_at IS NULL OR closed_at>=?) LIMIT 1',(sid,old_ip,now,now)).fetchone()
         reason='probe_failure' if incident else ('unknown' if after['emergency'] or after['fault_recovery'] else ('preload_refresh' if dict(after).get('preload_refresh_deadline')==after['next_switch_at'] else 'scheduled_rotation'))
         from rotation_groups import forced_drain_satisfied
-        if reason=='scheduled_rotation' and after['low_samples']<2 and forced_drain_satisfied(after,now):reason='forced_drain'
+        samples=dict(after).get('low_samples')
+        if reason in ('scheduled_rotation','preload_refresh'):
+            if type(samples)is not int:reason='unknown'
+            elif samples<2 and forced_drain_satisfied(after,now):reason='forced_drain'
         db.execute('INSERT OR IGNORE INTO rotation_recovery_timings(rotation_id,attempt,server_id,started,reason,old_ip) VALUES(?,?,?,?,?,?)',(after['id'],after['action_attempts'],sid,after['action_started'] or now,reason,old_ip))
     sid=after['drain_server_id'] or before['drain_server_id']
     if sid and after['phase']=='waiting_probe' and before['phase']!='waiting_probe':

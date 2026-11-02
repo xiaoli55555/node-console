@@ -230,6 +230,14 @@ class FastRecovery(unittest.TestCase):
             record_progress(db,before,after,f.clock[0])
             self.assertEqual(db.execute('SELECT reason FROM rotation_recovery_timings WHERE rotation_id=?',(f.rid,)).fetchone()[0],'scheduled_rotation')
 
+    def test_forced_preload_is_counted_as_forced_reclamation(self):
+        from rotation_insights import record_progress
+        f=self.f;before=dict(f.row());start=f.clock[0]-3601
+        after=dict(before,phase='waiting_ip',drain_server_id=f.sid('B'),old_ip='1.1.1.1',action_started=f.clock[0],action_attempts=1,drain_started=start,low_samples=0,preload_refresh_deadline=before['next_switch_at'],force_drain_threshold=200,force_drain_samples=json.dumps({'started':start,'threshold':200,'count':2,'stamp':f.clock[0]}))
+        with server.connect() as db:
+            record_progress(db,before,after,f.clock[0])
+            self.assertEqual(db.execute('SELECT reason FROM rotation_recovery_timings WHERE rotation_id=?',(f.rid,)).fetchone()[0],'forced_drain')
+
     def test_urgent_detection_still_obeys_daily_budget(self):
         f=self.prepare()
         _,sids=rotation.expedite_recovery_probes(server.connect,server.CIPHER)
