@@ -11,6 +11,7 @@ from rotation_insights import record_switch, record_progress
 import failover
 import rotation_groups
 import detection_recheck
+import rotation_timing
 from contextlib import nullcontext
 
 from detectors import boce_dns_gate, queue_reboot
@@ -75,6 +76,7 @@ def initialize(connect):
         for name,definition in [('force_drain_threshold','INTEGER NOT NULL DEFAULT 0'),('force_drain_samples','TEXT'),('urgent_probe_floors','TEXT')]:
             if name not in columns:db.execute(f'ALTER TABLE vps_rotations ADD COLUMN {name} {definition}')
         failover.initialize(db)
+        rotation_timing.initialize(db)
 
 
 # Existing tasks keep their alternating behavior after upgrading.
@@ -165,6 +167,7 @@ def _rotation_json(db,row):
     if mobile_lease:data['active_name']='解析待核对' if mobile_lease['intent'] else (data['failover_name'] or str(data['failover_server_id']))+'（故障转移）'
     if len({p['active_server_id'] for p in group})>1:data['active_name']='多条记录切换中'
     data['drain_statistics']=_drain_statistics(db,row)
+    data['timing']=rotation_timing.snapshot(db,row,int(time.time()))
     data['events']=[dict(e) for e in db.execute('SELECT server_id,message,created FROM vps_rotation_events WHERE rotation_id IN ('+','.join('?' for _ in group)+') ORDER BY id DESC LIMIT 50',data['member_ids'])]
     return data
 
@@ -296,6 +299,7 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
 
                 if not enabled:db.execute("UPDATE vps_rotations SET enabled=0,status='轮换已暂停' WHERE id=?",(rid,))
                 failover.configure(db,cipher,rid,d,now)
+                if not rotation:rotation_timing.change(db,rid,sid,active_ip,int(time.time()),'plan_created')
                 audit(db,'配置双 VPS 定时轮换 #'+str(rid))
                 return jsonify(ok=True,rotation=_rotation_json(db,db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()))
         except IntegrationError as e:return error(str(e),409)
@@ -589,6 +593,7 @@ def _reconcile_fixed_dns(connect,cipher,rid,now):
         delay=r['interval_s'] if target==r['other_server_id'] else 0
         message='已回读确认此前 DNS 切换结果，恢复固定主机协调流程'
         record_switch(db,rid,binding,intent['from'],intent['to'],intent['submitted'],now,ttl,bool(record.get('proxied',False)))
+        rotation_timing.change(db,rid,target,intent['to'],now,'dns_reconciled')
         db.execute('UPDATE dns_bindings SET expected_ip=?,status=?,updated=? WHERE id=?',(intent['to'],message,now,binding['id']))
         db.execute('UPDATE vps_rotations SET active_server_id=?,phase=?,drain_server_id=?,drain_started=?,drain_grace_s=?,old_ip=?,new_ip=NULL,action_started=NULL,reboot_command_id=NULL,last_sample_at=NULL,low_samples=?,emergency=?,next_switch_at=?,dns_intent=NULL,status=?,updated=? WHERE id=?',(target,phase,None if normal_takeover else old,None if normal_takeover else now,0 if emergency or normal_takeover else ttl+60,None if normal_takeover else intent['from'],2 if emergency else 0,emergency,now+delay,message,now,rid))
         if emergency:db.execute('UPDATE vps_rotations SET fault_recovery=1 WHERE id=?',(rid,))
@@ -736,6 +741,7 @@ def _dns_switch(connect,cipher,rotation,now,emergency=False,offline=False):
         validate_dns_record(updated,expected,conn)
         if _fixed(r):db.execute('UPDATE vps_rotations SET dns_intent=NULL WHERE id=?',(rotation,))
         record_switch(db,rotation,binding,old_ip,target_ip,submitted,int(time.time()),ttl,bool(record.get('proxied',False)))
+        rotation_timing.change(db,rotation,target,target_ip,int(time.time()),'fault_switch' if emergency else 'scheduled_switch')
         message=f"DNS 已从 {old_ip} 切换到 {target_ip}；等待旧 VPS #{r['active_server_id']} 连接降到阈值以下"
         if offline:message=f'承载 VPS 离线，DNS 已从 {old_ip} 切到 {target_ip}；旧机等待恢复，未执行换 IP'
         db.execute('UPDATE dns_bindings SET expected_ip=?,status=?,updated=? WHERE id=?',(target_ip,message,now,binding['id']))
@@ -1135,6 +1141,7 @@ def _sync_external_dns(connect,cipher,rid,now,force=False):
         phase='draining' if drain else 'active'
         delay=r['interval_s'] if _fixed(r) and target==r['other_server_id'] else max(60,r['interval_s']-r['lead_s'])
         message=f'已识别手动解析 {binding["expected_ip"]} → {actual}；当前承载 VPS #{target}，已核验并重建轮换计时'
+        rotation_timing.change(db,rid,target,actual,now,'manual_dns_observed')
         if preserve:
             db.execute('UPDATE dns_bindings SET expected_ip=?,automatic=0,status=?,updated=? WHERE id=?',(actual,message,now,binding['id']))
             db.execute('UPDATE vps_rotations SET external_dns_pending=0,next_switch_at=?,external_dns_check_at=?,fault_recovery=CASE WHEN enabled=1 THEN 0 ELSE fault_recovery END,emergency_probe_after=NULL,urgent_probe_floors=NULL,status=?,updated=? WHERE id=?',(now+delay,now,message+'；另一台原有排空/换 IP/复检继续跟踪',now,rid))
@@ -1210,7 +1217,9 @@ def tick(connect,cipher,rotation_ids=None):
         if rotation_ids is not None:ids=[rid for rid in ids if rid in rotation_ids]
         for rid in ids:
             try:
-                with connect() as db:before=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
+                with connect() as db:
+                    before=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
+                    rotation_timing.ensure_observed(db,before,int(time.time()))
                 _run_rotation(connect,cipher,rid,int(time.time()))
                 with connect() as db:
                     after=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()

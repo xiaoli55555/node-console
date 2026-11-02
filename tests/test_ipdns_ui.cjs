@@ -1,5 +1,18 @@
 const test=require('node:test'),assert=require('node:assert/strict'),vm=require('node:vm'),fs=require('node:fs');
 const source=fs.readFileSync('web/ipdns.js','utf8');const ctx=vm.createContext({esc:v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),console});vm.runInContext(source,ctx);
+test('carrier timers use server time, advance without mutating response and separate deadlines',()=>{
+ let now=500000;const clockCtx=vm.createContext({esc:String,Date:class extends Date{static now(){return now;}}});vm.runInContext(source,clockCtx);
+ const r={enabled:1,timing:{server_now:1000,current:{started:900,censored:0},switch_deadline:990,drain_timeout_at:1030,force_threshold:200,action_observe_until:995}};
+ const before=JSON.stringify(r);let html=clockCtx.rotationTimingMarkup(r);
+ assert.match(html,/已承载 0 小时 1 分 40 秒/);assert.match(html,/已超过切换时间 0 小时 0 分 10 秒/);
+ assert.match(html,/剩余 0 小时 0 分 30 秒/);assert.match(html,/已超出 0 小时 0 分 5 秒/);
+ now+=10000;html=clockCtx.rotationTimingMarkup(r);assert.match(html,/已承载 0 小时 1 分 50 秒/);assert.equal(JSON.stringify(r),before);
+});
+test('carrier history marks unknown original start and escapes names and reasons',()=>{
+ const r={enabled:0,timing:{server_now:1000,current:{started:900,censored:1},history:[{server_name:'<node>',ip:'1.2.3.4',started:800,finished:900,elapsed_s:100,censored:1,deadline:850,overdue_s:50,reason:'first_observed',end_reason:'<reason>'}]}};
+ assert.match(ctx.rotationTimingMarkup(r),/至少已观察承载/);assert.match(ctx.rotationTimingMarkup(r),/定时已暂停，承载计时继续/);
+ const html=ctx.rotationCarrierHistory(r);assert.match(html,/至少观察到承载/);assert.match(html,/切换超时 0 小时 0 分 50 秒/);assert.match(html,/&lt;node&gt;/);assert.match(html,/&lt;reason&gt;/);assert.doesNotMatch(html,/<node>/);
+});
 test('monitor cards show selected VPS only, scoped controls and old IP',()=>{const html=ctx.monitorMarkup({monitors:[{server_id:7,name:'CMHK',enabled:1,current_ip:'1.1.1.1',previous_ip:'8.8.8.8',port:443,status:'ready'}],bindings:[{automatic:1,server_id:7}],servers:[{id:7},{id:8}]});assert.match(html,/CMHK/);assert.match(html,/8\.8\.8\.8/);for(const action of ['check','config','bind','history','remove'])assert.match(html,new RegExp('data-monitor-'+action+'="7"'));assert.doesNotMatch(html,/data-monitor-check="8"/);});
 test('empty state invites explicit VPS selection and escapes node names',()=>{assert.match(ctx.monitorMarkup({monitors:[],bindings:[]}),/尚未选择 VPS/);assert.match(ctx.monitorMarkup({monitors:[{server_id:1,name:'<script>',enabled:0,port:443}],bindings:[]}),/&lt;script&gt;/);});
 test('DNS line labels distinguish common carriers and retain unknown API line codes',()=>{assert.equal(ctx.dnsLineLabel('telecom'),'电信（telecom）');assert.equal(ctx.dnsLineLabel('mobile'),'移动（mobile）');assert.equal(ctx.dnsLineLabel('custom-line'),'线路（custom-line）');});

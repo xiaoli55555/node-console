@@ -298,6 +298,9 @@ def _move(connect,cipher,rid,bid,target,now,restore=False):
 
 
 def _finish(db,r,b,target,restore,now):
+    import rotation_timing
+    peer=db.execute('SELECT * FROM vps_rotations WHERE binding_id=?',(b['id'],)).fetchone()
+    if peer:rotation_timing.change(db,peer['id'],r['primary_server_id'] if restore else r['failover_server_id'],target,now,'failover_restore' if restore else 'failover_takeover')
     message=('A 恢复，解析已切回 ' if restore else 'A 下线，解析已由故障转移 VPS 接替：')+target
     db.execute('UPDATE dns_bindings SET expected_ip=?,candidate=NULL,candidate_since=NULL,status=?,updated=? WHERE id=?',(target,message,now,b['id']))
     import rotation as rot
