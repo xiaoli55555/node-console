@@ -65,3 +65,28 @@ class DrainStatistics(unittest.TestCase):
         self.assertEqual(record['outcome'],'pending')
         self.assertEqual(record['threshold'],f.row()['connection_threshold'])
         self.assertEqual(len(self.stats()['records']),1)
+    def test_action_reason_and_observed_ip_are_separate_from_requests(self):
+        from rotation_insights import record_progress
+        f=self.f;before=dict(f.row());after=dict(before,action_attempts=before['action_attempts']+1,drain_server_id=f.sid('B'),old_ip='1.1.1.1',action_started=f.clock[0],phase='waiting_ip',emergency=0,fault_recovery=0)
+        with server.connect() as db:
+            record_progress(db,before,after,f.clock[0])
+            record=dict(db.execute('SELECT * FROM rotation_recovery_timings WHERE rotation_id=?',(f.rid,)).fetchone())
+            self.assertEqual(record['reason'],'scheduled_rotation');self.assertIsNone(record['new_ip'])
+            probe=dict(after,phase='waiting_probe',new_ip='8.8.4.4')
+            record_progress(db,after,probe,f.clock[0]+15)
+            record=dict(db.execute('SELECT * FROM rotation_recovery_timings WHERE rotation_id=?',(f.rid,)).fetchone())
+            self.assertEqual(record['new_ip'],'8.8.4.4');self.assertIsNone(record['verified'])
+    def test_emergency_without_confirmed_incident_is_unknown_not_blocked(self):
+        from rotation_insights import record_progress
+        f=self.f;before=dict(f.row());after=dict(before,action_attempts=before['action_attempts']+1,drain_server_id=f.sid('B'),old_ip='1.1.1.1',action_started=f.clock[0],phase='waiting_ip',emergency=1)
+        with server.connect() as db:
+            record_progress(db,before,after,f.clock[0])
+            self.assertEqual(db.execute('SELECT reason FROM rotation_recovery_timings WHERE rotation_id=?',(f.rid,)).fetchone()[0],'unknown')
+    def test_confirmed_current_ip_failure_is_classified_separately(self):
+        from rotation_insights import record_progress
+        f=self.f;before=dict(f.row());after=dict(before,action_attempts=before['action_attempts']+1,drain_server_id=f.sid('B'),old_ip='1.1.1.1',action_started=f.clock[0],phase='waiting_ip',emergency=1)
+        with server.connect() as db:
+            source=db.execute('SELECT source_id FROM detection_plans WHERE server_id=?',(f.sid('B'),)).fetchone()[0]
+            db.execute("INSERT INTO detection_incidents(server_id,source_id,source_name,ip,port,nodes,threshold,failures,first_failed,last_failed,confirmed_at,state,last_run,details,response_mode) VALUES(?,?,?,'1.1.1.1',443,'[\"13\"]',2,2,?,?,?,'confirmed',1,'[]','change_api')",(f.sid('B'),source,'selected probe',f.clock[0]-15,f.clock[0],f.clock[0]))
+            record_progress(db,before,after,f.clock[0])
+            self.assertEqual(db.execute('SELECT reason FROM rotation_recovery_timings WHERE rotation_id=?',(f.rid,)).fetchone()[0],'probe_failure')

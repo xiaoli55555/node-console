@@ -188,3 +188,8 @@ test('dedicated drain page loads filters and refreshes without DNS actions',asyn
  assert.match(elements.drainStatisticsRows.innerHTML,/&lt;A&gt;/);
  await refresh();assert.deepEqual(requests,['admin/rotation-drain-statistics','admin/rotation-drain-statistics']);
 });
+test('IP statistics distinguish scheduled changes, failures and mere action requests',()=>{
+ const html=ctx.rotationIPActionMarkup({ip_actions:[{reason:'scheduled_rotation',server_name:'<A>',old_ip:'1.1.1.1',new_ip:'8.8.8.8',ip_seen:10,verified:20,started:1,attempt:1},{reason:'probe_failure',old_ip:'1.0.0.1',started:2,attempt:2}]});
+ assert.match(html,/定时轮换：1 次/);assert.match(html,/连续不通触发：0 次/);assert.match(html,/未确认 IP 变化/);assert.match(html,/&lt;A&gt;/);
+ assert.match(ctx.confirmedFailureMarkup([]),/事件次数与换 IP 次数分开/);
+});

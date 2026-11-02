@@ -13,6 +13,7 @@ class InsightStatistics(unittest.TestCase):
         with self.connect() as db:
             db.executescript('''CREATE TABLE vps_rotations(id INTEGER PRIMARY KEY,primary_server_id INTEGER,other_server_id INTEGER,interval_s INTEGER,lead_s INTEGER,offline_after_s INTEGER);
             CREATE TABLE ip_events(id INTEGER PRIMARY KEY,server_id INTEGER,addresses TEXT,observed INTEGER);
+            CREATE TABLE detection_incidents(server_id INTEGER,ip TEXT,confirmed_at INTEGER,closed_at INTEGER);
             CREATE TABLE detection_runs(id INTEGER PRIMARY KEY,server_id INTEGER,ip TEXT,created INTEGER,updated INTEGER,nodes TEXT,details TEXT);
             INSERT INTO vps_rotations VALUES(1,1,2,3000,120,15);''')
         insights.initialize(self.connect)
@@ -44,9 +45,9 @@ class InsightStatistics(unittest.TestCase):
         self.assertEqual(r['dns']['proxied_unobservable'],1);self.assertEqual(r['dns']['trials_without_observations'],1);self.assertEqual(r['dns']['provider_readback']['p95_s'],3)
 
     def test_recovery_stages_are_separate_from_dns_propagation(self):
-        before={'id':1,'action_attempts':0,'drain_server_id':2,'phase':'draining','action_started':None}
+        before={'id':1,'action_attempts':0,'drain_server_id':2,'phase':'draining','action_started':None,'old_ip':'1.1.1.1','emergency':0,'fault_recovery':0}
         sent=dict(before,action_attempts=1,phase='waiting_ip',action_started=100)
-        seen=dict(sent,phase='waiting_probe')
+        seen=dict(sent,phase='waiting_probe',new_ip='8.8.8.8')
         ready=dict(seen,phase='active',drain_server_id=None)
         with self.connect() as db:
             insights.record_progress(db,before,sent,100);insights.record_progress(db,sent,seen,130);insights.record_progress(db,seen,ready,160)

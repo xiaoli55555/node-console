@@ -42,7 +42,11 @@ CREATE TABLE IF NOT EXISTS rotation_analysis_tokens(
 '''
 
 def initialize(connect):
-    with connect() as db:db.executescript(SCHEMA)
+    with connect() as db:
+        db.executescript(SCHEMA)
+        columns={r[1] for r in db.execute('PRAGMA table_info(rotation_recovery_timings)')}
+        for name,definition in [('reason',"TEXT NOT NULL DEFAULT 'unknown'"),('old_ip','TEXT'),('new_ip','TEXT')]:
+            if name not in columns:db.execute(f'ALTER TABLE rotation_recovery_timings ADD COLUMN {name} {definition}')
 
 def digest(token):return hashlib.sha256(token.encode()).hexdigest()
 
@@ -55,10 +59,13 @@ def record_switch(db,rid,binding,old_ip,new_ip,submitted,readback,ttl,proxied=Fa
 def record_progress(db,before,after,now):
     if not before or not after:return
     if after['action_attempts']>before['action_attempts'] and after['drain_server_id']:
-        db.execute('INSERT OR IGNORE INTO rotation_recovery_timings(rotation_id,attempt,server_id,started) VALUES(?,?,?,?)',(after['id'],after['action_attempts'],after['drain_server_id'],after['action_started'] or now))
+        sid=after['drain_server_id'];old_ip=after['old_ip']
+        incident=db.execute('SELECT 1 FROM detection_incidents WHERE server_id=? AND ip=? AND confirmed_at IS NOT NULL AND confirmed_at<=? AND (closed_at IS NULL OR closed_at>=?) LIMIT 1',(sid,old_ip,now,now)).fetchone()
+        reason='probe_failure' if incident else ('unknown' if after['emergency'] or after['fault_recovery'] else 'scheduled_rotation')
+        db.execute('INSERT OR IGNORE INTO rotation_recovery_timings(rotation_id,attempt,server_id,started,reason,old_ip) VALUES(?,?,?,?,?,?)',(after['id'],after['action_attempts'],sid,after['action_started'] or now,reason,old_ip))
     sid=after['drain_server_id'] or before['drain_server_id']
     if sid and after['phase']=='waiting_probe' and before['phase']!='waiting_probe':
-        db.execute('UPDATE rotation_recovery_timings SET ip_seen=COALESCE(ip_seen,?) WHERE rotation_id=? AND attempt=? AND server_id=?',(now,after['id'],after['action_attempts'],sid))
+        db.execute('UPDATE rotation_recovery_timings SET ip_seen=COALESCE(ip_seen,?),new_ip=? WHERE rotation_id=? AND attempt=? AND server_id=?',(now,after['new_ip'],after['id'],after['action_attempts'],sid))
     if sid and after['phase']=='active' and before['phase']=='waiting_probe':
         db.execute('UPDATE rotation_recovery_timings SET verified=? WHERE rotation_id=? AND attempt=? AND server_id=?',(now,after['id'],after['action_attempts'],sid))
     db.execute('DELETE FROM rotation_recovery_timings WHERE started<?',(now-90*86400,))

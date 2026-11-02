@@ -398,7 +398,7 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
     @auth(admin=True)
     def admin_drain_statistics():
         with connect() as db:
-            return jsonify(rotations=[dict(_rotation_json(db,r),drain_statistics=_drain_statistics(db,r,200)) for r in db.execute('SELECT * FROM vps_rotations ORDER BY id')])
+            return jsonify(rotations=[dict(_rotation_json(db,r),drain_statistics=_drain_statistics(db,r,200),ip_actions=[dict(x) for x in db.execute('SELECT t.*,s.name AS server_name FROM rotation_recovery_timings t LEFT JOIN servers s ON s.id=t.server_id WHERE rotation_id=? ORDER BY started DESC,id DESC LIMIT 200',(r['id'],))]) for r in db.execute('SELECT * FROM vps_rotations ORDER BY id')],incidents=[dict(x) for x in db.execute('SELECT d.id,d.server_id,s.name AS server_name,d.ip,d.port,d.confirmed_at,d.closed_at,d.state FROM detection_incidents d JOIN servers s ON s.id=d.server_id WHERE d.confirmed_at IS NOT NULL ORDER BY d.confirmed_at DESC LIMIT 500')])
     app.add_url_rule('/api/admin/servers/<int:sid>/rotation','admin_save_rotation',auth(admin=True)(save_rotation.__wrapped__),methods=['PUT'])
     app.add_url_rule('/api/admin/servers/<int:sid>/rotation/readiness','admin_rotation_readiness',auth(admin=True)(readiness.__wrapped__),methods=['POST'])
     app.add_url_rule('/api/admin/servers/<int:sid>/rotation','admin_delete_rotation',auth(admin=True)(delete_rotation.__wrapped__),methods=['DELETE'])
