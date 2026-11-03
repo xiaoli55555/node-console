@@ -1,5 +1,6 @@
 """Recovered carrier alerts must reflect current health without altering rotation work."""
 import unittest
+from unittest.mock import patch
 import test_rotation_emergency as fixture
 import server
 
@@ -10,6 +11,44 @@ class CarrierAlertRecovery(unittest.TestCase):
     def events(self):
         with server.connect() as db:
             return [x[0] for x in db.execute('SELECT message FROM vps_rotation_events WHERE rotation_id=? ORDER BY id',(self.f.rid,))]
+
+    def test_transient_heartbeat_during_drain_keeps_normal_deadline(self):
+        f=self.f;deadline=f.row()['next_switch_at'];started=f.clock[0]
+        with server.connect() as db:
+            db.execute("UPDATE vps_rotations SET phase='draining',drain_server_id=?,old_ip='1.1.1.1',drain_started=?,drain_grace_s=660 WHERE id=?",(f.sid('B'),started,f.rid))
+        f.down();f.tick()
+        self.assertEqual(f.row()['next_switch_at'],deadline)
+        self.assertIsNotNone(f.row()['emergency_probe_after'])
+        f.advance(5,online=('A','B'));f.tick()
+        r=f.row();self.assertIsNone(r['emergency_probe_after'])
+        self.assertEqual(r['next_switch_at'],deadline);self.assertEqual(r['drain_started'],started)
+        self.assertEqual(r['phase'],'draining');self.assertEqual(f.value('mobile'),'8.8.8.8')
+        f.change.assert_not_called()
+
+    def test_transient_fault_during_ip_action_does_not_force_early_reentry(self):
+        f=self.f;deadline=f.row()['next_switch_at'];started=f.clock[0]
+        with server.connect() as db:
+            db.execute("UPDATE vps_rotations SET phase='waiting_ip',drain_server_id=?,old_ip='1.1.1.1',action_started=? WHERE id=?",(f.sid('B'),started,f.rid))
+        f.down();f.tick()
+        self.assertEqual(f.row()['next_switch_at'],deadline)
+        f.advance(5,online=('A','B'));f.refresh('B',ip='8.8.4.4');f.tick()
+        f.advance(5,online=('A','B'));f.tick()
+        self.assertEqual(f.row()['phase'],'active');self.assertIsNone(f.row()['emergency_probe_after'])
+        self.assertEqual(f.row()['next_switch_at'],deadline);self.assertEqual(f.value('mobile'),'8.8.8.8')
+
+    def test_transient_fault_during_recheck_preserves_deadline(self):
+        f=self.f;deadline=f.row()['next_switch_at']
+        f.refresh('B',ip='8.8.4.4')
+        with server.connect() as db:
+            db.execute("UPDATE vps_rotations SET phase='waiting_probe',drain_server_id=?,old_ip='1.1.1.1',new_ip='8.8.4.4',action_started=? WHERE id=?",(f.sid('B'),f.clock[0]-10,f.rid))
+        with patch('rotation.socket.create_connection',side_effect=OSError('wait for business port')):
+            f.down();f.tick()
+            self.assertEqual(f.row()['next_switch_at'],deadline)
+            f.advance(5,online=('A','B'));f.tick()
+            self.assertIsNone(f.row()['emergency_probe_after'])
+            self.assertEqual(f.row()['phase'],'waiting_probe')
+        f.tick();self.assertEqual(f.row()['phase'],'active')
+        self.assertEqual(f.row()['next_switch_at'],deadline);self.assertEqual(f.value('mobile'),'8.8.8.8')
 
     def test_heartbeat_recovery_clears_alert_without_dns_or_timer_changes(self):
         f=self.f;before=f.row();f.down();f.tick()

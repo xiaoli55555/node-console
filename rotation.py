@@ -854,7 +854,8 @@ def _run_rotation(connect,cipher,rid,now):
                 db.execute('UPDATE vps_rotations SET emergency_probe_after=? WHERE id=?',(after,rid))
                 _event(db,rid,r['active_server_id'],'承载检测异常：'+_carrier_fault_reason(db,r,now)+'；优先请求备用机新一轮探测，就绪后接替',now)
             db.execute('UPDATE detection_plans SET next_at=MIN(next_at,?) WHERE server_id=?',(max(now,after),target))
-            db.execute('UPDATE vps_rotations SET next_switch_at=MIN(next_switch_at,?) WHERE id=?',(now,rid))
+            # Urgent takeover uses emergency_probe_after, not the normal
+            # deadline. A transient heartbeat gap must not shorten this tenure.
             cancellable=(r['phase']=='draining' and r['drain_server_id']==target
                          and r['standby_ready_server']==target
                          and r['preload_base_attempt'] is not None
@@ -1073,12 +1074,12 @@ def _run_rotation(connect,cipher,rid,now):
             next_at=r['next_switch_at']
             if _fixed(r) or r['fault_recovery']:next_at=now
             message=f'旧 VPS #{old} 已换到 {ip}，业务端口及 BOCE 复检通过；备用机已就绪'
-            message+=('；定时已暂停，等待手动启用' if not r['enabled'] else '；承载已到期，准备切换解析' if next_at<=now else '；等待计划切换时间')
+            message+=('；定时已暂停，等待手动启用' if not r['enabled'] else '；承载异常，准备紧急接替' if r['emergency_probe_after'] is not None else '；承载已到期，准备切换解析' if next_at<=now else '；等待计划切换时间')
             db.execute("UPDATE vps_rotations SET phase='active',emergency=0,drain_server_id=NULL,drain_started=NULL,drain_grace_s=0,old_ip=NULL,new_ip=NULL,action_started=NULL,reboot_command_id=NULL,last_sample_at=NULL,low_samples=0,next_switch_at=?,status=?,updated=? WHERE id=?",(next_at,message,now,rid))
             db.execute('UPDATE vps_rotations SET fault_recovery=0 WHERE id=?',(rid,))
             if not _fixed(r):db.execute('UPDATE vps_rotations SET standby_ready_at=?,standby_ready_server=?,reused_ip=NULL,reused_server_id=NULL,drain_base_attempt=NULL WHERE id=?',(now,old,rid))
             _event(db,rid,old,message,now)
-            if not _fixed(r) and r['enabled'] and next_at<=now:
+            if not _fixed(r) and r['enabled'] and (next_at<=now or r['emergency_probe_after'] is not None):
                 ready=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
                 if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='rotation_recovery_timings'").fetchone():record_progress(db,r,ready,now)
                 db.commit()
