@@ -281,7 +281,11 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
                 if record.get('content',record.get('Value'))!=active_ip or binding['expected_ip']!=active_ip:return error('DNS 当前解析必须指向轮换任务当前承载 VPS 的新鲜公网 IP')
                 db.execute('UPDATE dns_bindings SET automatic=0 WHERE id=?',(binding_id,))
                 if rotation:
-                    db.execute('UPDATE vps_rotations SET interval_s=?,connection_threshold=?,enabled=?,status=?,next_switch_at=CASE WHEN ? THEN ? ELSE next_switch_at END,updated=? WHERE id=?',(interval,threshold,int(enabled),'轮换已开启' if enabled else '轮换已暂停',int(enabled),now+interval-lead,now,rotation['id']))
+                    # Editing a running plan must not give its carrier a fresh
+                    # interval. New timing settings apply after the next handoff;
+                    # only re-enabling or changing modes starts a new schedule.
+                    restart_schedule=enabled and (not rotation['enabled'] or rotation['mode']!=mode)
+                    db.execute('UPDATE vps_rotations SET interval_s=?,connection_threshold=?,enabled=?,status=?,next_switch_at=CASE WHEN ? THEN ? ELSE next_switch_at END,updated=? WHERE id=?',(interval,threshold,int(enabled),'轮换已开启' if enabled else '轮换已暂停',int(restart_schedule),now+interval-lead,now,rotation['id']))
                     rid=rotation['id']
                 else:
                     rid=db.execute("INSERT INTO vps_rotations(owner_id,primary_server_id,other_server_id,binding_id,active_server_id,enabled,interval_s,connection_threshold,phase,next_switch_at,status,updated) VALUES(?,?,?,?,?,1,?,?,'active',?,'轮换已开启',?)",(g.user['id'],sid,other,binding_id,sid,interval,threshold,now+interval-lead,now)).lastrowid
