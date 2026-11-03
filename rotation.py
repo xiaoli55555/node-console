@@ -1405,7 +1405,7 @@ def _sync_external_dns(connect,cipher,rid,now,force=False):
         if realign and (r['phase']!='active' or r['action_started'] is not None):
             # Finish observing issued work before changing this member's state.
             return False
-        if not force and not (realign and r['external_dns_pending']) and r['external_dns_check_at'] is not None and now-r['external_dns_check_at']<300:
+        if not force and not realign and r['external_dns_check_at'] is not None and now-r['external_dns_check_at']<300:
             if r['external_dns_pending']:raise IntegrationError('DNS 自动纠正待重试，暂缓后续轮换动作')
             return False
         db.execute('UPDATE vps_rotations SET external_dns_check_at=? WHERE id=?',(now,rid));db.commit()

@@ -127,6 +127,7 @@ class MultiPlan(unittest.TestCase):
     def test_stale_split_probe_is_persisted_and_recovery_does_not_wait_five_minutes(self):
         root,peer=self.split_legacy_group()
         with server.connect() as db:
+            db.execute('UPDATE vps_rotations SET external_dns_check_at=? WHERE id=?',(self.clock[0]-10,peer))
             db.execute('UPDATE detection_runs SET created=?,updated=? WHERE server_id=?',(self.clock[0]-120,self.clock[0]-120,self.sid('B')))
             db.execute('UPDATE detection_plans SET next_at=? WHERE server_id=?',(self.clock[0]+300,self.sid('B')))
         with self.assertRaisesRegex(IntegrationError,'结果过期'):
