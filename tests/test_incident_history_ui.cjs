@@ -14,10 +14,10 @@ test('legacy unknown is never retroactively classified as serving',()=>{
 test('per-VPS filter and older pagination issue only scoped read requests',async()=>{
  const c=setup(),calls=[],elements={modal:{open:false},incidentHistoryContent:{},incidentServerFilter:{value:'4'},incidentCarrierFilter:{checked:true},refreshIncidentHistory:{},incidentLoadMore:{},incidentHistoryRows:{},incidentHistoryError:{}};
  c.$=id=>elements[id];c.navigate=async p=>{c.page=p;};c.notice=()=>{};
- c.api=async path=>{calls.push(path);return {incidents:[event],servers:[{id:4,name:'HKT'}],notice:'notice',has_more:!path.includes('before='),next_cursor:10};};
+ c.api=async path=>{calls.push(path);if(path==='detection/coverage-gaps')return {gaps:[]};return {incidents:[event],servers:[{id:4,name:'HKT'}],notice:'notice',has_more:!path.includes('before='),next_cursor:10};};
  await c.showDetectionIncidents(4);await c.loadIncidentHistory();assert.equal(calls[0],'detection/incidents?server_id=4');
- await elements.incidentCarrierFilter.onchange();await new Promise(resolve=>setImmediate(resolve));assert.equal(calls[1],'detection/incidents?server_id=4&carrier_only=1');
- await elements.incidentLoadMore.onclick();assert.equal(calls[2],'detection/incidents?server_id=4&carrier_only=1&before=10');assert.equal(elements.incidentLoadMore.hidden,true);
+ await elements.incidentCarrierFilter.onchange();await new Promise(resolve=>setImmediate(resolve));assert.equal(calls[2],'detection/incidents?server_id=4&carrier_only=1');
+ await elements.incidentLoadMore.onclick();assert.equal(calls[4],'detection/incidents?server_id=4&carrier_only=1&before=10');assert.equal(elements.incidentLoadMore.hidden,true);
 });
 test('late incident response does not overwrite another page',async()=>{
  const c=setup(),host={innerHTML:'unchanged'};c.$=()=>host;let resolve;c.api=()=>new Promise(r=>resolve=r);

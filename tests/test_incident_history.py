@@ -131,3 +131,44 @@ class IncidentHistory(unittest.TestCase):
         e=self.records()['incidents'][0]['evidence']
         self.assertEqual(e['first']['carrier_state'],'unknown');self.assertIsNone(e['first']['ip_age_s'])
         self.assertEqual(e['confirmed']['carrier_state'],'standby')
+
+
+class CoverageAudit(IncidentHistory):
+    def test_gap_deduplicates_and_freezes_carrier(self):
+        self.bind()
+        with self.connect() as db:
+            db.execute("UPDATE ip_monitors SET current_ip='8.8.8.8' WHERE server_id=1")
+            incident_history.coverage_gap(db,1,self.clock[0],'每日节点检测次数上限')
+            incident_history.coverage_gap(db,1,self.clock[0]+10,'每日节点检测次数上限')
+            rows=db.execute('SELECT * FROM detection_coverage_gaps').fetchall()
+            self.assertEqual(len(rows),1)
+            self.assertEqual(json.loads(rows[0]['evidence'])['carrier_state'],'serving')
+        self.assertEqual(self.client.get('/api/detection/coverage-gaps').status_code,403)
+        result=self.client.get('/api/detection/coverage-gaps',headers=self.headers)
+        self.assertEqual(len(result.json['gaps']),1)
+
+    def test_only_complete_current_target_result_closes_gap(self):
+        with self.connect() as db:
+            now=self.clock[0]
+            db.execute("UPDATE ip_monitors SET current_ip='8.8.8.8' WHERE server_id=1")
+            incident_history.coverage_gap(db,1,now,'检测结果缺失或未知，不能判定目标正常或不通')
+            run={'server_id':1,'ip':'8.8.8.8','source_id':self.source_id,'created':now+1,'nodes':'["a","b"]'}
+            incident_history.coverage_result(db,run,[{'node_id':'a','state':'reachable'}],now+2)
+            self.assertIsNone(db.execute('SELECT finished FROM detection_coverage_gaps').fetchone()[0])
+            incident_history.coverage_result(db,run,[{'node_id':'a','state':'reachable'},{'node_id':'b','state':'unreachable'}],now+3)
+            self.assertEqual(db.execute('SELECT finished FROM detection_coverage_gaps').fetchone()[0],now+3)
+
+    def test_waiting_is_not_a_gap(self):
+        with self.connect() as db:
+            incident_history.coverage_gap(db,1,self.clock[0],'已有检测任务进行中')
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM detection_coverage_gaps').fetchone()[0],0)
+
+    def test_last_pass_is_preserved_with_first_failure(self):
+        self.incident_run(self.source_id,['reachable','reachable'])
+        passed=self.clock[0]
+        self.step()
+        self.incident_run(self.source_id,['unreachable','unreachable'])
+        self.step()
+        self.incident_run(self.source_id,['unreachable','unreachable'])
+        e=self.records()['incidents'][0]['evidence']
+        self.assertEqual(e['last_pass']['observed_at'],passed)

@@ -28,6 +28,7 @@ def initialize(connect):
     _source_nodes_cache.clear()
     with connect() as db:
         db.executescript(SCHEMA)
+        db.executescript(incident_history.AUDIT_SCHEMA)
         detection_recheck.initialize(db)
         # Additive migrations preserve existing monitoring plans and run history.
         migrations={
@@ -211,6 +212,7 @@ def finish(db,run,status,rows,recheck_confirmed=False,reference_confirmed=False)
     plan=db.execute('SELECT p.*,s.kind AS source_kind,s.enabled AS source_enabled FROM detection_plans p JOIN detection_sources s ON s.id=p.source_id WHERE p.server_id=?',(run['server_id'],)).fetchone()
     current=db.execute('SELECT current_ip,enabled,port FROM ip_monitors WHERE server_id=?',(run['server_id'],)).fetchone()
     if plan and plan['source_enabled'] and plan['source_id']==run['source_id'] and plan['nodes']==run['nodes'] and current and current['enabled'] and current['port']==run['port'] and (not current['current_ip'] or current['current_ip']==run['ip']):
+        if new_evidence:incident_history.coverage_result(db,run,rows,now)
         confirm_node=dict(plan).get('confirm_node')
         scheduled=bool(run['scheduled']) if 'scheduled' in run.keys() else False
         if scheduled and plan['automatic'] and (confirm_node or plan['source_kind'] in ('boce','baota','aliyun')):
@@ -383,7 +385,9 @@ def tick(connect,cipher,server_ids=None):
         try:start_run(connect,cipher,sid,scheduled=True)
         except IntegrationError as e:
             retry_after=5 if '已有检测任务进行中' in str(e) else 60
-            with connect() as db:db.execute('UPDATE detection_plans SET next_at=?,status=? WHERE server_id=?',(now+retry_after,str(e),sid))
+            with connect() as db:
+                incident_history.coverage_gap(db,sid,now,str(e))
+                db.execute('UPDATE detection_plans SET next_at=?,status=? WHERE server_id=?',(now+retry_after,str(e),sid))
     if scope is None:execute_change_ip_actions(connect,cipher)
 
 # A successful/uncertain request needs an observation window, not an action cooldown.
@@ -474,6 +478,14 @@ def register(app,connect,cipher,auth,body,error,audit):
         for p in plans:p['nodes']=json.loads(p['nodes'])
         for r in runs:r['details']=json.loads(r['details'])
         return jsonify(sources=sources,plans=plans,runs=runs)
+
+    @app.get('/api/detection/coverage-gaps')
+    @auth(admin=True)
+    def coverage_gaps():
+        with connect() as db:
+            rows=[dict(r) for r in db.execute('SELECT g.*,s.name AS server_name FROM detection_coverage_gaps g JOIN servers s ON s.id=g.server_id ORDER BY g.id DESC LIMIT 500')]
+        for row in rows:row['evidence']=json.loads(row['evidence'])
+        return jsonify(gaps=rows,notice='仅记录观察到的检测缺口；不表示目标正常或被墙，升级前不补造。')
 
     @app.get('/api/detection/incidents')
     @auth(admin=True)

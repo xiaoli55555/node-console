@@ -55,7 +55,9 @@ def snapshot(db,sid,ip,now):
 def store(db,incident_id,sid,ip,now,first=None):
     row=db.execute('SELECT evidence,confirmed_at FROM detection_incidents WHERE id=?',(incident_id,)).fetchone()
     evidence=_json(row['evidence'],{})
-    if 'first' not in evidence:evidence['first']=first or snapshot(db,sid,ip,now)
+    if 'first' not in evidence:
+        evidence['first']=first or snapshot(db,sid,ip,now)
+        evidence['last_pass']=last_pass(db,sid,ip,db.execute('SELECT port FROM detection_incidents WHERE id=?',(incident_id,)).fetchone()['port'],evidence['first']['captured_at'])
     if row['confirmed_at'] is not None and 'confirmed' not in evidence:
         evidence['confirmed']=snapshot(db,sid,ip,now)
     db.execute('UPDATE detection_incidents SET evidence=? WHERE id=?',(json.dumps(evidence),incident_id))
@@ -66,3 +68,39 @@ def serialize(item,now):
     item['evidence']=_json(item.get('evidence'),{})
     item['duration_s']=max(0,(item['closed_at'] or now)-item['first_failed'])
     return item
+
+
+AUDIT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS detection_coverage_gaps(
+ id INTEGER PRIMARY KEY, server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+ ip TEXT, source_id INTEGER, started INTEGER NOT NULL, finished INTEGER,
+ reason TEXT NOT NULL, evidence TEXT NOT NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS detection_gap_open ON detection_coverage_gaps(server_id) WHERE finished IS NULL;
+"""
+
+def coverage_gap(db,sid,now,reason):
+    # Observational only. Never changes probe or rotation state.
+    if any(x in reason for x in ('已有检测任务','独立复测进行中','尚未到下一次')):return
+    m=db.execute('SELECT current_ip FROM ip_monitors WHERE server_id=?',(sid,)).fetchone()
+    p=db.execute('SELECT source_id FROM detection_plans WHERE server_id=?',(sid,)).fetchone()
+    ip=m['current_ip'] if m else None
+    old=db.execute('SELECT * FROM detection_coverage_gaps WHERE server_id=? AND finished IS NULL',(sid,)).fetchone()
+    if old and old['ip']==ip and old['reason']==reason:return
+    if old:db.execute('UPDATE detection_coverage_gaps SET finished=? WHERE id=?',(now,old['id']))
+    evidence=snapshot(db,sid,ip,now) if ip else {'carrier_state':'unknown'}
+    db.execute('INSERT INTO detection_coverage_gaps(server_id,ip,source_id,started,reason,evidence) VALUES(?,?,?,?,?,?)',(sid,ip,p['source_id'] if p else None,now,reason,json.dumps(evidence)))
+
+def coverage_result(db,run,rows,now):
+    expected={str(x) for x in _json(run['nodes'],[])}
+    valid=bool(expected) and len(rows)==len(expected) and {str(x.get('node_id')) for x in rows}==expected and all(x.get('state') in ('reachable','unreachable') for x in rows)
+    if not valid:
+        coverage_gap(db,run['server_id'],now,'检测结果缺失或未知，不能判定目标正常或不通')
+        return
+    # Only a current-plan result closes an observed coverage gap.
+    db.execute('UPDATE detection_coverage_gaps SET finished=? WHERE server_id=? AND finished IS NULL AND ip=? AND source_id=? AND started<=?',(now,run['server_id'],run['ip'],run['source_id'],run['created']))
+
+def last_pass(db,sid,ip,port,before):
+    for row in db.execute('SELECT id,updated,details FROM detection_runs WHERE server_id=? AND ip=? AND port=? AND updated<=? ORDER BY updated DESC,id DESC',(sid,ip,port,before)):
+        details=_json(row['details'],[])
+        if details and all(x.get('state')=='reachable' for x in details):return {'run_id':row['id'],'observed_at':row['updated']}
+    return None
