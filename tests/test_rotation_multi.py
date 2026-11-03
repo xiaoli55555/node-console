@@ -85,6 +85,76 @@ class MultiPlan(unittest.TestCase):
         self.assertEqual(len(result['rotations']),1);self.assertEqual(len(result['rotations'][0]['member_ids']),2)
         self.change.assert_not_called()
 
+    def test_group_waits_for_later_member_deadline_then_switches_all_routes(self):
+        r=self.multi()
+        with server.connect() as db:
+            db.execute('UPDATE vps_rotations SET next_switch_at=? WHERE id=?',(self.clock[0],r['id']))
+            db.execute('UPDATE vps_rotations SET next_switch_at=? WHERE id<>?',(self.clock[0]+60,r['id']))
+        self.tick()
+        self.assertEqual(self.value('mobile'),'8.8.8.8')
+        self.assertEqual(self.value('telecom'),'8.8.8.8')
+        self.advance(60,('A','B','C'));self.tick()
+        self.assertEqual(self.value('mobile'),'1.1.1.1')
+        self.assertEqual(self.value('telecom'),'1.1.1.1')
+
+    def test_partial_group_write_recovers_without_advancing_one_carrier(self):
+        self.multi()
+        with server.connect() as db:db.execute('UPDATE vps_rotations SET next_switch_at=?',(self.clock[0],))
+        def write(conn,binding,record,address):
+            if binding['id']==self.bindings['telecom']:raise IntegrationError('provider timeout')
+            self.records[binding['id']]['Value']=address
+        with patch('rotation.update_dns_record',side_effect=write):self.tick()
+        self.assertEqual(self.value('mobile'),'1.1.1.1')
+        self.assertEqual(self.value('telecom'),'8.8.8.8')
+        with server.connect() as db:
+            rows=db.execute('SELECT * FROM vps_rotations').fetchall()
+            self.assertTrue(all(r['dns_intent'] for r in rows))
+            self.assertTrue(all(r['active_server_id']==self.sid('A') for r in rows))
+        with patch('rotation.update_dns_record',side_effect=lambda c,b,r,ip:self.records[b['id']].update(Value=ip)) as writer:
+            self.tick()
+        self.assertEqual(writer.call_count,1)
+        self.assertEqual(self.value('telecom'),'1.1.1.1')
+        with server.connect() as db:
+            rows=db.execute('SELECT * FROM vps_rotations').fetchall()
+            self.assertTrue(all(not r['dns_intent'] for r in rows))
+            self.assertTrue(all(r['active_server_id']==self.sid('B') for r in rows))
+        self.change.assert_not_called()
+
+    def test_pending_group_corrects_external_edit_to_its_persisted_target(self):
+        self.multi()
+        with server.connect() as db:db.execute('UPDATE vps_rotations SET next_switch_at=?',(self.clock[0],))
+        with patch('rotation.update_dns_record',side_effect=IntegrationError('timeout')):self.tick()
+        self.records[self.bindings['telecom']]['Value']='4.4.4.4'
+        self.tick()
+        self.assertEqual(self.value('telecom'),'1.1.1.1')
+        with server.connect() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM vps_rotations WHERE dns_intent IS NOT NULL').fetchone()[0],0)
+        self.change.assert_not_called()
+
+    def test_paused_pending_group_does_not_continue_DNS_writes(self):
+        self.multi()
+        with server.connect() as db:db.execute('UPDATE vps_rotations SET next_switch_at=?',(self.clock[0],))
+        with patch('rotation.update_dns_record',side_effect=IntegrationError('timeout')):self.tick()
+        with server.connect() as db:db.execute('UPDATE vps_rotations SET enabled=0')
+        with patch('rotation.update_dns_record') as writer:self.tick()
+        writer.assert_not_called()
+        with server.connect() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM vps_rotations WHERE dns_intent IS NOT NULL').fetchone()[0],2)
+
+    def test_timeout_after_provider_applies_group_write_is_read_back(self):
+        self.multi()
+        with server.connect() as db:db.execute('UPDATE vps_rotations SET next_switch_at=?',(self.clock[0],))
+        def write(conn,binding,record,address):
+            self.records[binding['id']]['Value']=address
+            raise IntegrationError('response lost')
+        with patch('rotation.update_dns_record',side_effect=write):self.tick()
+        with patch('rotation.update_dns_record') as writer:self.tick()
+        writer.assert_not_called()
+        self.assertEqual(self.value('mobile'),'1.1.1.1')
+        self.assertEqual(self.value('telecom'),'1.1.1.1')
+        with server.connect() as db:
+            self.assertFalse(db.execute('SELECT 1 FROM vps_rotations WHERE dns_intent IS NOT NULL').fetchone())
+
     def test_record_group_changes_B_IP_once_after_all_routes_drain(self):
         self.multi()
         with server.connect() as db:db.execute('UPDATE vps_rotations SET next_switch_at=?',(self.clock[0],))

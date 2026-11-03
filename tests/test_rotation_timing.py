@@ -26,9 +26,10 @@ class CarrierTiming(unittest.TestCase):
 
     def test_manual_new_ip_starts_a_new_observed_carrier_period(self):
         f=self.f;start=f.clock[0];f.advance(20,online=('A','B'))
-        f.refresh('A',ip='1.0.0.1');f.records[f.bindings['mobile']]['Value']='1.0.0.1';f.tick()
+        f.refresh('A',ip='1.0.0.1');f.records[f.bindings['mobile']]['Value']='1.0.0.1'
+        rotation._sync_external_dns(server.connect,server.CIPHER,f.rid,f.clock[0],force=True)
         t=self.timing();self.assertEqual(t['current']['ip'],'1.0.0.1')
-        self.assertEqual(t['current']['reason'],'manual_dns_observed')
+        self.assertEqual(t['current']['reason'],'carrier_ip_observed')
         self.assertEqual(t['history'][1]['elapsed_s'],20);self.assertEqual(t['history'][1]['finished'],start+20)
 
     def test_pause_and_config_save_do_not_restart_carrier_duration(self):
