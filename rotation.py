@@ -926,12 +926,8 @@ def db_failover_active(connect,rid):
 def _run_rotation(connect,cipher,rid,now):
     with connect() as db:
         current=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
-        heartbeat_suspected=False
-        leased=bool(current and db.execute('SELECT 1 FROM vps_failover_leases WHERE rotation_id=?',(rid,)).fetchone())
-        if current and not _fixed(current) and not leased:
-            heartbeat_suspected=_offline(db,current['active_server_id'],now,current['offline_after_s'])
     if current and (current['enabled'] or current['failover_server_id'] or db_failover_active(connect,rid)):
-        if (not heartbeat_suspected or db_failover_active(connect,rid)) and failover.step(connect,cipher,rid,now):return
+        if failover.step(connect,cipher,rid,now):return
     _sync_external_dns(connect,cipher,rid,now)
     with connect() as db:current=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
     if current and not current['enabled']:

@@ -177,7 +177,10 @@ class PrimaryFailover(unittest.TestCase):
         self.down();self.tick();self.assertEqual(self.value('telecom'),'8.8.8.8')
         self.advance(2,('B','C'));self.tick()
         self.assertEqual(self.value('mobile'),'1.1.1.1')
-        self.tick() # C can independently take A's remaining records after B takes mobile.
+        self.tick() # Healthy B prevents C activation in alternating mode.
+        self.assertEqual(self.value('telecom'),'8.8.8.8');self.change.assert_not_called()
+        self.down('B');self.tick()
+        self.assertEqual(self.value('mobile'),'9.9.9.9')
         self.assertEqual(self.value('telecom'),'9.9.9.9');self.change.assert_not_called()
     def test_failover_during_A_reboot_restores_new_IP_without_state_deadlock(self):
         with server.connect() as db:

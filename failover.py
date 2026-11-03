@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS vps_failover_probe_costs(
 
 def initialize(db):
     columns={r[1] for r in db.execute('PRAGMA table_info(vps_rotations)')}
-    for name,definition in [('failover_server_id','INTEGER REFERENCES servers(id) ON DELETE RESTRICT'),('failover_binding_ids',"TEXT NOT NULL DEFAULT '[]'"),('failover_recovery_s','INTEGER NOT NULL DEFAULT 60'),('failover_healthy_since','INTEGER'),('failover_status',"TEXT NOT NULL DEFAULT '未配置 A 故障转移'")]:
+    for name,definition in [('failover_server_id','INTEGER REFERENCES servers(id) ON DELETE RESTRICT'),('failover_binding_ids',"TEXT NOT NULL DEFAULT '[]'"),('failover_recovery_s','INTEGER NOT NULL DEFAULT 60'),('failover_healthy_since','INTEGER'),('failover_recovery_server','INTEGER'),('failover_status',"TEXT NOT NULL DEFAULT '未配置 A 故障转移'")]:
         if name not in columns:db.execute(f'ALTER TABLE vps_rotations ADD COLUMN {name} {definition}')
     db.executescript(SCHEMA)
     import server_failover
@@ -267,7 +267,13 @@ def _status(db,rid,message,now):
     if old and old['failover_status']!=message:rot._event(db,rid,None,message,now)
 
 
-def _move(connect,cipher,rid,bid,target,now,restore=False):
+def _both_unavailable(db,r,now):
+    import rotation as rot
+    return all(rot._offline(db,sid,now,r['offline_after_s']) or rot._fixed_failure(db,sid,now)
+               for sid in (r['primary_server_id'],r['other_server_id']))
+
+
+def _move(connect,cipher,rid,bid,target,now,restore=False,target_server=None):
     """Hold the same per-binding lock used by ordinary IP sync across the write."""
     import fcntl
     from pathlib import Path
@@ -278,6 +284,8 @@ def _move(connect,cipher,rid,bid,target,now,restore=False):
             r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
             b=db.execute('SELECT * FROM dns_bindings WHERE id=?',(bid,)).fetchone()
             if not b:raise IntegrationError('故障转移解析绑定已不存在')
+            if not restore and r['mode']=='alternating' and not _both_unavailable(db,r,int(time.time())):
+                raise IntegrationError('A/B 未同时确认故障，取消启用 C')
             import rotation as rot
             try:
                 with rot.socket.create_connection((target,b['port']),timeout=4):pass
@@ -287,31 +295,34 @@ def _move(connect,cipher,rid,bid,target,now,restore=False):
             if lease and lease['intent']:raise IntegrationError('此前 DNS 动作结果待核对')
             conn=load_connection(db,cipher,b['connection_id']);record=get_dns_record(conn,b)
             validate_dns_record(record,b,conn)
+            if not restore and r['mode']=='alternating' and not _both_unavailable(db,r,int(time.time())):
+                raise IntegrationError('A/B 在 DNS 核对期间已恢复，取消启用 C')
             if lease is None:
                 db.execute('INSERT INTO vps_failover_leases(binding_id,rotation_id,original_ip,current_ip,updated) VALUES(?,?,?,?,?)',(bid,rid,b['expected_ip'],b['expected_ip'],now))
-            payload={'restore':bool(restore),'target_server':r['primary_server_id'] if restore else r['failover_server_id']}
+            payload={'restore':bool(restore),'target_server':(target_server or r['primary_server_id']) if restore else r['failover_server_id']}
             db.execute('UPDATE vps_failover_leases SET target_ip=?,intent=?,updated=? WHERE binding_id=?',(target,json.dumps(payload),now,bid))
             db.commit() # Claim before external I/O; crashes are reconciled by readback.
             if b['expected_ip']!=target:update_dns_record(conn,b,record,target)
             updated=get_dns_record(conn,b);validate_dns_record(updated,dict(b,expected_ip=target),conn)
-            _finish(db,r,b,target,restore,now)
+            _finish(db,r,b,target,restore,now,target_server=payload['target_server'])
 
 
-def _finish(db,r,b,target,restore,now):
+def _finish(db,r,b,target,restore,now,target_server=None):
     import rotation_timing
+    restored_server=target_server or r['primary_server_id']
     peer=db.execute('SELECT * FROM vps_rotations WHERE binding_id=?',(b['id'],)).fetchone()
-    if peer:rotation_timing.change(db,peer['id'],r['primary_server_id'] if restore else r['failover_server_id'],target,now,'failover_restore' if restore else 'failover_takeover')
-    message=('A 恢复，解析已切回 ' if restore else 'A 下线，解析已由故障转移 VPS 接替：')+target
+    if peer:rotation_timing.change(db,peer['id'],restored_server if restore else r['failover_server_id'],target,now,'failover_restore' if restore else 'failover_takeover')
+    message=('A/B 恢复，解析已切回 ' if restore else 'A/B 均不可用，解析已由 C 接替：' if r['mode']=='alternating' else 'A 下线，解析已由故障转移 VPS 接替：')+target
     db.execute('UPDATE dns_bindings SET expected_ip=?,candidate=NULL,candidate_since=NULL,status=?,updated=? WHERE id=?',(target,message,now,b['id']))
     import rotation as rot
-    rot._event(db,r['id'],r['primary_server_id'] if restore else r['failover_server_id'],'解析 #'+str(b['id'])+'：'+message,now)
+    rot._event(db,r['id'],restored_server if restore else r['failover_server_id'],'解析 #'+str(b['id'])+'：'+message,now)
     if restore:
         db.execute('DELETE FROM vps_failover_leases WHERE binding_id=?',(b['id'],))
         peer=db.execute('SELECT * FROM vps_rotations WHERE binding_id=?',(b['id'],)).fetchone()
         if peer:
-            if peer['drain_server_id']==peer['primary_server_id']:
-                db.execute("UPDATE vps_rotations SET active_server_id=?,phase='active',drain_server_id=NULL,old_ip=NULL,new_ip=NULL,action_started=NULL,emergency=0,low_samples=0,next_switch_at=? WHERE id=?",(peer['primary_server_id'],now+peer['interval_s'],peer['id']))
-            else:db.execute('UPDATE vps_rotations SET active_server_id=? WHERE id=?',(peer['primary_server_id'],peer['id']))
+            if peer['drain_server_id']==restored_server:
+                db.execute("UPDATE vps_rotations SET active_server_id=?,phase='active',drain_server_id=NULL,old_ip=NULL,new_ip=NULL,action_started=NULL,emergency=0,low_samples=0,next_switch_at=? WHERE id=?",(restored_server,now+peer['interval_s'],peer['id']))
+            else:db.execute('UPDATE vps_rotations SET active_server_id=? WHERE id=?',(restored_server,peer['id']))
     else:db.execute('UPDATE vps_failover_leases SET current_ip=?,target_ip=NULL,intent=NULL,updated=? WHERE binding_id=?',(target,now,b['id']))
 
 
@@ -329,7 +340,7 @@ def _reconcile(connect,cipher,rid,now):
             if actual!=lease['target_ip']:
                 _status(db,rid,'故障转移 DNS 结果未确认，保持占用并暂停轮换；需要核对供应商记录',now)
                 return False
-            intent=json.loads(lease['intent']);_finish(db,r,b,actual,intent['restore'],now)
+            intent=json.loads(lease['intent']);_finish(db,r,b,actual,intent['restore'],now,target_server=intent.get('target_server'))
     return True
 
 
@@ -355,6 +366,15 @@ def step(connect,cipher,rid,now):
                     protecting_change=False
             except IntegrationError:pass
         down=offline or protecting_change
+        if r['mode']=='alternating':
+            # Absence of proof is not a second outage. Keep C cold whenever
+            # either A or B is healthy or its failure is still unconfirmed.
+            both_failed=_both_unavailable(db,r,now)
+            down=both_failed
+            if not leases and not both_failed:
+                stop_probe(db,rid)
+                _status(db,rid,'A/B 未同时确认故障，C 保持待命；优先 A/B 接替',now)
+                return False
         if not down and not leases:
             stop_probe(db,rid)
             if r['failover_status'].startswith('A 心跳超时'):_status(db,rid,'A 已在线，故障转移待命',now)
@@ -370,7 +390,7 @@ def step(connect,cipher,rid,now):
         if not down and not lease_rows:
             db.execute('UPDATE vps_rotations SET failover_healthy_since=NULL WHERE id=?',(rid,))
             stop_probe(db,rid)
-            _status(db,rid,'A 已恢复，故障转移解析已切回；恢复 A/B 轮换',now);return True
+            _status(db,rid,'A/B 已验证恢复，故障转移解析已切回；C 回到待命，恢复 A/B 轮换',now);return True
         if down:
             db.execute('UPDATE vps_rotations SET failover_healthy_since=NULL WHERE id=?',(rid,))
             try:
@@ -399,33 +419,41 @@ def step(connect,cipher,rid,now):
                 work.append(bid)
             db.commit()
             for bid in work:_move(connect,cipher,rid,bid,address,now)
-            with connect() as saved:_status(saved,rid,'A 心跳超时，A 的全部解析由故障转移 VPS 接替（健康 B 的所选轮换记录保持 B）；A/B 定时动作暂停' if offline else 'A 换 IP 期间，其他解析由故障转移 VPS 接替；轮换记录保持健康 B',now)
-            return bool(offline)
-        # A returned: verify selected nodes and current IP, then apply hysteresis.
-        rot._request_probe(db,r['primary_server_id'],now)
-        try:
-            current_ip,_,_=rot._fresh_ip(db,r['primary_server_id'],now,cipher)
-            ready_plan=r
-            if r['phase'] in ('waiting_ip','waiting_probe') and r['drain_server_id']==r['primary_server_id'] and current_ip!=r['old_ip']:
-                ready_plan=dict(r,phase='active',drain_server_id=None)
-            address,_,_=rot._fixed_ready(db,cipher,ready_plan,r['primary_server_id'],now,verified_candidate=current_ip)
-        except IntegrationError as e:
-            db.execute('UPDATE vps_rotations SET failover_healthy_since=NULL WHERE id=?',(rid,))
-            _status(db,rid,'A 已上报，仍等待所选检测点和动作状态确认：'+str(e),now);return True
+            message=('A/B 均已确认不可用，解析由 C 接替；等待 A/B 验证恢复' if r['mode']=='alternating' else 'A 心跳超时，A 的全部解析由故障转移 VPS 接替（健康 B 的所选轮换记录保持 B）；A/B 定时动作暂停' if offline else 'A 换 IP 期间，其他解析由故障转移 VPS 接替；轮换记录保持健康 B')
+            with connect() as saved:_status(saved,rid,message,now)
+            return bool(offline) or r['mode']=='alternating'
+        # Alternating plans may return to either verified A or B. C is a
+        # last resort, never a substitute for a healthy partner.
+        candidates=[r['primary_server_id']]
+        if r['mode']=='alternating':candidates.append(r['other_server_id'])
+        recovered=None;last_error='等待有效的 A/B 恢复证据'
+        for sid in candidates:
+            rot._request_probe(db,sid,now)
+            try:
+                current_ip,_,_=rot._fresh_ip(db,sid,now,cipher)
+                ready_plan=r
+                if r['mode']=='alternating' or (r['phase'] in ('waiting_ip','waiting_probe') and r['drain_server_id']==sid and current_ip!=r['old_ip']):
+                    ready_plan=dict(r,phase='active',drain_server_id=None)
+                address,_,_=rot._fixed_ready(db,cipher,ready_plan,sid,now,verified_candidate=current_ip)
+                recovered=sid;break
+            except IntegrationError as e:last_error=str(e)
+        if recovered is None:
+            db.execute('UPDATE vps_rotations SET failover_healthy_since=NULL,failover_recovery_server=NULL WHERE id=?',(rid,))
+            _status(db,rid,'A/B 仍等待所选检测点和动作状态确认：'+last_error,now);return True
         since=r['failover_healthy_since']
-        if since is None:
-            db.execute('UPDATE vps_rotations SET failover_healthy_since=? WHERE id=?',(now,rid));since=now
+        if since is None or (r['mode']=='alternating' and r['failover_recovery_server']!=recovered):
+            db.execute('UPDATE vps_rotations SET failover_healthy_since=?,failover_recovery_server=? WHERE id=?',(now,recovered,rid));since=now
         c_healthy=True
         try:
             if rot._offline(db,r['failover_server_id'],now,r['offline_after_s']):raise IntegrationError('故障转移 VPS 心跳超时')
             backup_ready(db,cipher,r,now)
         except IntegrationError:c_healthy=False
         if c_healthy and now-since<r['failover_recovery_s']:
-            _status(db,rid,'A 已通过所选检测点，等待恢复稳定窗口后切回',now);return True
+            _status(db,rid,'A/B 已通过所选检测点，等待恢复稳定窗口后切回',now);return True
         db.commit()
-        for lease in lease_rows:_move(connect,cipher,rid,lease['binding_id'],address,now,restore=True)
+        for lease in lease_rows:_move(connect,cipher,rid,lease['binding_id'],address,now,restore=True,target_server=recovered)
         with connect() as saved:
             saved.execute('UPDATE vps_rotations SET failover_healthy_since=NULL WHERE id=?',(rid,))
             stop_probe(saved,rid)
-            _status(saved,rid,'A 已恢复，故障转移解析已切回；恢复 A/B 轮换',now)
+            _status(saved,rid,'A/B 已验证恢复，故障转移解析已切回；C 回到待命，恢复 A/B 轮换',now)
         return True

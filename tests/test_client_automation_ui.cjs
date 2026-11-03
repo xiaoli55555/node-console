@@ -67,7 +67,7 @@ test('both rotation modes remain available and legacy tasks default to alternati
 
 test('primary outage failover exposes a distinct C and all-A scope without a partial selector',()=>{
  const html=ctx.rotationModeFields({mode:'fixed_primary',other_server_id:2,failover_server_id:3,failover_recovery_s:45,failover_status:'<waiting>'},[{id:1,name:'A'},{id:2,name:'B'},{id:3,name:'<C>'}],[],1);
- for(const value of ['name="failover_server_id"','name="failover_recovery_s"','A 的全部绑定解析','A、B 都下线'])assert.ok(html.includes(value),value);
+ for(const value of ['name="failover_server_id"','name="failover_recovery_s"','A 的全部绑定解析','仅 A、B 均确认不可用','任一正常或故障尚未确认','不参与定时轮换'])assert.ok(html.includes(value),value);
  assert.doesNotMatch(html,/name="failover_binding_ids"/);
  assert.match(html,/备用机闲时不拨测/);
  assert.match(html,/临时继承 A 的探测点/);
