@@ -62,12 +62,20 @@ def _valid(db,job,cipher,now):
     p=db.execute('SELECT p.*,s.kind,s.secret,s.enabled AS source_enabled FROM detection_plans p JOIN detection_sources s ON s.id=p.source_id WHERE p.server_id=?',(r['server_id'],)).fetchone()
     m=db.execute('SELECT * FROM ip_monitors WHERE server_id=?',(r['server_id'],)).fetchone()
     s=db.execute('SELECT seen FROM servers WHERE id=?',(r['server_id'],)).fetchone()
-    if not p or not m or not s or not p['automatic'] or not p['source_enabled'] or not m['enabled'] or not s['seen'] or not 0<=now-s['seen']<=60:return None
+    if not p or not m or not s or not p['automatic'] or not p['source_enabled'] or not m['enabled']:return None
+    fresh=bool(s['seen'] and 0<=now-s['seen']<=60)
     if job['node'] in set(map(str,json.loads(r['nodes']))) or (p['confirm_node'] or '')!=job['node'] or p['source_id']!=r['source_id'] or p['nodes']!=r['nodes'] or m['port']!=r['port'] or not r['scheduled']:return None
     if not 0<=now-r['updated']<=max(300,p['interval_s']*2):return None
     if db.execute("SELECT 1 FROM detection_runs WHERE server_id=? AND id>? AND status NOT IN ('creating','pending','queued','issued') LIMIT 1",(r['server_id'],r['id'])).fetchone():return None
     try:
-        if candidate_ip(db,m,cipher)!=r['ip'] or not failed(json.loads(r['details']),json.loads(r['nodes'])):return None
+        if not failed(json.loads(r['details']),json.loads(r['nodes'])):return None
+        if fresh:
+            if candidate_ip(db,m,cipher)!=r['ip']:return None
+        else:
+            # External diagnosis of this rotation's frozen old address only; never readiness.
+            if m['source_id']:return None
+            from rotation import heartbeat_probe_target
+            if heartbeat_probe_target(db,r['server_id'],r['port'],now,run=r)!=r['ip']:return None
     except (IntegrationError,ValueError,TypeError):return None
     return r,p
 

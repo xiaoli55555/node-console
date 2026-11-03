@@ -506,6 +506,22 @@ def _failed_ip(db,sid,now):
         return bool(nodes) and len(rows)==len(nodes) and {str(x.get('node_id')) for x in rows}==set(map(str,nodes)) and all(x.get('state')=='unreachable' for x in rows)
     except (TypeError,ValueError,AttributeError):return False
 
+def _carrier_suspect(db,sid,now):
+    """A current raw failure may request a safe standby check, never authorize repair."""
+    if _failed_ip(db,sid,now):return True
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='detection_rechecks'").fetchone():return False
+    if not db.execute("SELECT 1 FROM detection_rechecks c JOIN detection_runs r ON r.id=c.parent_id WHERE r.server_id=? AND c.state IN ('queued','creating','pending') LIMIT 1",(sid,)).fetchone():return False
+    row=db.execute("SELECT r.*,p.nodes AS plan_nodes,p.source_id AS plan_source,m.port AS monitor_port,s.seen FROM detection_runs r JOIN detection_plans p ON p.server_id=r.server_id JOIN detection_sources source ON source.id=p.source_id JOIN ip_monitors m ON m.server_id=r.server_id JOIN servers s ON s.id=r.server_id WHERE r.server_id=? AND p.automatic=1 AND source.enabled=1 AND m.enabled=1 AND r.scheduled=1 AND r.status NOT IN ('creating','pending','queued','issued') ORDER BY r.id DESC LIMIT 1",(sid,)).fetchone()
+    if not row or not row['seen'] or not 0<=now-row['seen']<=45 or not 0<=now-row['updated']<=120:return False
+    if row['source_id']!=row['plan_source'] or row['nodes']!=row['plan_nodes'] or row['port']!=row['monitor_port']:return False
+    check=db.execute("SELECT state FROM detection_rechecks WHERE parent_id=?",(row['id'],)).fetchone()
+    if not check or check['state'] not in ('queued','creating','pending'):return False
+    try:
+        address=candidate_ip(db,{'server_id':sid,'source_id':None},None)
+        return address==row['ip'] and detection_recheck.failed(json.loads(row['details']),json.loads(row['nodes']))
+    except (IntegrationError,ValueError,TypeError):return False
+
+
 def _pending_action(db,sid,verified_candidate=None):
     """A queued/issued action may execute after an apparently healthy probe."""
     if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='commands'").fetchone():
@@ -689,7 +705,7 @@ def _offline(db,sid,now,timeout=15):
     return not node or not node['seen'] or now-node['seen']>=timeout
 
 
-def heartbeat_probe_target(db,sid,port,now):
+def heartbeat_probe_target(db,sid,port,now,run=None):
     """Probe the frozen DNS carrier address even when its agent has gone stale."""
     if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vps_rotations'").fetchone():raise IntegrationError('agent 上报已过期，且没有轮换心跳复测任务')
     if _pending_action(db,sid):raise IntegrationError('原机存在在途动作，等待心跳复测')
@@ -700,9 +716,25 @@ def heartbeat_probe_target(db,sid,port,now):
         except (ValueError,TypeError):continue
         address=r['old_ip'] if repairing else r['expected_ip']
         if state.get('sid')==sid and state.get('ip')==address and r['dns_port']==port and not r['dns_intent'] and not r['external_dns_pending']:
+            if run is not None and (run['id']<=state.get('floor',0) or run['created']<state.get('after',0) or run['source_id']!=state.get('source') or run['nodes']!=state.get('nodes')):continue
             addresses.add(public_v4(address))
     if len(addresses)!=1:raise IntegrationError('没有唯一已确认的承载 IP 可供心跳复测')
-    return addresses.pop()
+    address=addresses.pop()
+    monitor=db.execute('SELECT current_ip FROM ip_monitors WHERE server_id=?',(sid,)).fetchone()
+    if monitor and monitor['current_ip'] and monitor['current_ip']!=address:raise IntegrationError('已观察到 IP 变化，不能复用旧承载地址')
+    node=db.execute('SELECT metrics FROM servers WHERE id=?',(sid,)).fetchone()
+    try:
+        metrics=json.loads(node['metrics'] or '{}') if node else {}
+        def known_ips(values):
+            result=set()
+            for value in values:
+                try:result.add(public_v4(value))
+                except IntegrationError:pass
+            return result
+        known=known_ips(metrics.get('public_ips',[])) or known_ips(metrics.get('egress_ips',[]))
+    except (ValueError,TypeError,AttributeError):raise IntegrationError('上报地址格式异常，不能复用旧承载地址') from None
+    if known and known!={address}:raise IntegrationError('已上报的地址与本轮冻结 IP 不一致，取消旧诊断')
+    return address
 
 
 def _heartbeat_confirmed(db,r,now,subject=None,subject_ip=None,force=False):
@@ -791,6 +823,7 @@ def _carrier_fault_reason(db,r,now):
     if _failed_ip(db,sid,now):
         run=db.execute("SELECT ip,port FROM detection_runs WHERE server_id=? AND status NOT IN ('creating','pending','queued','issued') ORDER BY id DESC LIMIT 1",(sid,)).fetchone()
         return f'国内 TCP 检测不通：{run["ip"]}:{run["port"]}，所选节点已满足当前故障确认条件'
+    if _carrier_suspect(db,sid,now):return '当前承载首轮 TCP 全部不通，网站校验／独立复检尚未完成；先复检备用机，不据此更换原机 IP'
     return '本次故障接替来源待核对，当前没有可确认的心跳超时或国内 TCP 不通证据'
 
 def _original_emergency_probe(db,r,target,now):
@@ -803,7 +836,7 @@ def _original_emergency_probe(db,r,target,now):
         db.execute('UPDATE vps_rotations SET emergency_probe_after=? WHERE id=?',(after,r['id']))
         db.execute('UPDATE detection_plans SET next_at=MIN(next_at,?) WHERE server_id=?',(after,target))
         reason=('定时轮换已到期，备用机仍在排空' if r['phase']=='draining' and r['next_switch_at']<=now
-                and not _offline(db,r['active_server_id'],now,r['offline_after_s']) and not _failed_ip(db,r['active_server_id'],now)
+                and not _offline(db,r['active_server_id'],now,r['offline_after_s']) and not _carrier_suspect(db,r['active_server_id'],now)
                 else _carrier_fault_reason(db,r,now))
         _event(db,r['id'],r['active_server_id'],'请求接替前复检：'+reason,now)
         db.commit()
@@ -826,7 +859,7 @@ def _draining_fault_takeover(db,r,target,now):
             and r['action_started'] is None and r['new_ip'] is None
             and not _pending_action(db,target) and not _pending_action(db,r['active_server_id'])
             and (_offline(db,r['active_server_id'],now,r['offline_after_s'])
-                 or _failed_ip(db,r['active_server_id'],now)))
+                 or _carrier_suspect(db,r['active_server_id'],now)))
 
 
 def _dns_switch(connect,cipher,rotation,now,emergency=False,offline=False):
@@ -924,7 +957,7 @@ def _paused_failover(connect,cipher,rid,now):
             db.commit();_reconcile_fixed_dns(connect,cipher,rid,now);return
         current=r['active_server_id']
         offline=_offline(db,current,now,r['offline_after_s'])
-        failed=_fixed_failure(db,current,now) if _fixed(r) else (not _offline(db,current,now,r['offline_after_s']) and _failed_ip(db,current,now))
+        failed=_fixed_failure(db,current,now) if _fixed(r) else (not _offline(db,current,now,r['offline_after_s']) and _carrier_suspect(db,current,now))
         if not offline and not failed:return
         target=r['other_server_id'] if current==r['primary_server_id'] else r['primary_server_id']
         _request_probe(db,target,now)
@@ -976,7 +1009,7 @@ def _run_rotation(connect,cipher,rid,now):
                     db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',(message,now,rid))
                 _event(db,rid,r['active_server_id'],message,now)
                 r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
-        if not _fixed(r) and r['phase']!='active' and (_offline(db,r['active_server_id'],now,r['offline_after_s']) or _failed_ip(db,r['active_server_id'],now)):
+        if not _fixed(r) and r['phase']!='active' and (_offline(db,r['active_server_id'],now,r['offline_after_s']) or _carrier_suspect(db,r['active_server_id'],now)):
             # Only a current carrier fault permits freshly verified reuse of an
             # unissued draining standby; a scheduled deadline alone does not.
             target=r['other_server_id'] if r['active_server_id']==r['primary_server_id'] else r['primary_server_id']
@@ -1013,7 +1046,7 @@ def _run_rotation(connect,cipher,rid,now):
                 db.execute('UPDATE detection_plans SET next_at=MIN(next_at,?) WHERE server_id=?',(now,target));db.commit()
             _dns_switch(connect,cipher,rid,now,emergency=True,offline=True)
             r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
-        if not _fixed(r) and r['phase']=='active' and not _offline(db,r['active_server_id'],now,r['offline_after_s']) and _failed_ip(db,r['active_server_id'],now):
+        if not _fixed(r) and r['phase']=='active' and not _offline(db,r['active_server_id'],now,r['offline_after_s']) and _carrier_suspect(db,r['active_server_id'],now):
             target=r['other_server_id'] if r['active_server_id']==r['primary_server_id'] else r['primary_server_id']
             if not _failed_ip(db,target,now):
                 last=db.execute('SELECT MAX(created) FROM detection_runs WHERE server_id=?',(target,)).fetchone()[0]
