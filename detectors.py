@@ -285,7 +285,14 @@ def start_run(connect,cipher,sid,scheduled=False):
         now=int(time.time())
         if db.execute("SELECT 1 FROM detection_rechecks c JOIN detection_runs r ON r.id=c.parent_id WHERE r.server_id=? AND c.state IN ('queued','creating','pending')",(sid,)).fetchone():raise IntegrationError('独立复测进行中，等待同一 IP 的复测结果')
         if now<p['next_at']:raise IntegrationError('尚未到下一次检测时间，请避免重复扣费')
-        ip=candidate_ip(db,m,cipher);nodes=json.loads(p['nodes']) if p['kind'] in ('boce','aliyun','baota') else ['self']
+        try:ip=candidate_ip(db,m,cipher)
+        except IntegrationError:
+            if not scheduled:raise
+            node=db.execute('SELECT seen FROM servers WHERE id=?',(sid,)).fetchone()
+            if m['source_id'] or (node and node['seen'] and 0<=now-node['seen']<=90):raise
+            from rotation import heartbeat_probe_target
+            ip=heartbeat_probe_target(db,sid,m['port'],now)
+        nodes=json.loads(p['nodes']) if p['kind'] in ('boce','aliyun','baota') else ['self']
         if not nodes:raise IntegrationError('请至少选择一个国内检测点')
         cost=len(nodes) if p['kind'] in ('boce','aliyun','baota') else 0
         from datetime import datetime

@@ -667,10 +667,23 @@ class PanelTest(unittest.TestCase):
             with server.connect() as db:
                 row=db.execute('SELECT * FROM vps_rotations').fetchone()
                 self.assertEqual(row['active_server_id'],nodes[0][0])
+                self.assertEqual(row['phase'],'draining')
+                self.assertEqual(change.call_count,1)
+            # Only a new post-cut round may confirm B for repair.
+            rotation.tick(server.connect,server.CIPHER);clock[0]+=2
+            report(1,tcp=200)
+            with server.connect() as db:
+                source=db.execute('SELECT source_id FROM detection_plans WHERE server_id=?',(nodes[1][0],)).fetchone()[0]
+                for _ in range(db.execute('SELECT failure_threshold FROM detection_plans WHERE server_id=?',(nodes[1][0],)).fetchone()[0]):
+                    db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details) VALUES(?,?,?,?,'[\"13\"]','TCP 不通',?,?,?)",(nodes[1][0],source,ips[1],port,clock[0],clock[0],json.dumps([{'node_id':'13','state':'unreachable'}])))
+            rotation.tick(server.connect,server.CIPHER)
+            with server.connect() as db:
+                row=db.execute('SELECT * FROM vps_rotations').fetchone()
                 self.assertEqual(row['phase'],'waiting_ip')
                 self.assertEqual(row['emergency'],1)
             self.assertEqual(change.call_count,2)
-            # Offline is not censorship: fail over using the bound DNS old value, but do not call change-IP.
+            # Heartbeat loss first moves DNS to freshly verified B; it cannot
+            # authorize changing A until post-cut business confirmation.
             self.assertEqual(report(1,tcp=20).status_code,200)
             with server.connect() as db:
                 source=db.execute('SELECT source_id FROM detection_plans WHERE server_id=?',(nodes[1][0],)).fetchone()[0]
@@ -684,10 +697,24 @@ class PanelTest(unittest.TestCase):
                 source=db.execute('SELECT source_id FROM detection_plans WHERE server_id=?',(nodes[1][0],)).fetchone()[0]
                 db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details) VALUES(?,?,?,?,'[\"13\"]','TCP 可达',?,?,?)",(nodes[1][0],source,ips[1],port,clock[0],clock[0],json.dumps([{'node_id':'13','state':'reachable'}])))
             rotation.tick(server.connect,server.CIPHER)
+            self.assertEqual(record['Value'],ips[1]);self.assertEqual(change.call_count,2)
+            rotation.tick(server.connect,server.CIPHER);clock[0]+=2
+            with server.connect() as db:
+                source=db.execute('SELECT source_id FROM detection_plans WHERE server_id=?',(nodes[0][0],)).fetchone()[0]
+                for _ in range(db.execute('SELECT failure_threshold FROM detection_plans WHERE server_id=?',(nodes[0][0],)).fetchone()[0]):
+                    db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details,scheduled) VALUES(?,?,?,?,'[\"13\"]','TCP 不通',?,?,?,1)",(nodes[0][0],source,ips[0],port,clock[0],clock[0],json.dumps([{'node_id':'13','state':'unreachable'}])))
+            rotation.tick(server.connect,server.CIPHER)
+            clock[0]+=2;report(1)
+            with server.connect() as db:
+                db.execute('UPDATE servers SET seen=? WHERE id=?',(clock[0]-91,nodes[0][0]))
+                source=db.execute('SELECT source_id FROM detection_plans WHERE server_id=?',(nodes[1][0],)).fetchone()[0]
+                db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details) VALUES(?,?,?,?,'[\"13\"]','TCP 可达',?,?,?)",(nodes[1][0],source,ips[1],port,clock[0],clock[0],json.dumps([{'node_id':'13','state':'reachable'}])))
+            rotation.tick(server.connect,server.CIPHER)
             with server.connect() as db:
                 row=db.execute('SELECT * FROM vps_rotations').fetchone()
-                self.assertEqual(row['active_server_id'],nodes[1][0]);self.assertEqual(row['emergency'],0)
-            self.assertEqual(record['Value'],ips[1]);self.assertEqual(change.call_count,2)
+                self.assertEqual(row['active_server_id'],nodes[1][0]);self.assertEqual(row['emergency'],1)
+                self.assertEqual(row['drain_grace_s'],0)
+            self.assertEqual(record['Value'],ips[1]);self.assertEqual(change.call_count,3)
             # Telemetry tokens are scoped: observer can report only DNS; analyst can only read statistics.
             self.assertEqual(self.bob.get(f'/api/client/servers/{nodes[0][0]}/rotation/insights').status_code,404)
             created=self.alice.post(f'/api/client/servers/{nodes[0][0]}/rotation/observers',json={'label':'test observer','region':'Shanghai','isp':'Telecom'},headers=headers)
@@ -732,9 +759,11 @@ class PanelTest(unittest.TestCase):
             self.assertEqual(deleted.status_code,200,deleted.json)
             self.assertEqual(report(0).status_code,200);self.assertEqual(report(1).status_code,200)
             with server.connect() as db:
-                for sid,_ in nodes:
+                for i,(sid,_) in enumerate(nodes):
                     action=db.execute("SELECT id FROM ip_connections WHERE server_id=? AND kind='change_ip'",(sid,)).fetchone()[0]
                     db.execute('UPDATE detection_plans SET owner_id=NULL,action_connection_id=? WHERE server_id=?',(action,sid))
+                    source=db.execute('SELECT source_id FROM detection_plans WHERE server_id=?',(sid,)).fetchone()[0]
+                    db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details,scheduled) VALUES(?,?,?,?,'[\"13\"]','TCP 可达',?,?,?,1)",(sid,source,ips[i],port,clock[0],clock[0],json.dumps([{'node_id':'13','state':'reachable'}])))
                 db.execute('UPDATE detection_sources SET owner_id=NULL,server_id=NULL')
                 db.execute('UPDATE ip_connections SET owner_id=NULL,server_id=NULL')
                 db.execute('UPDATE dns_bindings SET expected_ip=? WHERE id=?',(ips[0],binding_id))

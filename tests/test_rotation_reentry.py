@@ -1,4 +1,4 @@
-"""A drained rotating VPS must change IP before re-entry, including fault handoff."""
+"""Normal re-entry needs new IP; carrier incidents may reuse a freshly checked draining standby."""
 import unittest
 from unittest.mock import patch
 import test_rotation_emergency as emergency_fixture
@@ -8,6 +8,77 @@ from ip_dns import IntegrationError
 
 class ReentryGate(unittest.TestCase):
     setUp=emergency_fixture.OriginalEmergencyProbe.setUp
+
+    def prepare_urgent_drain(self,shared=False):
+        import json
+        f=self.f;deadline=f.row()['next_switch_at']
+        f.mocks[0].side_effect=lambda db,cipher,cid:{'kind':db.execute('SELECT kind FROM ip_connections WHERE id=?',(cid,)).fetchone()[0]}
+        with server.connect() as db:
+            db.execute("UPDATE vps_rotations SET phase='draining',drain_server_id=?,old_ip='1.1.1.1',drain_started=?,drain_grace_s=660,low_samples=0 WHERE id=?",(f.sid('B'),f.clock[0],f.rid))
+            metrics=json.loads(db.execute('SELECT metrics FROM servers WHERE id=?',(f.sid('B'),)).fetchone()[0]);metrics['tcp']=999
+            db.execute('UPDATE servers SET metrics=? WHERE id=?',(json.dumps(metrics),f.sid('B')))
+            if shared:
+                db.execute("INSERT INTO vps_rotations(owner_id,primary_server_id,other_server_id,binding_id,active_server_id,enabled,phase,next_switch_at,updated,drain_server_id,drain_started,drain_grace_s,old_ip,low_samples,mode) SELECT owner_id,primary_server_id,other_server_id,?,active_server_id,enabled,phase,next_switch_at,updated,drain_server_id,drain_started,drain_grace_s,old_ip,low_samples,mode FROM vps_rotations WHERE id=?",(f.bindings['telecom'],f.rid))
+        return deadline
+
+    def confirm_retired_A(self):
+        f=self.f;f.tick()
+        self.assertIsNotNone(f.row()['repair_check'])
+        f.advance(2,online=('B',));f.offline_probe();f.tick()
+
+    def test_confirmed_failure_reuses_standby_then_repairs_carrier_and_returns(self):
+        f=self.f;deadline=self.prepare_urgent_drain()
+        f.health[f.sid('A')]=False;f.refresh('A');f.tick()
+        self.assertEqual(f.value('mobile'),'8.8.8.8');f.change.assert_not_called()
+        self.assertEqual(f.row()['next_switch_at'],deadline)
+        f.advance(2,online=('A','B'));f.tick()
+        self.assertEqual(f.value('mobile'),'1.1.1.1')
+        f.change.assert_not_called();self.confirm_retired_A()
+        self.assertEqual(f.change.call_count,1);self.assertEqual(f.change.call_args.args[1],f.sid('A'))
+        self.assertEqual(f.row()['phase'],'waiting_ip')
+        f.health[f.sid('A')]=True;f.refresh('A',ip='8.8.4.4');f.tick()
+        f.advance(2,online=('A','B'));f.tick()
+        self.assertEqual(f.value('mobile'),'8.8.4.4');self.assertEqual(f.row()['active_server_id'],f.sid('A'))
+        self.assertEqual(f.row()['next_switch_at'],f.clock[0]+f.row()['interval_s']-f.row()['lead_s'])
+        self.assertEqual(f.change.call_count,1)
+
+    def test_heartbeat_timeout_also_reuses_standby_without_changing_its_ip(self):
+        f=self.f;self.prepare_urgent_drain();f.down();f.tick()
+        f.change.assert_not_called();self.assertEqual(f.value('mobile'),'8.8.8.8')
+        f.advance(2,online=('B',));f.offline_probe();f.tick();f.advance(2,online=('B',));f.tick()
+        self.assertEqual(f.value('mobile'),'1.1.1.1')
+        # A provider API may change the old carrier even while its heartbeat is stale.
+        f.change.assert_not_called();self.confirm_retired_A()
+        self.assertEqual(f.change.call_count,1);self.assertEqual(f.change.call_args.args[1],f.sid('A'))
+        self.assertEqual(f.row()['phase'],'waiting_ip')
+
+    def test_healthy_carrier_still_obeys_normal_drain_and_ttl(self):
+        f=self.f;deadline=self.prepare_urgent_drain();f.tick();f.change.assert_not_called()
+        self.assertEqual(f.row()['phase'],'draining');self.assertEqual(f.row()['next_switch_at'],deadline)
+        self.assertEqual(f.value('mobile'),'8.8.8.8')
+
+    def test_shared_records_reuse_existing_standby_and_only_repair_original_carrier(self):
+        f=self.f;self.prepare_urgent_drain(shared=True)
+        f.health[f.sid('A')]=False;f.refresh('A');f.tick();f.advance(2,online=('A','B'));f.tick()
+        self.assertEqual(f.value('mobile'),'1.1.1.1');self.assertEqual(f.value('telecom'),'1.1.1.1')
+        self.confirm_retired_A()
+        self.assertEqual(f.change.call_count,1);self.assertEqual(f.change.call_args.args[1],f.sid('A'))
+
+    def test_pending_action_still_blocks_urgent_change_and_recovery_restores_drain_gate(self):
+        f=self.f;deadline=self.prepare_urgent_drain()
+        f.health[f.sid('A')]=False;f.refresh('A')
+        with patch('rotation._pending_action',return_value=True):f.tick()
+        f.change.assert_not_called();self.assertEqual(f.row()['phase'],'draining')
+        f.health[f.sid('A')]=True;f.refresh('A');f.tick()
+        f.change.assert_not_called();self.assertEqual(f.row()['next_switch_at'],deadline)
+
+    def test_draining_standby_business_port_failure_blocks_reuse(self):
+        f=self.f;self.prepare_urgent_drain()
+        f.health[f.sid('A')]=False;f.refresh('A');f.tick();f.advance(2,online=('A','B'))
+        with patch('rotation.socket.create_connection',side_effect=OSError('port unavailable')):f.tick()
+        self.assertEqual(f.value('mobile'),'8.8.8.8');f.change.assert_not_called()
+        self.assertEqual(f.row()['phase'],'draining')
+
     def test_emergency_cannot_republish_draining_machine_with_old_ip(self):
         f=self.f
         with server.connect() as db:
@@ -25,34 +96,26 @@ class ReentryGate(unittest.TestCase):
         f.tick();f.advance(15,online=('A','B'));f.tick()
         self.assertNotEqual(f.row()['phase'],'active')
         self.assertEqual(f.value('mobile'),'8.8.8.8')
-    def test_normal_deadline_during_drain_does_not_switch(self):
-        f=self.f
-        with server.connect() as db:
-            db.execute("UPDATE vps_rotations SET phase='draining',drain_server_id=?,old_ip='1.1.1.1',next_switch_at=? WHERE id=?",(f.sid('B'),f.clock[0]-1,f.rid))
-        rotation._dns_switch(server.connect,server.CIPHER,f.rid,f.clock[0])
-        self.assertEqual(f.value('mobile'),'8.8.8.8')
+    def test_normal_deadline_during_drain_reuses_only_after_fresh_probe(self):
+        f=self.f;self.prepare_urgent_drain()
+        with server.connect() as db:db.execute('UPDATE vps_rotations SET next_switch_at=? WHERE id=?',(f.clock[0]-1,f.rid))
+        f.tick();self.assertEqual(f.value('mobile'),'8.8.8.8');f.change.assert_not_called()
+        f.advance(2,online=('A','B'));f.tick()
+        self.assertEqual(f.value('mobile'),'1.1.1.1');self.assertEqual(f.change.call_count,1)
+        self.assertEqual(f.change.call_args.args[1],f.sid('A'))
+        f.refresh('A',ip='8.8.4.4');f.tick();f.advance(2,online=('A','B'));f.tick()
+        self.assertEqual(f.value('mobile'),'8.8.4.4');self.assertEqual(f.change.call_count,1)
 
     def test_carrier_failure_does_not_prevent_drain_change_recheck_then_handoff(self):
-        f=self.f
-        f.mocks[0].side_effect=lambda db,cipher,cid:{'kind':db.execute('SELECT kind FROM ip_connections WHERE id=?',(cid,)).fetchone()[0]}
-        f.health[f.sid('A')]=False;f.refresh('A')
-        with server.connect() as db:
-            db.execute("UPDATE vps_rotations SET phase='draining',drain_server_id=?,old_ip='1.1.1.1',drain_started=?,drain_grace_s=0,low_samples=2 WHERE id=?",(f.sid('B'),f.clock[0]-30,f.rid))
-        f.tick()
-        self.assertEqual(f.row()['phase'],'waiting_ip');self.assertEqual(f.change.call_count,1)
-        self.assertEqual(f.value('mobile'),'8.8.8.8')
-        f.advance(15,online=('A','B'));f.refresh('B',ip='8.8.4.4');f.tick()
-        self.assertEqual(f.row()['phase'],'waiting_probe');self.assertEqual(f.value('mobile'),'8.8.8.8')
-        f.advance(15,online=('A','B'));f.tick()
-        self.assertEqual(f.value('mobile'),'8.8.4.4')
-        self.assertEqual(f.row()['drain_server_id'],f.sid('A'))
+        self.test_confirmed_failure_reuses_standby_then_repairs_carrier_and_returns()
     def test_same_ip_after_completed_attempt_stays_out_even_past_deadline(self):
         f=self.f
         with server.connect() as db:
             db.execute("UPDATE vps_rotations SET phase='waiting_ip',drain_server_id=?,old_ip='1.1.1.1',action_started=?,next_switch_at=? WHERE id=?",(f.sid('B'),f.clock[0]-70,f.clock[0]-1,f.rid))
         f.tick()
         self.assertEqual(f.row()['phase'],'draining')
-        rotation._dns_switch(server.connect,server.CIPHER,f.rid,f.clock[0])
+        with self.assertRaisesRegex(IntegrationError,'复检'):
+            rotation._dns_switch(server.connect,server.CIPHER,f.rid,f.clock[0])
         self.assertEqual(f.value('mobile'),'8.8.8.8')
 
     def ready_standby(self,deadline):
@@ -144,12 +207,12 @@ class ReentryGate(unittest.TestCase):
             db.execute("UPDATE vps_rotations SET phase='draining',drain_server_id=?,old_ip='8.8.4.4',drain_started=?,drain_grace_s=0,preload_base_attempt=action_attempts,drain_base_attempt=action_attempts,preload_refresh_deadline=next_switch_at WHERE id=?",(f.sid('B'),f.clock[0],f.rid))
         self.assertEqual(f.row()['phase'],'draining');f.change.assert_not_called()
         f.health[f.sid('A')]=False;f.refresh('A');f.tick()
-        self.assertEqual(f.row()['phase'],'active');f.change.assert_not_called()
+        self.assertEqual(f.row()['phase'],'draining');f.change.assert_not_called()
         self.assertEqual(f.value('mobile'),'8.8.8.8')
         f.advance(2,online=('A','B'));f.tick()
         self.assertEqual(f.value('mobile'),'8.8.4.4')
         self.assertEqual(f.row()['drain_server_id'],f.sid('A'))
-        f.tick();self.assertEqual(f.change.call_count,1)
+        self.confirm_retired_A();self.assertEqual(f.change.call_count,1)
         self.assertEqual(f.row()['phase'],'waiting_ip')
         self.assertEqual(f.row()['emergency'],1)
 
@@ -218,7 +281,16 @@ class ReentryGate(unittest.TestCase):
         with server.connect() as db:db.execute('UPDATE detection_rechecks SET poll_at=0')
         with patch('detectors.boce',return_value={'done':True,'list':[{'node_id':19,'packets_transmitted':1,'packets_received':0,'error_code':0}]}):detection_recheck.tick(server.connect,server.CIPHER)
         f.tick();f.advance(2,online=('B',));f.tick()
-        self.assertEqual(f.value('mobile'),'1.1.1.1');self.assertEqual(f.change.call_count,1)
+        self.assertEqual(f.value('mobile'),'1.1.1.1');f.change.assert_not_called()
+        f.tick();f.advance(2,online=('B',));f.offline_probe()
+        with server.connect() as db:
+            parent=db.execute('SELECT * FROM detection_runs WHERE server_id=? ORDER BY id DESC LIMIT 1',(f.sid('A'),)).fetchone()
+            detectors.finish(db,parent,'首轮不通',[{'node_id':'13','state':'unreachable'}])
+        f.tick();f.change.assert_not_called()
+        with patch('detectors.boce',return_value={'data':{'id':'post-cut-cross-point'}}):detection_recheck.tick(server.connect,server.CIPHER)
+        with server.connect() as db:db.execute('UPDATE detection_rechecks SET poll_at=0')
+        with patch('detectors.boce',return_value={'done':True,'list':[{'node_id':19,'packets_transmitted':1,'packets_received':0,'error_code':0}]}):detection_recheck.tick(server.connect,server.CIPHER)
+        f.tick();self.assertEqual(f.change.call_count,1)
         self.assertEqual(f.row()['enabled'],1)
         f.health[f.sid('A')]=True;f.refresh('A',ip='1.0.0.1');f.tick()
         with server.connect() as db:self.assertLessEqual(db.execute('SELECT next_at FROM detection_plans WHERE server_id=?',(f.sid('A'),)).fetchone()[0],f.clock[0])

@@ -6,10 +6,13 @@ from ip_dns import IntegrationError
 
 class RotationConditions(unittest.TestCase):
     def setUp(self):
+        # State-machine unit tests inject a confirmed heartbeat result; the
+        # real probe guard is exercised in test_rotation_heartbeat_guard.
+        guard=patch('rotation._heartbeat_confirmed',return_value=True);guard.start();self.addCleanup(guard.stop)
         self.tmp=tempfile.TemporaryDirectory();self.path=Path(self.tmp.name)/'test.db'
         rotation.initialize(self.connect)
         with self.connect() as db:
-            db.executescript("""CREATE TABLE servers(id INTEGER,seen INTEGER);INSERT INTO servers VALUES(1,990);INSERT INTO servers VALUES(2,990);CREATE TABLE detection_runs(id INTEGER PRIMARY KEY,server_id INTEGER,created INTEGER,ip TEXT DEFAULT '8.8.8.8',port INTEGER DEFAULT 443,status TEXT DEFAULT 'completed');CREATE TABLE detection_plans(server_id INTEGER,next_at INTEGER);""")
+            db.executescript("""CREATE TABLE servers(id INTEGER,seen INTEGER);INSERT INTO servers VALUES(1,990);INSERT INTO servers VALUES(2,990);CREATE TABLE detection_runs(id INTEGER PRIMARY KEY,server_id INTEGER,created INTEGER,ip TEXT DEFAULT '8.8.8.8',port INTEGER DEFAULT 443,status TEXT DEFAULT 'completed',action_status TEXT);CREATE TABLE detection_plans(server_id INTEGER,next_at INTEGER);""")
             db.execute("INSERT INTO vps_rotations(owner_id,primary_server_id,other_server_id,binding_id,active_server_id,enabled,phase,next_switch_at,updated,interval_s,lead_s) VALUES(1,1,2,1,1,1,'active',1000,900,120,20)")
             db.execute('INSERT INTO detection_runs(server_id,created) VALUES(1,990)');db.execute('INSERT INTO detection_runs(server_id,created) VALUES(2,990)')
     def tearDown(self):self.tmp.cleanup()
@@ -33,11 +36,11 @@ class RotationConditions(unittest.TestCase):
     def test_normal_deadline_calls_dns_switch(self):
         with patch('rotation._failed_ip',return_value=False),patch('rotation._dns_switch') as switch:
             rotation._run_rotation(self.connect,None,1,1000);switch.assert_called_once_with(self.connect,None,1,1000)
-    def test_new_active_fails_during_drain_does_not_republish_unrenewed_old_machine(self):
+    def test_new_active_fails_during_drain_requests_verified_emergency_handoff(self):
         with self.connect() as db:db.execute("UPDATE vps_rotations SET phase='draining',drain_server_id=2")
         with patch('rotation._failed_ip',side_effect=lambda db,sid,now:sid==1),patch('rotation._validated_plan',side_effect=IntegrationError('await repair')),patch('rotation._dns_switch') as switch:
             rotation._run_rotation(self.connect,None,1,950)
-            switch.assert_not_called()
+            switch.assert_called_once_with(self.connect,None,1,950,emergency=True,offline=False)
         self.assertEqual(self.row()['drain_server_id'],2)
     def test_failure_during_standby_ip_change_does_not_deadlock_recovery(self):
         with self.connect() as db:db.execute("UPDATE vps_rotations SET phase='waiting_ip',drain_server_id=2,old_ip='8.8.8.8',action_started=940")

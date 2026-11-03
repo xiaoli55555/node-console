@@ -11,6 +11,7 @@ from agent.agent import tcp_port_counts
 
 class FixedPrimary(unittest.TestCase):
     def setUp(self):
+        guard=patch('rotation._heartbeat_confirmed',return_value=True);guard.start();self.addCleanup(guard.stop)
         self.tmp=tempfile.TemporaryDirectory();self.path=Path(self.tmp.name)/'test.db'
         rotation.initialize(self.connect)
         with self.connect() as db:
@@ -83,7 +84,7 @@ class FixedPrimary(unittest.TestCase):
             with self.subTest(mode=mode):
                 self.change.reset_mock()
                 with self.connect() as db:
-                    db.execute("UPDATE vps_rotations SET mode=?,phase='draining',active_server_id=1,drain_server_id=2,old_ip='1.1.1.1',drain_started=1600,drain_grace_s=0,emergency=0,low_samples=0,last_sample_at=NULL,connection_threshold=20,action_started=NULL",(mode,))
+                    db.execute("UPDATE vps_rotations SET mode=?,phase='draining',active_server_id=1,drain_server_id=2,old_ip='1.1.1.1',drain_started=1600,drain_grace_s=0,emergency=0,low_samples=0,last_sample_at=NULL,connection_threshold=20,action_started=NULL,next_switch_at=10000",(mode,))
                 for now,count,expected in ((1751,20,0),(1752,19,1),(1752,19,1),(1753,20,0),(1754,19,1)):
                     self.count=count;self.refresh(now);rotation._run_rotation(self.connect,None,1,now)
                     self.assertEqual(self.row()['low_samples'],expected);self.change.assert_not_called()
@@ -96,7 +97,7 @@ class FixedPrimary(unittest.TestCase):
                 with self.subTest(mode=mode,count=count,stamp=stamp):
                     self.change.reset_mock();self.refresh(1751)
                     with self.connect() as db:
-                        db.execute("UPDATE vps_rotations SET mode=?,phase='draining',active_server_id=1,drain_server_id=2,old_ip='1.1.1.1',drain_started=1600,drain_grace_s=0,emergency=0,low_samples=1,last_sample_at=1750,connection_threshold=20,action_started=NULL",(mode,))
+                        db.execute("UPDATE vps_rotations SET mode=?,phase='draining',active_server_id=1,drain_server_id=2,old_ip='1.1.1.1',drain_started=1600,drain_grace_s=0,emergency=0,low_samples=1,last_sample_at=1750,connection_threshold=20,action_started=NULL,next_switch_at=10000",(mode,))
                     with patch('rotation._fresh_ip',return_value=('1.1.1.1',443,{'tcp':count,'connections_sampled':stamp})):
                         rotation._run_rotation(self.connect,None,1,1751)
                     self.change.assert_not_called();self.assertEqual(self.row()['low_samples'],0)
@@ -117,7 +118,7 @@ class FixedPrimary(unittest.TestCase):
                 with self.connect() as db:
                     db.execute('DELETE FROM commands')
                     db.execute("INSERT INTO commands VALUES(?,'reboot','accepted')",(pending_sid,))
-                    db.execute("UPDATE vps_rotations SET mode='alternating',phase='draining',active_server_id=1,drain_server_id=2,old_ip='1.1.1.1',drain_started=1600,drain_grace_s=0,emergency=0,low_samples=1,last_sample_at=1750,connection_threshold=20,action_started=NULL")
+                    db.execute("UPDATE vps_rotations SET mode='alternating',phase='draining',active_server_id=1,drain_server_id=2,old_ip='1.1.1.1',drain_started=1600,drain_grace_s=0,emergency=0,low_samples=1,last_sample_at=1750,connection_threshold=20,action_started=NULL,next_switch_at=10000")
                 self.count=19;rotation._run_rotation(self.connect,None,1,1751)
                 self.change.assert_not_called();self.assertIn('重启',self.row()['status'])
 
@@ -136,7 +137,7 @@ class FixedPrimary(unittest.TestCase):
         self.switch(1000);self.switch(1600)
         for mode in ('fixed_primary','alternating'):
             with self.subTest(mode=mode):
-                with self.connect() as db:db.execute("UPDATE vps_rotations SET mode=?,phase='waiting_ip',action_started=1600,old_ip='1.1.1.1',emergency=0",(mode,))
+                with self.connect() as db:db.execute("UPDATE vps_rotations SET mode=?,phase='waiting_ip',action_started=1600,old_ip='1.1.1.1',emergency=0,next_switch_at=10000",(mode,))
                 self.count=100;self.refresh(1750)
                 rotation._run_rotation(self.connect,None,1,1751)
                 self.assertEqual(self.row()['phase'],'draining');self.assertEqual(self.row()['low_samples'],0)

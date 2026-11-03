@@ -64,6 +64,14 @@ class PrimaryFailover(unittest.TestCase):
         for name in online:self.refresh(name)
     def down(self,name='A'):
         with server.connect() as db:db.execute('UPDATE servers SET seen=? WHERE id=?',(self.clock[0]-30,self.sid(name)))
+    def offline_probe(self,name='A',reachable=False):
+        """Finish domestic probes without delivering an agent heartbeat."""
+        sid=self.sid(name)
+        with server.connect() as db:
+            p=db.execute('SELECT p.*,m.port FROM detection_plans p JOIN ip_monitors m ON m.server_id=p.server_id WHERE p.server_id=?',(sid,)).fetchone()
+            details=json.dumps([{'node_id':str(n),'state':'reachable' if reachable else 'unreachable'} for n in json.loads(p['nodes'])])
+            for _ in range(1 if reachable else max(1,p['failure_threshold'])):
+                db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details,scheduled) VALUES(?,?,?,?,?,'completed',?,?,?,1)",(sid,p['source_id'],self.ips[sid],p['port'],p['nodes'],self.clock[0],self.clock[0],details))
     def tick(self):
         rotation.tick(server.connect,server.CIPHER)
         with server.connect() as db:
@@ -166,7 +174,11 @@ class PrimaryFailover(unittest.TestCase):
     def test_legacy_alternating_mode_also_supports_primary_failover(self):
         self.assertEqual(self.save(enabled=False).status_code,200)
         result=self.save(mode='alternating');self.assertEqual(result.status_code,200,result.json)
-        self.down();self.tick();self.assertEqual(self.value('telecom'),'9.9.9.9');self.change.assert_not_called()
+        self.down();self.tick();self.assertEqual(self.value('telecom'),'8.8.8.8')
+        self.advance(2,('B','C'));self.tick()
+        self.assertEqual(self.value('mobile'),'1.1.1.1')
+        self.tick() # C can independently take A's remaining records after B takes mobile.
+        self.assertEqual(self.value('telecom'),'9.9.9.9');self.change.assert_not_called()
     def test_failover_during_A_reboot_restores_new_IP_without_state_deadlock(self):
         with server.connect() as db:
             db.execute("UPDATE vps_rotations SET active_server_id=?,phase='waiting_ip',drain_server_id=?,old_ip='8.8.8.8',action_started=? WHERE id=?",(self.sid('B'),self.sid('A'),self.clock[0],self.rid))

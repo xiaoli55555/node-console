@@ -26,7 +26,7 @@ class ForcedDrain(unittest.TestCase):
             db.execute("UPDATE vps_rotations SET phase='active',mode='fixed_primary',active_server_id=1,drain_server_id=NULL,force_drain_samples=NULL,low_samples=0,last_sample_at=NULL,action_started=NULL")
         self.switch(1000);self.switch(1600)
         with self.connect() as db:
-            db.execute('UPDATE vps_rotations SET mode=?,force_drain_threshold=?',(mode,threshold))
+            db.execute('UPDATE vps_rotations SET mode=?,force_drain_threshold=?,next_switch_at=10000',(mode,threshold))
         self.count=150
 
     def step(self,now):
