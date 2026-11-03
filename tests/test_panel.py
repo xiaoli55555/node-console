@@ -43,11 +43,11 @@ class PanelTest(unittest.TestCase):
             path=urlsplit(url).path;query=parse_qs(urlsplit(url).query)
             if path.endswith('/node/list'):return {'code':200,'data':{'error_code':0,'data':{'list':[{'id':13},{'id':14}]}}}
             if path.endswith('/create/tcping'):
-                self.assertIn(query['host'][0],[ip+':'+str(port) for ip in [old_ip,new_ip,bad_ip]]);self.assertEqual(query['node_ids'],['13,14'])
+                self.assertIn(query['host'][0],[ip+':'+str(port) for ip in [old_ip,new_ip,bad_ip]]+['www.qq.com:80','www.baidu.com:80']);self.assertEqual(query['node_ids'],['13,14'])
                 task='20261028_simulated_'+str(len(created)+1);created.append(task);targets[task]=query['host'][0]
                 return {'code':200,'data':{'error_code':0,'data':{'id':task}}}
             self.assertIn(path.rsplit('/',1)[-1],created)
-            return {'code':200,'data':{'done':True,'list':[{'node_id':i,'node_name':str(i),'packets_transmitted':10,'packets_received':10 if targets[path.rsplit('/',1)[-1]]==new_ip+':'+str(port) else 0,'error_code':0} for i in [13,14]]}}
+            return {'code':200,'data':{'done':True,'list':[{'node_id':i,'node_name':str(i),'packets_transmitted':10,'packets_received':10 if targets[path.rsplit('/',1)[-1]] in (new_ip+':'+str(port),'www.qq.com:80','www.baidu.com:80') else 0,'error_code':0} for i in [13,14]]}}
         def saved(path,data):
             response=self.post(path,data);self.assertIn(response.status_code,(200,201),response.json);return response.json
         with patch('time.time',side_effect=lambda:clock[0]),patch('detectors.request_json',side_effect=boce_response),patch('ip_dns.alidns',side_effect=dns),patch('ip_dns.request_moonvm',side_effect=[ip_dns.IntegrationError('provider rejected (simulation)'),'accepted bad IP (simulation)','accepted good IP (simulation)']) as moonvm,patch('ip_dns.socket.create_connection',return_value=MagicMock()) as tcp,patch('detectors.queue_reboot',side_effect=AssertionError('Reboot must never be called')) as reboot:
@@ -71,8 +71,10 @@ class PanelTest(unittest.TestCase):
                 detectors.tick(server.connect,server.CIPHER)
                 clock[0]+=10
                 detectors.tick(server.connect,server.CIPHER)
+                detectors.detection_recheck.tick(server.connect,server.CIPHER)
+                detectors.execute_change_ip_actions(server.connect,server.CIPHER)
                 self.assertEqual(moonvm.call_count,1 if n==2 else 0)
-            self.assertEqual(len(created),3);self.assertEqual(moonvm.call_count,1)
+            self.assertEqual(len(created),9);self.assertEqual(moonvm.call_count,1)
             # Explicit rejection retries without a one-hour delay; accepted requests wait for IP.
             detectors.execute_change_ip_actions(server.connect,server.CIPHER);self.assertEqual(moonvm.call_count,2)
             detectors.execute_change_ip_actions(server.connect,server.CIPHER);self.assertEqual(moonvm.call_count,2)
@@ -86,6 +88,8 @@ class PanelTest(unittest.TestCase):
                 if n:clock[0]+=110
                 report(bad_ip);detectors.tick(server.connect,server.CIPHER)
                 clock[0]+=10;detectors.tick(server.connect,server.CIPHER)
+                detectors.detection_recheck.tick(server.connect,server.CIPHER)
+                detectors.execute_change_ip_actions(server.connect,server.CIPHER)
             self.assertEqual(moonvm.call_count,3)
             self.assertEqual(records['mobile-record']['Value'],old_ip)
             clock[0]+=1;report(new_ip)
@@ -98,7 +102,7 @@ class PanelTest(unittest.TestCase):
                 clock[0]+=10;detectors.tick(server.connect,server.CIPHER)
                 self.assertEqual(dns_writes,[])
                 with server.connect() as db:self.assertIsNone(ip_dns.boce_dns_gate(db,sid,new_ip,port))
-            self.assertEqual(len(created),7)
+            self.assertEqual(len(created),19)
             # A DNS error must retry DNS only, never change an already verified IP again.
             with self.assertRaises(ip_dns.IntegrationError):ip_dns.run_binding(server.connect,server.CIPHER,binding['id'],apply=True)
             detectors.execute_change_ip_actions(server.connect,server.CIPHER)

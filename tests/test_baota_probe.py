@@ -109,7 +109,9 @@ class IntegrationTest(unittest.TestCase):
    with self.connect() as db:db.execute('UPDATE detection_plans SET next_at=0 WHERE server_id=1')
    with patch('baota_probe.create',return_value='v2-task'):rid=detectors.start_run(self.connect,self.cipher,1,scheduled=True)
    with self.connect() as db:db.execute('UPDATE detection_runs SET poll_at=0 WHERE id=?',(rid,))
-   with patch('baota_probe.poll',return_value=provider.summarize([packet(0)],['7'])):detectors.tick(self.connect,self.cipher)
+   with patch('baota_probe.create',return_value='control-task'),patch('baota_probe.poll',return_value=provider.summarize([packet(0)],['7'])):detectors.tick(self.connect,self.cipher)
+   with self.connect() as db:db.execute('UPDATE detection_rechecks SET poll_at=0 WHERE parent_id=?',(rid,))
+   with patch('baota_probe.poll',return_value=provider.summarize([packet(1)],['7'])):detectors.detection_recheck.tick(self.connect,self.cipher)
    with self.connect() as db:self.assertEqual(db.execute('SELECT COUNT(*) FROM commands').fetchone()[0],cycle)
   with self.connect() as db:
    incident=db.execute('SELECT * FROM detection_incidents WHERE confirmed_at IS NOT NULL').fetchone()

@@ -22,10 +22,24 @@ class IndependentRecheck(unittest.TestCase):
    self.assertIsNotNone(db.execute('SELECT * FROM detection_rechecks').fetchone())
    self.assertEqual(db.execute('SELECT COUNT(*) FROM commands').fetchone()[0],0)
   return source
- def execute(self,state='unreachable'):
-  with patch('detectors.boce',return_value={'data':{'id':'independent-task'}}) as remote:
+ def reference(self,state='reachable'):
+  def submit(secret,path,body):return {'data':{'id':'ref-'+body['host'].split(':')[0]}}
+  with patch('detectors.boce',side_effect=submit) as remote:
    recheck.tick(self.connect,self.cipher)
-   self.assertEqual(remote.call_args.args[2],{'node_ids':'3','host':'8.8.8.8:443'})
+   self.assertEqual({x.args[2]['host'] for x in remote.call_args_list},{'www.qq.com:80','www.baidu.com:80'})
+   self.assertTrue(all(x.args[2]['node_ids']=='1,2,3' for x in remote.call_args_list))
+  with self.connect() as db:db.execute('UPDATE detection_rechecks SET poll_at=0')
+  result={'done':True,'list':[{'node_id':n,'packets_transmitted':1,'packets_received':1 if state=='reachable' else 0,'error_code':0,'round_trip_avg':17.5} for n in [1,2,3]]}
+  if state=='unknown':result['list']=[]
+  def response(secret,path,*args):
+   if path=='task/create/tcping':
+    self.assertEqual(args[0],{'node_ids':'3','host':'8.8.8.8:443'})
+    return {'data':{'id':'independent-task'}}
+   return result
+  with patch('detectors.boce',side_effect=response) as remote:recheck.tick(self.connect,self.cipher)
+  return remote
+ def execute(self,state='unreachable'):
+  IndependentRecheck.reference(self)
   with self.connect() as db:db.execute('UPDATE detection_rechecks SET poll_at=0')
   received=0 if state=='unreachable' else 1
   result={'done':True,'list':[{'node_id':3,'packets_transmitted':1,'packets_received':received,'error_code':0}]}
@@ -71,7 +85,7 @@ class IndependentRecheck(unittest.TestCase):
   self.setup_plan()
   with patch('detectors.boce',side_effect=IntegrationError('network')) as remote:
    recheck.tick(self.connect,self.cipher);recheck.tick(self.connect,self.cipher)
-   self.assertEqual(remote.call_count,1)
+   self.assertEqual(remote.call_count,2)
   with self.connect() as db:self.assertEqual(db.execute('SELECT COUNT(*) FROM commands').fetchone()[0],0)
  def test_ten_rounds_of_failed_reachable_and_unknown_do_not_pause_detection(self):
   for cycle in range(10):
@@ -83,7 +97,13 @@ class IndependentRecheck(unittest.TestCase):
  def test_timeout_never_queues_action(self):
   self.setup_plan()
   with patch('detectors.boce',return_value={'data':{'id':'timeout-task'}}):recheck.tick(self.connect,self.cipher)
-  with self.connect() as db:db.execute('UPDATE detection_rechecks SET submitted=?,poll_at=0',(int(time.time())-121,))
+  with self.connect() as db:
+   old=int(time.time())-121
+   db.execute('UPDATE detection_rechecks SET submitted=?,poll_at=0',(old,))
+   row=db.execute('SELECT reference_jobs FROM detection_rechecks').fetchone()
+   jobs=json.loads(row[0])
+   for job in jobs.values():job['submitted']=old;job['poll_at']=0
+   db.execute('UPDATE detection_rechecks SET reference_jobs=?',(json.dumps(jobs),))
   with patch('detectors.boce') as remote:recheck.tick(self.connect,self.cipher);remote.assert_not_called()
   with self.connect() as db:
    self.assertEqual(db.execute('SELECT state FROM detection_rechecks').fetchone()[0],'unknown')

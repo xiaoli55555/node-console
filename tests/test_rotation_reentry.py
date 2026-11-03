@@ -299,6 +299,13 @@ class ReentryGate(unittest.TestCase):
         f.tick();self.assertEqual(f.value('mobile'),'8.8.8.8');f.change.assert_not_called()
         with patch('detectors.boce',return_value={'data':{'id':'cross-point'}}):detection_recheck.tick(server.connect,server.CIPHER)
         with server.connect() as db:db.execute('UPDATE detection_rechecks SET poll_at=0')
+        def control_response(secret,path,body=None):
+            if body:
+                self.assertEqual(body['host'],'8.8.8.8:443');self.assertEqual(body['node_ids'],'19')
+                return {'data':{'id':'independent-target'}}
+            return {'done':True,'list':[{'node_id':node,'packets_transmitted':1,'packets_received':1,'error_code':0,'round_trip_avg':15} for node in (13,19)]}
+        with patch('detectors.boce',side_effect=control_response):detection_recheck.tick(server.connect,server.CIPHER)
+        with server.connect() as db:db.execute('UPDATE detection_rechecks SET poll_at=0')
         with patch('detectors.boce',return_value={'done':True,'list':[{'node_id':19,'packets_transmitted':1,'packets_received':0,'error_code':0}]}):detection_recheck.tick(server.connect,server.CIPHER)
         f.tick();f.advance(2,online=('B',));f.tick()
         self.assertEqual(f.value('mobile'),'1.1.1.1');f.change.assert_not_called()
@@ -308,6 +315,13 @@ class ReentryGate(unittest.TestCase):
             detectors.finish(db,parent,'首轮不通',[{'node_id':'13','state':'unreachable'}])
         f.tick();f.change.assert_not_called()
         with patch('detectors.boce',return_value={'data':{'id':'post-cut-cross-point'}}):detection_recheck.tick(server.connect,server.CIPHER)
+        with server.connect() as db:db.execute('UPDATE detection_rechecks SET poll_at=0')
+        def control_response(secret,path,body=None):
+            if body:
+                self.assertEqual(body['host'],'8.8.8.8:443');self.assertEqual(body['node_ids'],'19')
+                return {'data':{'id':'independent-target'}}
+            return {'done':True,'list':[{'node_id':node,'packets_transmitted':1,'packets_received':1,'error_code':0,'round_trip_avg':15} for node in (13,19)]}
+        with patch('detectors.boce',side_effect=control_response):detection_recheck.tick(server.connect,server.CIPHER)
         with server.connect() as db:db.execute('UPDATE detection_rechecks SET poll_at=0')
         with patch('detectors.boce',return_value={'done':True,'list':[{'node_id':19,'packets_transmitted':1,'packets_received':0,'error_code':0}]}):detection_recheck.tick(server.connect,server.CIPHER)
         f.tick();self.assertEqual(f.change.call_count,1)

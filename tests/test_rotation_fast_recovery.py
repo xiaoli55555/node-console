@@ -205,12 +205,12 @@ class FastRecovery(unittest.TestCase):
                 remote='task-'+str(len(hosts));hosts[remote]=body['host']
                 return {'data':{'id':remote}}
             host=hosts[path.rsplit('/',1)[-1]]
-            return {'done':True,'list':[{'node_id':13,'packets_transmitted':1,'packets_received':int(host.startswith('8.8.4.4:')),'error_code':0}]}
+            return {'done':True,'list':[{'node_id':13,'packets_transmitted':1,'packets_received':int(host.startswith('8.8.4.4:') or host=='www.baidu.com:80'),'error_code':0}]}
         with patch('rotation.boce_dns_gate',side_effect=detectors.boce_dns_gate),patch('detectors.boce',side_effect=provider) as remote,patch('dns_worker.time.sleep') as sleep:
             dns_worker.rotation_detection_cycle()
         self.assertEqual(f.value('mobile'),'8.8.4.4')
         self.assertEqual(f.row()['active_server_id'],f.sid('B'))
-        self.assertEqual(len(hosts),2);self.assertEqual(remote.call_count,4)
+        self.assertIn('www.baidu.com:80',hosts.values());self.assertGreaterEqual(remote.call_count,4);self.assertLessEqual(remote.call_count,8)
         sleep.assert_not_called();f.change.assert_not_called()
 
     def test_pending_confirmation_does_not_clear_an_existing_urgent_incident(self):

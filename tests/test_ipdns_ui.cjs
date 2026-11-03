@@ -1,5 +1,7 @@
 const test=require('node:test'),assert=require('node:assert/strict'),vm=require('node:vm'),fs=require('node:fs');
-const source=fs.readFileSync('web/ipdns.js','utf8');const ctx=vm.createContext({page:'rotations',esc:v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),console});vm.runInContext(source,ctx);
+const scheduleSource=fs.readFileSync('web/app.js','utf8');
+const scheduleFunctions=scheduleSource.slice(scheduleSource.indexOf('function drainScheduleFields('),scheduleSource.indexOf('function rotationModeFields('));
+const source=fs.readFileSync('web/ipdns.js','utf8');const ctx=vm.createContext({page:'rotations',esc:v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),console});vm.runInContext(scheduleFunctions,ctx);vm.runInContext(source,ctx);
 test('carrier timers use server time, advance without mutating response and separate deadlines',()=>{
  let now=500000;const clockCtx=vm.createContext({esc:String,Date:class extends Date{static now(){return now;}}});vm.runInContext(source,clockCtx);
  const r={enabled:1,timing:{server_now:1000,current:{started:900,censored:0},switch_deadline:990,drain_timeout_at:1030,force_threshold:200,action_observe_until:995}};

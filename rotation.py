@@ -12,6 +12,7 @@ import failover
 import rotation_groups
 import detection_recheck
 import rotation_timing
+import rotation_schedule
 from contextlib import nullcontext
 
 from detectors import boce_dns_gate, queue_reboot
@@ -73,7 +74,7 @@ def initialize(connect):
         columns={r[1] for r in db.execute('PRAGMA table_info(vps_rotations)')}
         for name,definition in [('mode',"TEXT NOT NULL DEFAULT 'alternating'"),('takeover_s','INTEGER NOT NULL DEFAULT 600'),('first_switch_at','INTEGER'),('mobile_only_ack','INTEGER NOT NULL DEFAULT 0'),('dns_intent','TEXT'),('fault_recovery','INTEGER NOT NULL DEFAULT 0'),('reboot_command_id','INTEGER'),('emergency_probe_after','INTEGER'),('standby_ready_at','INTEGER'),('standby_ready_server','INTEGER'),('preload_refresh_deadline','INTEGER'),('preload_base_attempt','INTEGER'),('reused_ip','TEXT'),('reused_server_id','INTEGER'),('drain_base_attempt','INTEGER'),('external_dns_check_at','INTEGER'),('external_dns_pending','INTEGER NOT NULL DEFAULT 0')]:
             if name not in columns:db.execute(f'ALTER TABLE vps_rotations ADD COLUMN {name} {definition}')
-        for name,definition in [('force_drain_threshold','INTEGER NOT NULL DEFAULT 0'),('force_drain_samples','TEXT'),('urgent_probe_floors','TEXT'),('heartbeat_check','TEXT'),('repair_check','TEXT'),('repair_check_required','INTEGER NOT NULL DEFAULT 0')]:
+        for name,definition in [('drain_schedule','TEXT'),('drain_schedule_key','TEXT'),('drain_schedule_after','INTEGER'),('force_drain_threshold','INTEGER NOT NULL DEFAULT 0'),('force_drain_samples','TEXT'),('urgent_probe_floors','TEXT'),('heartbeat_check','TEXT'),('repair_check','TEXT'),('repair_check_required','INTEGER NOT NULL DEFAULT 0')]:
             if name not in columns:db.execute(f'ALTER TABLE vps_rotations ADD COLUMN {name} {definition}')
         failover.initialize(db)
         rotation_timing.initialize(db)
@@ -114,9 +115,10 @@ def _force_drain_ready(db,r,count,stamp,now):
 def _drain_timing(db,r,now,outcome=None,tcp=None,start=False):
     """Observe one DNS handoff; never count action retries as new drains."""
     if not r['drain_server_id'] or r['drain_started'] is None:return
+    threshold=rotation_schedule.effective(r,now)['threshold']
     if start:db.execute("INSERT OR IGNORE INTO vps_rotation_drain_timings(rotation_id,server_id,old_ip,started,threshold,grace_s) VALUES(?,?,?,?,?,?)",
-               (r['id'],r['drain_server_id'],r['old_ip'],r['drain_started'],r['connection_threshold'],r['drain_grace_s']))
-    db.execute("UPDATE vps_rotation_drain_timings SET threshold=? WHERE rotation_id=? AND server_id=? AND started=? AND outcome='pending'",(r['connection_threshold'],r['id'],r['drain_server_id'],r['drain_started']))
+               (r['id'],r['drain_server_id'],r['old_ip'],r['drain_started'],threshold,r['drain_grace_s']))
+    db.execute("UPDATE vps_rotation_drain_timings SET threshold=? WHERE rotation_id=? AND server_id=? AND started=? AND outcome='pending'",(threshold,r['id'],r['drain_server_id'],r['drain_started']))
     if r['emergency']:outcome='skipped'
     if outcome=='forced':
         db.execute("UPDATE vps_rotation_drain_timings SET threshold=? WHERE rotation_id=? AND server_id=? AND started=? AND outcome='pending'",(r['force_drain_threshold'],r['id'],r['drain_server_id'],r['drain_started']))
@@ -144,6 +146,18 @@ def _owned_server(db,sid,uid):
 def _rotation_json(db,row):
     if not row:return None
     data=dict(row)
+    data['drain_effective']=rotation_schedule.effective(row,int(time.time()))
+    data['drain_tcp']=None
+    if row['drain_server_id']:
+        metrics=db.execute('SELECT metrics FROM servers WHERE id=?',(row['drain_server_id'],)).fetchone()
+        if metrics:
+            try:
+                snapshot=json.loads(metrics['metrics'] or '{}')
+                if isinstance(snapshot,dict):data['drain_tcp']=_rotation_tcp_count(snapshot,int(time.time()))[0]
+            except (ValueError,TypeError,IntegrationError):pass
+    if not row['emergency'] and not rotation_schedule.samples_current(row,int(time.time())):data['low_samples']=0
+    try:data['drain_schedule']=rotation_schedule.config(row)
+    except (ValueError,TypeError,IntegrationError):data['drain_schedule']=rotation_schedule.validate(rotation_schedule.DEFAULT)
     group=rotation_groups.members(db,row)
     data['binding_ids']=[p['binding_id'] for p in group]
     data['member_ids']=[p['id'] for p in group]
@@ -233,6 +247,7 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
                 if len(existing)>1:return error('VPS 或 DNS 记录已用于其他轮换任务',409)
                 rotation=existing[0] if existing else None
                 if rotation and g.user['role']!='admin' and rotation['owner_id']!=g.user['id']:return error('轮换计划不属于当前客户',403)
+                schedule=rotation_schedule.validate(d['drain_schedule']) if 'drain_schedule' in d else None
                 force_threshold=d.get('force_drain_threshold',rotation['force_drain_threshold'] if rotation else 0)
                 if type(force_threshold)is not int or not 0<=force_threshold<=10000:
                     return error('满 1 小时强制换 IP 的连接数阈值应为 1～10000，或 0 关闭')
@@ -255,6 +270,7 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
                     kept_threshold=d.get('connection_threshold',rotation['connection_threshold'])
                     db.execute('UPDATE vps_rotations SET force_drain_samples=CASE WHEN force_drain_threshold<>? THEN NULL ELSE force_drain_samples END,force_drain_threshold=? WHERE id=?',(force_threshold,force_threshold,rotation['id']))
                     db.execute("UPDATE vps_rotations SET enabled=0,status='轮换已暂停',interval_s=?,low_samples=CASE WHEN connection_threshold<>? THEN 0 ELSE low_samples END,last_sample_at=CASE WHEN connection_threshold<>? THEN NULL ELSE last_sample_at END,connection_threshold=?,lead_s=?,offline_after_s=?,takeover_s=?,first_switch_at=?,mobile_only_ack=?,updated=? WHERE id=?",(d.get('interval_s',rotation['interval_s']),kept_threshold,kept_threshold,kept_threshold,0 if mode=='fixed_primary' else d.get('lead_s',rotation['lead_s']),d.get('offline_after_s',rotation['offline_after_s']),takeover,first,int(ack),now,rotation['id']))
+                    if schedule is not None:rotation_schedule.save(db,rotation['id'],schedule,now)
                     audit(db,'暂停双 VPS 定时轮换 #'+str(rotation['id']))
                     return jsonify(ok=True,rotation=_rotation_json(db,db.execute('SELECT * FROM vps_rotations WHERE id=?',(rotation['id'],)).fetchone()))
                 import server_failover
@@ -290,6 +306,7 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
                     rid=rotation['id']
                 else:
                     rid=db.execute("INSERT INTO vps_rotations(owner_id,primary_server_id,other_server_id,binding_id,active_server_id,enabled,interval_s,connection_threshold,phase,next_switch_at,status,updated) VALUES(?,?,?,?,?,1,?,?,'active',?,'轮换已开启',?)",(g.user['id'],sid,other,binding_id,sid,interval,threshold,now+interval-lead,now)).lastrowid
+                if schedule is not None:rotation_schedule.save(db,rid,schedule,now)
                 db.execute('UPDATE vps_rotations SET lead_s=?,offline_after_s=? WHERE id=?',(lead,offline_after,rid))
                 db.execute('UPDATE vps_rotations SET force_drain_samples=CASE WHEN force_drain_threshold<>? THEN NULL ELSE force_drain_samples END,force_drain_threshold=? WHERE id=?',(force_threshold,force_threshold,rid))
                 db.execute('UPDATE vps_rotations SET mode=?,takeover_s=?,first_switch_at=?,mobile_only_ack=? WHERE id=?',(mode,takeover,first,int(ack),rid))
@@ -511,6 +528,7 @@ def _fixed_failure(db,sid,now):
     if not nodes:return False
     address=runs[0]['ip']
     for run in runs:
+        if detection_recheck.confirmed(db,plan,run) is False:return False
         if run['source_id']!=plan['source_id'] or run['nodes']!=plan['nodes'] or run['ip']!=address or run['port']!=plan['port'] or not 0<=now-run['updated']<=max(120,plan['interval_s']*2):return False
         try:rows=json.loads(run['details'])
         except (ValueError,TypeError):return False
@@ -732,7 +750,7 @@ def _heartbeat_confirmed(db,r,now,subject=None,subject_ip=None,force=False):
             details=json.loads(run['details'])
             return bool(nodes) and len(details)==len(nodes) and {str(x['node_id']) for x in details}==nodes and all(x['state']=='unreachable' for x in details)
         confirmation=detection_recheck.confirmed(db,plan,runs[0])
-        failed=confirmation is not False and all_failed(runs[0]) and (confirmation is True or (len(runs)>=plan['failure_threshold'] and all(valid(x) and all_failed(x) for x in runs)))
+        failed=confirmation is not False and all_failed(runs[0]) and (confirmation is True or (len(runs)>=plan['failure_threshold'] and all(valid(x) and all_failed(x) and detection_recheck.confirmed(db,plan,x) is not False for x in runs)))
         domestic_ok=bool(nodes) and len(rows)==len(nodes) and {str(x['node_id']) for x in rows}==nodes and all(x['state']=='reachable' for x in rows)
     except (ValueError,TypeError,KeyError,AttributeError):return None
     if not failed and not domestic_ok:
@@ -940,6 +958,8 @@ def _run_rotation(connect,cipher,rid,now):
     with connect() as db:
         r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
         if not r or (not r['enabled'] and not r['fault_recovery']):return
+        r,drain_effective=rotation_schedule.sync(db,r,now)
+        db.commit() # Release schedule sampling changes before a separate DNS handoff connection.
         # A recovered carrier ends this fault attempt. A later fault must request
         # another standby round, rather than reuse the previous incident's marker.
         stale_alert=r['phase']=='active' and _carrier_alert_status(r['status'])
@@ -1084,9 +1104,12 @@ def _run_rotation(connect,cipher,rid,now):
                 except IntegrationError as e:
                     db.execute('UPDATE vps_rotations SET status=?,updated=?,low_samples=0,force_drain_samples=NULL WHERE id=?',(str(e),now,rid));return
 
+            if not r['emergency'] and r['drain_schedule_after'] is not None and stamp<=r['drain_schedule_after']:
+                db.execute('UPDATE vps_rotations SET status=? WHERE id=?',('时段或排空配置已变化，等待两次新的 TCP 采样',rid));return
             if not r['emergency'] and stamp>(r['last_sample_at'] or 0):
-                lows=r['low_samples']+1 if count<r['connection_threshold'] else 0
-                db.execute('UPDATE vps_rotations SET low_samples=?,last_sample_at=?,status=?,updated=? WHERE id=?',(lows,stamp,f'旧 VPS 当前 {count} 条 TCP 连接；阈值 < {r["connection_threshold"]}，连续低值采样 {lows}/2',now,rid))
+                threshold=drain_effective['threshold']
+                lows=r['low_samples']+1 if count<threshold else 0
+                db.execute('UPDATE vps_rotations SET low_samples=?,last_sample_at=?,status=?,updated=? WHERE id=?',(lows,stamp,f'旧 VPS 当前 {count} 条 TCP 连接；阈值 < {threshold}（{drain_effective["label"]}），连续低值采样 {lows}/2',now,rid))
                 r=dict(r);r['low_samples']=lows
             forced=not r['emergency'] and _force_drain_ready(db,r,count,stamp,now) and r['low_samples']<2
             if r['low_samples']<2 and not forced:return

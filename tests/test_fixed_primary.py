@@ -303,6 +303,8 @@ class SelectedNodeFailure(unittest.TestCase):
         CREATE TABLE detection_runs(id INTEGER PRIMARY KEY,server_id INTEGER,source_id INTEGER,nodes TEXT,ip TEXT,port INTEGER,updated INTEGER,details TEXT,status TEXT NOT NULL DEFAULT 'completed');
         INSERT INTO detection_plans VALUES(1,7,'["13","42"]',3,120,1);
         INSERT INTO ip_monitors VALUES(1,443,1);''')
+        import detection_recheck
+        detection_recheck.initialize(self.db)
         self.rows=[{'node_id':'13','state':'unreachable'},{'node_id':'42','state':'unreachable'}]
         self.guard=patch('rotation._failed_ip',return_value=True);self.guard.start()
     def tearDown(self):self.guard.stop();self.db.close()

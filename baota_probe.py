@@ -39,11 +39,15 @@ def nodes(secret):
     return result
 
 
-def create(secret,ip,port,selected,run_id):
-    try:target=ipaddress.ip_address(ip)
-    except ValueError:raise IntegrationError('无效的公网 TCP 目标') from None
-    if target.version!=4 or not target.is_global or type(port)is not int or not 1<=port<=65535:
-        raise IntegrationError('无效的公网 TCP 目标')
+def create(secret,ip,port,selected,run_id,reference=False):
+    if reference:
+        if ip not in ('www.baidu.com','www.qq.com') or port!=80:raise IntegrationError('无效的固定参照站目标')
+        target=ip
+    else:
+        try:target=ipaddress.ip_address(ip)
+        except ValueError:raise IntegrationError('无效的公网 TCP 目标') from None
+        if target.version!=4 or not target.is_global or type(port)is not int or not 1<=port<=65535:
+            raise IntegrationError('无效的公网 TCP 目标')
     if not selected or len(selected)>20 or any(not re.fullmatch(r'[0-9]{1,20}',str(n)) for n in selected):
         raise IntegrationError('请选择 1–20 个宝塔节点 ID')
     available={n['id'] for n in nodes(secret)}

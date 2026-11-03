@@ -28,7 +28,7 @@ def initialize(connect):
     _source_nodes_cache.clear()
     with connect() as db:
         db.executescript(SCHEMA)
-        db.executescript(detection_recheck.SCHEMA)
+        detection_recheck.initialize(db)
         # Additive migrations preserve existing monitoring plans and run history.
         migrations={
             'detection_sources':{
@@ -200,7 +200,7 @@ def record_incident(db,run,plan,rows,now):
         if active['evidence']:incident_history.store(db,active['id'],run['server_id'],run['ip'],now)
 
 
-def finish(db,run,status,rows,recheck_confirmed=False):
+def finish(db,run,status,rows,recheck_confirmed=False,reference_confirmed=False):
     now=int(time.time())
     action_result=None
     action_status=None
@@ -208,17 +208,18 @@ def finish(db,run,status,rows,recheck_confirmed=False):
     new_evidence=previous and previous['status'] in ('creating','pending','queued','issued')
     db.execute('UPDATE detection_runs SET status=?,details=?,updated=? WHERE id=?',(status,json.dumps(rows),now,run['id']))
     # Do not apply old source/IP results to a reconfigured plan or a changed target.
-    plan=db.execute('SELECT p.*,s.enabled AS source_enabled FROM detection_plans p JOIN detection_sources s ON s.id=p.source_id WHERE p.server_id=?',(run['server_id'],)).fetchone()
+    plan=db.execute('SELECT p.*,s.kind AS source_kind,s.enabled AS source_enabled FROM detection_plans p JOIN detection_sources s ON s.id=p.source_id WHERE p.server_id=?',(run['server_id'],)).fetchone()
     current=db.execute('SELECT current_ip,enabled,port FROM ip_monitors WHERE server_id=?',(run['server_id'],)).fetchone()
     if plan and plan['source_enabled'] and plan['source_id']==run['source_id'] and plan['nodes']==run['nodes'] and current and current['enabled'] and current['port']==run['port'] and (not current['current_ip'] or current['current_ip']==run['ip']):
         confirm_node=dict(plan).get('confirm_node')
         scheduled=bool(run['scheduled']) if 'scheduled' in run.keys() else False
-        if confirm_node and scheduled and plan['automatic']:
-            if not recheck_confirmed and detection_recheck.enqueue(db,run,plan,rows,now):
+        if scheduled and plan['automatic'] and (confirm_node or plan['source_kind'] in ('boce','baota','aliyun')):
+            if not reference_confirmed and not recheck_confirmed and detection_recheck.enqueue(db,run,plan,rows,now):
                 db.execute('UPDATE detection_runs SET incident_evidence=COALESCE(incident_evidence,?) WHERE id=?',(json.dumps(incident_history.snapshot(db,run['server_id'],run['ip'],now)),run['id']))
                 return
             if recheck_confirmed:
                 plan=dict(plan);plan['failure_threshold']=1;new_evidence=True
+        if reference_confirmed:new_evidence=True
         if new_evidence:record_incident(db,run,plan,rows,now)
         if recheck_confirmed:db.execute("UPDATE detection_incidents SET threshold=2,failures=2,first_failed=MIN(first_failed,COALESCE((SELECT created FROM detection_rechecks WHERE parent_id=?),first_failed)),confirmed_at=COALESCE(confirmed_at,?),state='confirmed' WHERE server_id=? AND last_run=? AND closed_at IS NULL",(run['id'],now,run['server_id'],run['id']))
         if recheck_confirmed:
@@ -300,9 +301,7 @@ def start_run(connect,cipher,sid,scheduled=False):
         z=ZoneInfo('Asia/Shanghai');today=datetime.now(z).replace(hour=0,minute=0,second=0,microsecond=0).timestamp()
         from failover import budget_primary
         primary=budget_primary(db,sid)
-        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vps_failover_probe_costs'").fetchone():
-            used=db.execute('SELECT COALESCE(SUM(cost),0) FROM detection_runs WHERE created>=? AND (server_id=? OR id IN (SELECT run_id FROM vps_failover_probe_costs WHERE primary_server_id=?))',(today,primary,primary)).fetchone()[0]
-        else:used=db.execute('SELECT COALESCE(SUM(cost),0) FROM detection_runs WHERE server_id=? AND created>=?',(sid,today)).fetchone()[0]
+        used=detection_recheck.daily_usage(db,primary,today)
         if used+cost>p['daily_limit']:raise IntegrationError('已达到此 VPS 的每日节点检测次数上限')
         rid=db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,poll_at,cost,scheduled) VALUES(?,?,?,?,?,'creating',?,?,?,?,?)",(sid,p['source_id'],ip,m['port'],json.dumps(nodes),now,now,now+10,cost,int(scheduled))).lastrowid
         if primary!=sid:db.execute('INSERT INTO vps_failover_probe_costs(run_id,primary_server_id) VALUES(?,?)',(rid,primary))
@@ -471,6 +470,7 @@ def register(app,connect,cipher,auth,body,error,audit):
             sources=[{k:r[k] for k in ('id','name','kind','enabled','last_seen','verified_at')} for r in db.execute('SELECT * FROM detection_sources')]
             plans=[dict(r) for r in db.execute('SELECT p.*,m.port FROM detection_plans p JOIN ip_monitors m ON m.server_id=p.server_id')]
             runs=[dict(r) for r in db.execute('SELECT id,server_id,source_id,ip,port,status,created,updated,details,action_result,action_status FROM detection_runs ORDER BY id DESC LIMIT 50')]
+            for run in runs:run['reference']=detection_recheck.snapshot(db,run['id'])
         for p in plans:p['nodes']=json.loads(p['nodes'])
         for r in runs:r['details']=json.loads(r['details'])
         return jsonify(sources=sources,plans=plans,runs=runs)
@@ -504,7 +504,9 @@ def register(app,connect,cipher,auth,body,error,audit):
             for p in plans:
                 run=db.execute('SELECT id,ip,port,status,created,updated,details,action_result FROM detection_runs WHERE server_id=? AND source_id=? ORDER BY id DESC LIMIT 1',(p['server_id'],p['source_id'])).fetchone()
                 latest=dict(run) if run else None
-                if latest:latest['details']=json.loads(latest['details'])
+                if latest:
+                    latest['details']=json.loads(latest['details'])
+                    latest['reference']=detection_recheck.snapshot(db,latest['id'])
                 recovery=db.execute("SELECT id,action_status,action_result,action_attempts,action_attempted,action_candidate FROM detection_runs WHERE server_id=? AND action_status IS NOT NULL AND action_command_id IS NULL ORDER BY id DESC LIMIT 1",(p['server_id'],)).fetchone()
                 result.append({'recovery':dict(recovery) if recovery else None,'server_id':p['server_id'],'current_port':p['current_port'],'source_kind':p['source_kind'],'current_ip':p['current_ip'],'monitor_enabled':bool(p['monitor_enabled']),'source_name':p['source_name'],'source_enabled':bool(p['source_enabled']),'automatic':bool(p['automatic']),'action_enabled':bool(p['action_enabled']),'response_mode':p['response_mode'],'status':p['status'],'checked':p['checked'],'next_at':p['next_at'],'failure_streak':p['failure_streak'],'failure_threshold':p['failure_threshold'],'run':latest})
         return jsonify(monitors=result,now=int(time.time()))
@@ -590,7 +592,9 @@ def register(app,connect,cipher,auth,body,error,audit):
                 if generic and generic['owner_id']==g.user['id']:inherited={'primary_server_id':generic['server_id']}
             if inherited:safe_plan.update(inherited_from=inherited['primary_server_id'],nodes=json.loads(plan['nodes']),interval_s=plan['interval_s'],daily_limit=plan['daily_limit'],automatic=bool(plan['automatic']),actions_locked=True)
         run=dict(latest) if latest else None
-        if run:run['details']=json.loads(run['details'])
+        if run:
+            run['details']=json.loads(run['details'])
+            with connect() as db:run['reference']=detection_recheck.snapshot(db,run['id'])
         status={'run':run,'failure_streak':plan['failure_streak'] if plan else 0,'failure_ip':plan['failure_ip'] if plan else None,'failure_port':plan['failure_port'] if plan else None,'next_at':plan['next_at'] if plan else None,'plan_status':plan['status'] if plan else '尚未配置探测','checked':plan['checked'] if plan else None}
         return jsonify(sources=sources,plan=safe_plan,monitor=dict(monitor) if monitor else None,status=status)
 

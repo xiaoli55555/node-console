@@ -120,7 +120,30 @@ function clientProbeStatusMarkup(status){
  const state={creating:'正在创建探测任务',pending:'探测任务处理中',queued:'等待探测点领取',issued:'探测点正在执行',completed:'探测已完成',failed:'探测任务失败'}[run.status]||run.status||'等待结果';
  const details=(run.details||[]).map(x=>`<span class="probe-node-${['reachable','unreachable','unknown'].includes(x.state)?x.state:'unknown'}">${esc(x.name||x.node_id)}：${({reachable:'可达',unreachable:'不通',unknown:'未知'})[x.state]||'未知'}${Number.isFinite(x.latency_ms)?' '+x.latency_ms+' ms':''}</span>`).join('');
  const checked=run.updated?new Date(run.updated*1000).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'}):'等待中';
- return `<strong>${esc(state)}${status.failure_streak?` · 连续失败 ${status.failure_streak}`:''}</strong><p>目标：${esc(run.ip)}:${run.port} · 更新：${checked}</p><div class="ipdns-probe-nodes">${details||'<span>等待探测节点返回结果</span>'}</div>${run.action_result?`<p><b>自动处理进度：</b>${esc(run.action_result)}</p>`:''}${status.plan_status?`<small>${esc(status.plan_status)}</small>`:''}`;
+ return `${typeof referenceProbeMarkup==='function'?referenceProbeMarkup(run.reference):''}<strong>${esc(state)}${status.failure_streak?` · 连续失败 ${status.failure_streak}`:''}</strong><p>目标：${esc(run.ip)}:${run.port} · 更新：${checked}</p><div class="ipdns-probe-nodes">${details||'<span>等待探测节点返回结果</span>'}</div>${run.action_result?`<p><b>自动处理进度：</b>${esc(run.action_result)}</p>`:''}${status.plan_status?`<small>${esc(status.plan_status)}</small>`:''}`;
+}
+function drainScheduleFields(r){
+ const c=r?.drain_schedule||{enabled:false,boundaries:[180,600,1200],thresholds:[80,20,40,80]};
+ const fmt=m=>`${String(Math.floor(m/60)).padStart(2,'0')}:${String(m%60).padStart(2,'0')}`;
+ return `<fieldset><legend>分时连接排空（北京时间）</legend><label><input type="checkbox" name="drain_schedule_enabled" ${c.enabled?'checked':''}>启用分时阈值</label><p>关闭使用下方默认 TCP 阈值。四段完整覆盖一天；修改分界时间会同时更新相邻两段。保存不重置轮换时间，切换时段后重新确认两次新采样。故障紧急接替规则保持原样。</p>${c.boundaries.map((m,i)=>`<label>第 ${i+1} 个分界时间<input type="time" name="drain_boundary_${i}" value="${fmt(m)}" required></label>`).join('')}<div data-drain-preview>${drainSchedulePreview(c)}</div>${c.thresholds.map((n,i)=>`<label>第 ${i+1} 段 TCP 严格低于<input type="number" name="drain_threshold_${i}" min="1" max="10000" step="1" value="${n}" required></label>`).join('')}<p>完整配置随“保存轮换”一起保存；任一字段不合法则全部不生效。配置异常时回退默认阈值并告警。提高阈值可能中断更多剩余连接。</p></fieldset>`;
+}
+function drainSchedulePreview(c){
+ const fmt=m=>`${String(Math.floor(m/60)).padStart(2,'0')}:${String(m%60).padStart(2,'0')}`,b=[0,...c.boundaries,1440];
+ return `<p>${c.thresholds.map((n,i)=>`第 ${i+1} 段 ${fmt(b[i])}–${fmt(b[i+1])}：TCP &lt; ${n}`).join('<br>')}</p>`;
+}
+function drainSchedulePayload(form){
+ if(!form.drain_schedule_enabled)return {};
+ const boundaries=[0,1,2].map(i=>{const v=form[`drain_boundary_${i}`].value;if(!/^\d{2}:\d{2}$/.test(v))throw Error('请填写全部三个分界时间');const [h,m]=v.split(':').map(Number);if(h>23||m>59)throw Error('分界时间无效');return h*60+m;});
+ const thresholds=[0,1,2,3].map(i=>Number(form[`drain_threshold_${i}`].value));
+ if(!(0<boundaries[0]&&boundaries[0]<boundaries[1]&&boundaries[1]<boundaries[2]&&boundaries[2]<1440))throw Error('分界时间必须递增，不能产生空段或重叠');
+ if(thresholds.some(n=>!Number.isInteger(n)||n<1||n>10000))throw Error('四段阈值必须为 1～10000 的整数');
+ return {drain_schedule:{enabled:form.drain_schedule_enabled.checked,boundaries,thresholds}};
+}
+function bindDrainSchedule(form){
+ if(!form.drain_schedule_enabled)return;
+ const preview=form.querySelector('[data-drain-preview]');
+ const update=()=>{try{preview.innerHTML=drainSchedulePreview(drainSchedulePayload(form).drain_schedule);}catch(e){preview.textContent=e.message;}};
+ for(const el of [...[0,1,2].map(i=>form[`drain_boundary_${i}`]),...[0,1,2,3].map(i=>form[`drain_threshold_${i}`])])el.addEventListener('input',update);
 }
 function rotationModeFields(r,servers=[],bindings=[],primaryId=null){
  const fixed=r?.mode==='fixed_primary';
@@ -128,10 +151,11 @@ function rotationModeFields(r,servers=[],bindings=[],primaryId=null){
  const local=date?new Date(date.getTime()-date.getTimezoneOffset()*60000).toISOString().slice(0,16):'';
  const forceDrain=`<fieldset><legend>排空满 1 小时强制回收（可选）</legend><label>强制换 IP 的 TCP 阈值（严格低于）<input name="force_drain_threshold" type="number" min="1" max="10000" value="${r?.force_drain_threshold||''}" placeholder="留空关闭，由你设定"></label><p>从 DNS 切离开始满 1 小时后，连续两次新鲜 TCP 采样低于此值才允许强制换 IP；仍等待 TTL 到期、当前承载健康及已有任务结束。剩余连接可能中断。留空关闭，不影响正常阈值。</p></fieldset>`;
  const failover=`<fieldset><legend>A 故障转移（独立可选，适用于两种模式）</legend><label>A 的故障转移 VPS<select name="failover_server_id"><option value="">不启用</option>${servers.map(x=>`<option value="${x.id}" ${x.id===primaryId||x.id===r?.other_server_id?'disabled':''} ${r?.failover_server_id===x.id?'selected':''}>${esc(x.name)}</option>`).join('')}</select></label><p>同账号的独立专用 C 可以同时供多个轮换计划备用，各计划分别复检、接管和恢复；C 不能同时作为其他计划的 A/B。${r?.failover_server_id?`当前 C 服务 ${Number(r.failover_plan_count||1)} 个轮换计划。`:""}</p><p><strong>接替范围：A 的全部绑定解析。</strong>双机交替模式中，仅 A、B 均确认不可用时才验证并启用 C；任一正常或故障尚未确认，C 保持待命，不参与定时轮换。固定主机模式仍按原 A 故障转移规则执行。</p><label>恢复稳定等待（秒）<input name="failover_recovery_s" type="number" min="15" max="3600" value="${r?.failover_recovery_s||60}"></label><p>选择备用机即独立启用，暂停 B 定时轮换不关闭此功能。满足当前模式的故障转移条件后，C 临时继承 A 的探测点、端口与检测规则，验证通过才接替 A 的全部绑定解析。所选记录已在健康 B 时保持 B；所选记录在 A 时自动纳入接替。备用机闲时不拨测；接管时继承 A 的规则，换 IP API 仅使用备用机自身对应的配置。需提前配置相同的转发服务。接替期间暂停 A/B 定时动作；双机交替模式允许 A 或 B 验证恢复并经过稳定窗口后切回，C 退出接管；固定主机模式仍等待 A 恢复。</p>${r?.failover_status?`<p>故障转移状态：${esc(r.failover_status)}</p>`:''}</fieldset>`;
- return `<label>运行模式<select name="mode"><option value="alternating" ${fixed?'':'selected'}>双机交替轮换（原模式）</option><option value="fixed_primary" ${fixed?'selected':''}>固定主机＋定时线路轮换</option></select></label><p>原模式：两台交替承载，退出的一台换 IP。新模式：主 VPS 保持 IP，仅确认被墙后修复；轮换 VPS 定时接替所选线路解析，到时切回主 VPS，再等轮换机 TCP 已建立连接总数连续两次低于阈值后换 IP。主机不可用则延后切回。</p><input name="takeover_minutes" type="hidden" value="10"><label>新模式：首次切入时间（本机时区；留空或已过期则验证后立即切入）<input name="first_switch" type="datetime-local" value="${local}"></label><label><input name="mobile_only_ack" type="checkbox" ${r?.mobile_only_ack?'checked':''}> 新模式：确认仅轮换下方选定的 DNS 记录；若选择默认线路，该记录覆盖的所有运营商都会切换</label><p>新模式的周期是 B 每次承载时长，不使用“提前发布 DNS”。B 到时切回 A，B 连接数达标后换 IP，检测通过立即切回 B 并重新计时。支持移动、电信、联通、默认或其他已有线路：在下方“轮换线路 / DNS A 记录”中选择，只修改选定的记录；后台同一计划支持多选。连接数直接使用现有 TCP 已建立连接总数，无需按业务端口上报；低于阈值换 IP 仍可能断开剩余连接。</p>${forceDrain}${failover}`;
+ return `<label>运行模式<select name="mode"><option value="alternating" ${fixed?'':'selected'}>双机交替轮换（原模式）</option><option value="fixed_primary" ${fixed?'selected':''}>固定主机＋定时线路轮换</option></select></label><p>原模式：两台交替承载，退出的一台换 IP。新模式：主 VPS 保持 IP，仅确认被墙后修复；轮换 VPS 定时接替所选线路解析，到时切回主 VPS，再等轮换机 TCP 已建立连接总数连续两次低于阈值后换 IP。主机不可用则延后切回。</p><input name="takeover_minutes" type="hidden" value="10"><label>新模式：首次切入时间（本机时区；留空或已过期则验证后立即切入）<input name="first_switch" type="datetime-local" value="${local}"></label><label><input name="mobile_only_ack" type="checkbox" ${r?.mobile_only_ack?'checked':''}> 新模式：确认仅轮换下方选定的 DNS 记录；若选择默认线路，该记录覆盖的所有运营商都会切换</label><p>新模式的周期是 B 每次承载时长，不使用“提前发布 DNS”。B 到时切回 A，B 连接数达标后换 IP，检测通过立即切回 B 并重新计时。支持移动、电信、联通、默认或其他已有线路：在下方“轮换线路 / DNS A 记录”中选择，只修改选定的记录；后台同一计划支持多选。连接数直接使用现有 TCP 已建立连接总数，无需按业务端口上报；低于阈值换 IP 仍可能断开剩余连接。</p>${drainScheduleFields(r)}${forceDrain}${failover}`;
 }
-function rotationModePayload(form){return {force_drain_threshold:Number(form.force_drain_threshold?.value||0),mode:form.mode.value,takeover_s:Number(form.takeover_minutes.value)*60,first_switch_at:form.first_switch.value?Math.floor(new Date(form.first_switch.value).getTime()/1000):null,mobile_only_ack:form.mobile_only_ack.checked,...(form.failover_server_id?{failover_server_id:form.failover_server_id.value?Number(form.failover_server_id.value):null,failover_recovery_s:Number(form.failover_recovery_s.value)}:{})};}
+function rotationModePayload(form){return {...drainSchedulePayload(form),force_drain_threshold:Number(form.force_drain_threshold?.value||0),mode:form.mode.value,takeover_s:Number(form.takeover_minutes.value)*60,first_switch_at:form.first_switch.value?Math.floor(new Date(form.first_switch.value).getTime()/1000):null,mobile_only_ack:form.mobile_only_ack.checked,...(form.failover_server_id?{failover_server_id:form.failover_server_id.value?Number(form.failover_server_id.value):null,failover_recovery_s:Number(form.failover_recovery_s.value)}:{})};}
 function bindFailoverChoices(form,primaryId){
+ bindDrainSchedule(form);
  if(!form.failover_server_id)return;
  const sync=()=>{const primary=Number(form.primary_server_id?.value||primaryId),other=Number(form.other_server_id.value);for(const option of form.failover_server_id.options){option.disabled=!!option.value&&[primary,other].includes(Number(option.value));if(option.disabled&&option.selected)form.failover_server_id.value='';}};
  form.other_server_id.addEventListener('change',sync);form.primary_server_id?.addEventListener('change',sync);sync();

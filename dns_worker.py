@@ -1,7 +1,7 @@
 """Run one dedicated worker: python dns_worker.py (Compose starts it automatically)."""
 import time
 import server
-from detectors import tick as detection_tick
+from detectors import tick as detection_tick, execute_change_ip_actions
 from ip_dns import run_binding, check_monitor, IntegrationError
 from rotation import tick as rotation_tick, expedite_recovery_probes
 from rotation_insights import collect_reports
@@ -46,4 +46,12 @@ if __name__=='__main__':
         rotation_detection_cycle()
         try:collect_reports(server.connect)
         except Exception:print("Rotation report: collection failed",flush=True)
-        time.sleep(5)
+        # Keep normal monitoring cadence, while failed-target guards advance at 1 s.
+        import detection_recheck
+        for _ in range(5):
+            try:
+                if detection_recheck.tick(server.connect,server.CIPHER):
+                    rotation_tick(server.connect,server.CIPHER)
+                    execute_change_ip_actions(server.connect,server.CIPHER)
+            except Exception:print('Reference check: cycle failed',flush=True)
+            time.sleep(1)

@@ -59,13 +59,23 @@ class DetectorTest(unittest.TestCase):
   with self.connect() as db:db.execute('DELETE FROM ip_monitors WHERE server_id=1')
   self.assertEqual(self.post('/plans/1',{'source_id':source,'nodes':[]}).status_code,400)
   with self.connect() as db:self.assertIsNone(db.execute('SELECT 1 FROM ip_monitors').fetchone())
- def incident_run(self,source,states,ip='8.8.8.8',scheduled=True):
+ def incident_run(self,source,states,ip='8.8.8.8',scheduled=True,complete_reference=True):
   now=int(time.time())
   with self.connect() as db:
    db.execute('UPDATE ip_monitors SET current_ip=? WHERE server_id=1',(ip,))
    rid=db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,scheduled,created,updated) VALUES(1,?,?,443,?,'pending',?,?,?)",(source,ip,json.dumps(['1','2']),int(scheduled),now,now)).lastrowid
    run=db.execute('SELECT * FROM detection_runs WHERE id=?',(rid,)).fetchone()
    detectors.finish(db,run,'test',[{'node_id':str(i+1),'state':state} for i,state in enumerate(states)])
+  # Tests of incident accounting use a completed, successful control-station phase.
+  # Guard/independent tests explicitly keep the asynchronous phase pending.
+  with self.connect() as db:
+   job=db.execute("SELECT c.* FROM detection_rechecks c JOIN detection_runs r ON r.id=c.parent_id WHERE r.id=? AND c.node=''",(rid,)).fetchone()
+  if complete_reference and job:
+   with patch('detectors.boce',return_value={'data':{'id':'fixture-control'}}):detectors.detection_recheck.tick(self.connect,self.cipher)
+   with self.connect() as db:db.execute('UPDATE detection_rechecks SET poll_at=0 WHERE parent_id=?',(rid,))
+   success={'done':True,'list':[{'node_id':n,'packets_transmitted':1,'packets_received':1,'error_code':0} for n in (1,2)]}
+   with patch('detectors.boce',return_value=success):detectors.detection_recheck.tick(self.connect,self.cipher)
+
  def test_incident_confirms_once_and_survives_run_history_cleanup(self):
   source=self.source()['id'];self.plan(source,automatic=True)
   for _ in range(4):self.incident_run(source,['unreachable','unreachable'])
@@ -143,7 +153,7 @@ class DetectorTest(unittest.TestCase):
    db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,scheduled,created,updated) VALUES(1,?,'8.8.8.8',443,?,'pending',1,100,100)",(source,json.dumps(['1','2'])))
    run=db.execute('SELECT * FROM detection_runs').fetchone()
    with patch('detectors.time.time',return_value=1000):
-    detectors.finish(db,run,'不通',[{'node_id':'1','state':'unreachable'},{'node_id':'2','state':'unreachable'}])
+    detectors.finish(db,run,'参照站通过后不通',[{'node_id':'1','state':'unreachable'},{'node_id':'2','state':'unreachable'}],reference_confirmed=True)
    plan=db.execute('SELECT * FROM detection_plans').fetchone()
    self.assertEqual(plan['next_at'],1010);self.assertEqual(plan['failure_streak'],1)
    self.assertIsNone(db.execute('SELECT action_status FROM detection_runs').fetchone()[0])

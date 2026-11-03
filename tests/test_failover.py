@@ -358,6 +358,9 @@ class PrimaryFailover(unittest.TestCase):
                 run=db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details,scheduled) VALUES(?,?,?,443,?,'pending',?,?,?,1)",(self.sid('C'),p['source_id'],'9.9.9.9',p['nodes'],self.clock[0],self.clock[0],'[]')).lastrowid
                 row=db.execute('SELECT * FROM detection_runs WHERE id=?',(run,)).fetchone()
                 detectors.finish(db,row,'complete',[{'node_id':'13','state':'unreachable'}])
+                db.commit()
+                with patch('detectors.boce',return_value={'data':{'id':'C-reference'}}):detectors.detection_recheck.tick(server.connect,server.CIPHER,server_ids=[self.sid('C')])
+                with patch('detectors.boce',return_value={'done':True,'list':[{'node_id':13,'packets_transmitted':1,'packets_received':1,'error_code':0}]}):detectors.detection_recheck.tick(server.connect,server.CIPHER,server_ids=[self.sid('C')])
         with patch('detectors.invoke_change_ip_api',return_value='accepted') as change:
             detectors.execute_change_ip_actions(server.connect,server.CIPHER)
             change.assert_called_once();self.assertEqual(change.call_args.args[1],self.sid('C'))
@@ -371,6 +374,9 @@ class PrimaryFailover(unittest.TestCase):
             for _ in range(2):
                 run=db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details,scheduled) VALUES(?,?,?,443,?,'pending',?,?,?,1)",(self.sid('C'),p['source_id'],'9.9.9.9',p['nodes'],self.clock[0],self.clock[0],'[]')).lastrowid
                 detectors.finish(db,db.execute('SELECT * FROM detection_runs WHERE id=?',(run,)).fetchone(),'complete',[{'node_id':'13','state':'unreachable'}])
+                db.commit()
+                with patch('detectors.boce',return_value={'data':{'id':'C-reference'}}):detectors.detection_recheck.tick(server.connect,server.CIPHER,server_ids=[self.sid('C')])
+                with patch('detectors.boce',return_value={'done':True,'list':[{'node_id':13,'packets_transmitted':1,'packets_received':1,'error_code':0}]}):detectors.detection_recheck.tick(server.connect,server.CIPHER,server_ids=[self.sid('C')])
             commands=db.execute('SELECT server_id FROM commands').fetchall()
             self.assertEqual([x[0] for x in commands],[self.sid('C')])
 

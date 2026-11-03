@@ -5,6 +5,7 @@ const statusMatch=source.match(/function clientProbeStatusMarkup\([\s\S]*?\n}/);
 assert.ok(match,'customer settings renderer exists');
 assert.ok(statusMatch,'customer probe status renderer exists');
 const ctx=vm.createContext({esc:v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))});
+vm.runInContext(source.slice(source.indexOf('function drainScheduleFields('),source.indexOf('function rotationModeFields(')),ctx);
 vm.runInContext(source.match(/function rotationModeFields\([\s\S]*?\n}/)[0]+'\n'+statusMatch[0]+'\n'+match[0],ctx);
 
 test('customer VPS settings expose BOCE, AliDNS, Cloudflare, MoonVM, port and recovery controls',()=>{
