@@ -163,6 +163,7 @@ def _rotation_json(db,row):
     if data['failover_leases'] and not data['failover_server_id']:
         inherited=db.execute('SELECT r.failover_server_id,r.failover_status,s.name FROM vps_failover_leases l JOIN vps_rotations r ON r.id=l.rotation_id JOIN servers s ON s.id=r.failover_server_id WHERE l.binding_id=?',((mobile_lease or data['failover_leases'][0])['binding_id'],)).fetchone()
         if inherited:data['failover_server_id']=inherited['failover_server_id'];data['failover_name']=inherited['name'];data['failover_status']=inherited['failover_status']
+    data['failover_plan_count']=db.execute('SELECT COUNT(*) FROM (SELECT 1 FROM vps_rotations WHERE failover_server_id=? AND owner_id=? GROUP BY primary_server_id,other_server_id,owner_id,mode)',(data['failover_server_id'],data['owner_id'])).fetchone()[0] if data['failover_server_id'] else 0
     data['mobile_effective_server_id']=data['failover_server_id'] if mobile_lease and not mobile_lease['intent'] else data['active_server_id']
     if mobile_lease:data['active_name']='解析待核对' if mobile_lease['intent'] else (data['failover_name'] or str(data['failover_server_id']))+'（故障转移）'
     if len({p['active_server_id'] for p in group})>1:data['active_name']='多条记录切换中'
