@@ -1395,8 +1395,16 @@ def _sync_external_dns(connect,cipher,rid,now,force=False):
         if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='dns_bindings'").fetchone():return False
         r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
         if not r or not r['enabled'] or r['dns_intent']:return False
+        group=rotation_groups.members(db,r)
+        root=group[0]
+        if any(not member['enabled'] or member['dns_intent'] for member in group):return False
         lease=db.execute('SELECT * FROM vps_failover_leases WHERE binding_id=?',(r['binding_id'],)).fetchone()
         if lease and lease['intent']:return False
+        target=root['active_server_id']
+        realign=not lease and r['active_server_id']!=target
+        if realign and (r['phase']!='active' or r['action_started'] is not None):
+            # Finish observing issued work before changing this member's state.
+            return False
         if not force and r['external_dns_check_at'] is not None and now-r['external_dns_check_at']<300:
             if r['external_dns_pending']:raise IntegrationError('DNS 自动纠正待重试，暂缓后续轮换动作')
             return False
@@ -1406,12 +1414,14 @@ def _sync_external_dns(connect,cipher,rid,now,force=False):
         if lease:
             target_ip=public_v4(lease['current_ip'])
         else:
-            try:target_ip,port,_=_fresh_ip(db,r['active_server_id'],now,cipher)
+            try:target_ip,port,_=_fresh_ip(db,target,now,cipher)
             except IntegrationError:
                 # Missing carrier heartbeat must reach the existing emergency
                 # takeover flow; periodic maintenance cannot block recovery.
                 return False
             if port!=binding['port']:raise IntegrationError('承载 VPS 业务端口与 DNS 绑定不一致')
+            if realign:
+                _fixed_ready(db,cipher,dict(r,phase='active'),target,now,verified_candidate=target_ip)
         conn=load_connection(db,cipher,binding['connection_id'])
         record=get_dns_record(conn,binding)
         actual=public_v4(record.get('content',record.get('Value')))
@@ -1428,10 +1438,20 @@ def _sync_external_dns(connect,cipher,rid,now,force=False):
             _event(db,rid,r['active_server_id'],message,now)
         else:
             db.execute('UPDATE dns_bindings SET expected_ip=? WHERE id=?',(target_ip,binding['id']))
-        if not lease and binding['expected_ip']!=target_ip:
-            rotation_timing.change(db,rid,r['active_server_id'],target_ip,now,'carrier_ip_observed')
+        if realign:
+            ttl=record.get('ttl',record.get('TTL',300))
+            try:ttl=int(ttl)
+            except (TypeError,ValueError):ttl=300
+            ttl=300 if ttl<=1 else ttl
+            _finish_dns_switch(db,r,binding,rid,target,binding['expected_ip'],target_ip,ttl,now,now,
+                               False,False,False,bool(record.get('proxied',False)))
+            _event(db,rid,target,f'历史分叉线路已核对并跟随计划 #{root["id"]} 的统一承载目标；保留计划截止时间，重新等待本线路 TTL 与连接排空',now)
+        elif not lease and binding['expected_ip']!=target_ip:
+            rotation_timing.change(db,rid,target,target_ip,now,'carrier_ip_observed')
+        if realign:
+            db.execute('UPDATE vps_rotations SET next_switch_at=? WHERE id=?',(root['next_switch_at'],rid))
         db.execute('UPDATE vps_rotations SET external_dns_pending=0 WHERE id=?',(rid,))
-        return actual!=target_ip
+        return actual!=target_ip or realign
 
 
 def expedite_recovery_probes(connect,cipher):

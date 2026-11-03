@@ -85,6 +85,45 @@ class MultiPlan(unittest.TestCase):
         self.assertEqual(len(result['rotations']),1);self.assertEqual(len(result['rotations'][0]['member_ids']),2)
         self.change.assert_not_called()
 
+    def split_legacy_group(self):
+        plan=self.multi()
+        with server.connect() as db:
+            db.execute("UPDATE vps_rotations SET mode='alternating',next_switch_at=?",(self.clock[0]+2000,))
+            db.execute("UPDATE vps_rotations SET active_server_id=other_server_id,phase='draining',drain_server_id=primary_server_id,old_ip='8.8.8.8',drain_started=?,next_switch_at=? WHERE id=?",(self.clock[0]-600,self.clock[0]+1000,plan['id']))
+            db.execute("UPDATE dns_bindings SET expected_ip='1.1.1.1' WHERE id=?",(self.bindings['mobile'],))
+            peer=db.execute('SELECT id FROM vps_rotations WHERE id<>?',(plan['id'],)).fetchone()[0]
+        self.records[self.bindings['mobile']]['Value']='1.1.1.1'
+        return plan['id'],peer
+
+    def test_periodic_check_repairs_legacy_split_to_one_plan_carrier(self):
+        root,peer=self.split_legacy_group()
+        rotation._sync_external_dns(server.connect,server.CIPHER,peer,self.clock[0],force=True)
+        self.assertEqual(self.value('telecom'),'1.1.1.1')
+        with server.connect() as db:
+            rows=db.execute('SELECT * FROM vps_rotations ORDER BY id').fetchall()
+            self.assertTrue(all(r['active_server_id']==self.sid('B') for r in rows))
+            self.assertTrue(all(r['next_switch_at']==self.clock[0]+1000 for r in rows))
+            self.assertEqual(rows[1]['phase'],'draining')
+            self.assertEqual(rows[1]['drain_server_id'],self.sid('A'))
+            self.assertGreaterEqual(rows[1]['drain_grace_s'],120)
+        self.change.assert_not_called()
+
+    def test_split_repair_recovers_when_provider_applied_before_timeout(self):
+        root,peer=self.split_legacy_group()
+        def write(c,b,r,ip):
+            self.records[b['id']]['Value']=ip
+            raise IntegrationError('response lost')
+        with patch('rotation.update_dns_record',side_effect=write):
+            with self.assertRaises(IntegrationError):
+                rotation._sync_external_dns(server.connect,server.CIPHER,peer,self.clock[0],force=True)
+        with patch('rotation.update_dns_record') as writer:
+            rotation._sync_external_dns(server.connect,server.CIPHER,peer,self.clock[0],force=True)
+        writer.assert_not_called()
+        with server.connect() as db:
+            r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(peer,)).fetchone()
+            self.assertEqual(r['active_server_id'],self.sid('B'))
+            self.assertEqual(r['external_dns_pending'],0)
+
     def test_group_waits_for_later_member_deadline_then_switches_all_routes(self):
         r=self.multi()
         with server.connect() as db:
