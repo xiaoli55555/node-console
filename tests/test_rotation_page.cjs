@@ -16,10 +16,10 @@ test('overview and detail load into page; detail shows per-line DNS and candidat
  assert.doesNotMatch(html,/<main>/);assert.match(html,/&lt;main&gt;/);
 });
 test('late initial response cannot overwrite a different page',async()=>{
- const {c,elements}=setup();let resolve;c.api=()=>new Promise(r=>resolve=r);const pending=c.loadAdminRotations();c.page='servers';resolve({rotations:[plan]});await pending;assert.equal(elements.adminRotationsContent.innerHTML,'');
+ const {c,elements}=setup();let resolve;c.api=path=>path==='detection/monitor-status'?Promise.resolve({monitors:[]}):new Promise(r=>resolve=r);const pending=c.loadAdminRotations();c.page='servers';resolve({rotations:[plan]});await pending;assert.equal(elements.adminRotationsContent.innerHTML,'');
 });
 test('live response cannot overwrite an open editor or navigate back after leaving',async()=>{
- const {c,timers,elements}=setup();let resolve;c.api=()=>new Promise(r=>resolve=r);const data={rotations:[{...plan,urgent_probe_floors:'{}'}]};c.startAdminRotationLive(data);
+ const {c,timers,elements}=setup();let resolve;c.api=path=>path==='detection/monitor-status'?Promise.resolve({monitors:[]}):new Promise(r=>resolve=r);const data={rotations:[{...plan,urgent_probe_floors:'{}'}]};c.startAdminRotationLive(data);
  const pending=timers[0]();c.renderRotationPage('<form>unsaved changes</form>');resolve({rotations:[{...plan,status:'new status'}]});await pending;
  assert.match(elements.adminRotationsContent.innerHTML,/unsaved changes/);assert.equal(data.rotations[0].status,plan.status);
  c.page='servers';await timers[0]();assert.match(elements.adminRotationsContent.innerHTML,/unsaved changes/);

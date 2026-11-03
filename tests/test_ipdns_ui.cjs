@@ -107,7 +107,7 @@ test('admin lifecycle buttons submit pause resume delete and recover after a fai
  const message={};let rejectDelete=true,removed=false;const calls=[];
  env.document={querySelectorAll(selector){return buttons.filter(b=>selector.includes('-'+b.name+']'));}};
  env.$=()=>message;env.renderRotationPage=()=>{};env.startAdminRotationLive=()=>{};env.confirm=()=>true;
- env.api=async(path,method,body)=>{calls.push({path,method,body});if(path==='admin/rotations')return {rotations:removed?[]:[r]};if(method==='PUT'){r.enabled=body.enabled;return {};}if(method==='DELETE'){if(rejectDelete)throw Error('轮换动作正在提交，请稍后重试删除');removed=true;return {};}};
+ env.api=async(path,method,body)=>{calls.push({path,method,body});if(path==='detection/monitor-status')return {monitors:[]};if(path==='admin/rotations')return {rotations:removed?[]:[r]};if(method==='PUT'){r.enabled=body.enabled;return {};}if(method==='DELETE'){if(rejectDelete)throw Error('轮换动作正在提交，请稍后重试删除');removed=true;return {};}};
  await env.loadAdminRotations();await buttons[1].onclick();assert.equal(r.enabled,false);
  await buttons[1].onclick();assert.equal(r.enabled,true);
  await buttons[1].onclick();assert.equal(r.enabled,false);
