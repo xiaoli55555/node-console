@@ -96,15 +96,34 @@ class ReentryGate(unittest.TestCase):
         f.tick();f.advance(15,online=('A','B'));f.tick()
         self.assertNotEqual(f.row()['phase'],'active')
         self.assertEqual(f.value('mobile'),'8.8.8.8')
-    def test_normal_deadline_during_drain_reuses_only_after_fresh_probe(self):
+    def test_normal_deadline_waits_for_drain_changed_ipv4_and_recheck(self):
         f=self.f;self.prepare_urgent_drain()
         with server.connect() as db:db.execute('UPDATE vps_rotations SET next_switch_at=? WHERE id=?',(f.clock[0]-1,f.rid))
-        f.tick();self.assertEqual(f.value('mobile'),'8.8.8.8');f.change.assert_not_called()
+        f.tick();f.advance(2,online=('A','B'));f.tick()
+        self.assertEqual(f.value('mobile'),'8.8.8.8');f.change.assert_not_called()
+        with self.assertRaisesRegex(IntegrationError,'排空'):
+            rotation._dns_switch(server.connect,server.CIPHER,f.rid,f.clock[0],emergency=True)
+        # A new healthy probe cannot substitute for the required B IP change.
+        f.advance(661,online=('A','B'));f.tick()
+        self.assertEqual(f.row()['low_samples'],1);f.change.assert_not_called()
+        f.advance(15,online=('A','B'));f.tick()
+        self.assertEqual(f.change.call_count,1);self.assertEqual(f.change.call_args.args[1],f.sid('B'))
+        f.refresh('B');f.tick();self.assertEqual(f.value('mobile'),'8.8.8.8')
+        f.refresh('B',ip='8.8.4.4');f.tick()
+        self.assertEqual(f.row()['phase'],'waiting_probe');self.assertEqual(f.value('mobile'),'8.8.8.8')
         f.advance(2,online=('A','B'));f.tick()
-        self.assertEqual(f.value('mobile'),'1.1.1.1');self.assertEqual(f.change.call_count,1)
-        self.assertEqual(f.change.call_args.args[1],f.sid('A'))
-        f.refresh('A',ip='8.8.4.4');f.tick();f.advance(2,online=('A','B'));f.tick()
         self.assertEqual(f.value('mobile'),'8.8.4.4');self.assertEqual(f.change.call_count,1)
+        self.assertEqual(f.row()['emergency'],0)
+
+    def test_carrier_fault_after_deadline_still_allows_verified_old_ip_takeover(self):
+        f=self.f;self.prepare_urgent_drain()
+        with server.connect() as db:db.execute('UPDATE vps_rotations SET next_switch_at=? WHERE id=?',(f.clock[0]-1,f.rid))
+        f.health[f.sid('A')]=False;f.refresh('A');f.tick()
+        self.assertEqual(f.value('mobile'),'8.8.8.8');f.change.assert_not_called()
+        f.advance(2,online=('A','B'));f.tick()
+        self.assertEqual(f.value('mobile'),'1.1.1.1');f.change.assert_not_called()
+        self.confirm_retired_A()
+        self.assertEqual(f.change.call_count,1);self.assertEqual(f.change.call_args.args[1],f.sid('A'))
 
     def test_carrier_failure_does_not_prevent_drain_change_recheck_then_handoff(self):
         self.test_confirmed_failure_reuses_standby_then_repairs_carrier_and_returns()
@@ -114,8 +133,9 @@ class ReentryGate(unittest.TestCase):
             db.execute("UPDATE vps_rotations SET phase='waiting_ip',drain_server_id=?,old_ip='1.1.1.1',action_started=?,next_switch_at=? WHERE id=?",(f.sid('B'),f.clock[0]-70,f.clock[0]-1,f.rid))
         f.tick()
         self.assertEqual(f.row()['phase'],'draining')
-        with self.assertRaisesRegex(IntegrationError,'复检'):
-            rotation._dns_switch(server.connect,server.CIPHER,f.rid,f.clock[0])
+        rotation._dns_switch(server.connect,server.CIPHER,f.rid,f.clock[0])
+        with self.assertRaisesRegex(IntegrationError,'排空'):
+            rotation._dns_switch(server.connect,server.CIPHER,f.rid,f.clock[0],emergency=True)
         self.assertEqual(f.value('mobile'),'8.8.8.8')
 
     def ready_standby(self,deadline):

@@ -802,12 +802,12 @@ def _original_emergency_probe(db,r,target,now):
 
 
 def _draining_fault_takeover(db,r,target,now):
-    """A due rotation or carrier incident may reuse an idle draining standby IP."""
+    """Only a current carrier fault may reuse an unissued draining standby IP."""
     return (not _fixed(r) and r['phase']=='draining' and r['drain_server_id']==target
             and r['action_started'] is None and r['new_ip'] is None
             and not _pending_action(db,target) and not _pending_action(db,r['active_server_id'])
-            and ((r['enabled'] and r['next_switch_at']<=now)
-                 or _offline(db,r['active_server_id'],now,r['offline_after_s']) or _failed_ip(db,r['active_server_id'],now)))
+            and (_offline(db,r['active_server_id'],now,r['offline_after_s'])
+                 or _failed_ip(db,r['active_server_id'],now)))
 
 
 def _dns_switch(connect,cipher,rotation,now,emergency=False,offline=False):
@@ -815,8 +815,8 @@ def _dns_switch(connect,cipher,rotation,now,emergency=False,offline=False):
         r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rotation,)).fetchone()
         if not r or (not r['enabled'] and not emergency):return
         target=r['other_server_id'] if r['active_server_id']==r['primary_server_id'] else r['primary_server_id']
-        reuse_draining=_draining_fault_takeover(db,r,target,now)
-        if not emergency and ((r['phase']!='active' and not reuse_draining) or r['next_switch_at']>now):return
+        reuse_draining=emergency and _draining_fault_takeover(db,r,target,now)
+        if not emergency and (r['phase']!='active' or r['next_switch_at']>now):return
         if emergency and r['phase'] in ('waiting_ip','waiting_probe'):raise IntegrationError('备用机正在换 IP 或复检，暂不能安全切回')
         binding=db.execute('SELECT * FROM dns_bindings WHERE id=?',(r['binding_id'],)).fetchone()
         if not binding:raise IntegrationError('轮换 DNS 绑定已删除')
@@ -832,7 +832,7 @@ def _dns_switch(connect,cipher,rotation,now,emergency=False,offline=False):
                 db.execute("UPDATE vps_rotations SET phase='draining',drain_server_id=?,drain_started=?,drain_grace_s=0,old_ip=?,new_ip=NULL,action_started=NULL,reboot_command_id=NULL,last_sample_at=NULL,low_samples=0,emergency=0,drain_base_attempt=action_attempts,preload_base_attempt=NULL,status=?,updated=? WHERE id=?",(target,now,address,message,now,rotation))
                 _event(db,rotation,target,message,now)
                 return
-        if (emergency or reuse_draining) and not _fixed(r):_original_emergency_probe(db,r,target,now)
+        if emergency and not _fixed(r):_original_emergency_probe(db,r,target,now)
         _fixed_ready(db,cipher,r,target,now,allow_draining=reuse_draining)
         if offline:old_ip,port=binding['expected_ip'],binding['port']
         else:old_ip,port,_=_fresh_ip(db,r['active_server_id'],now,cipher)
@@ -852,7 +852,7 @@ def _dns_switch(connect,cipher,rotation,now,emergency=False,offline=False):
         except (TypeError,ValueError):ttl=300
         if ttl<=1:ttl=300
         if ttl>604800:raise IntegrationError('DNS TTL 超过 7 天，已停止轮换')
-        immediate_repair=not _fixed(r) and (emergency or reuse_draining)
+        immediate_repair=not _fixed(r) and emergency
         grace=0 if immediate_repair or (emergency and not offline) else ttl+60
         submitted=int(time.time())
         if _fixed(r):
@@ -868,7 +868,7 @@ def _dns_switch(connect,cipher,rotation,now,emergency=False,offline=False):
         record_switch(db,rotation,binding,old_ip,target_ip,submitted,int(time.time()),ttl,bool(record.get('proxied',False)))
         if reuse_draining:
             _drain_timing(db,r,now,'skipped')
-            _event(db,rotation,target,'排空中接替：备用机现有 IP 已通过本次复检，跳过换 IP 立即接替；原承载机复测确认故障后才换 IP，复检通过立即切回',now)
+            _event(db,rotation,target,'故障应急接替：备用机现有 IP 已通过本次复检，跳过换 IP 接替；正常定时轮换仍须排空、换 IP 和复检',now)
         rotation_timing.change(db,rotation,target,target_ip,int(time.time()),'fault_switch' if emergency else 'scheduled_switch')
         message=f"DNS 已从 {old_ip} 切换到 {target_ip}；等待旧 VPS #{r['active_server_id']} 连接降到阈值以下"
         if offline:message=f'承载 VPS 离线，DNS 已从 {old_ip} 切到 {target_ip}；旧机等待恢复，未执行换 IP'
@@ -891,7 +891,7 @@ def _dns_switch(connect,cipher,rotation,now,emergency=False,offline=False):
             db.execute('UPDATE vps_rotations SET next_switch_at=? WHERE id=?',(now+delay,rotation))
             if r['active_server_id']==r['other_server_id'] and not (emergency and not offline):
                 db.execute('UPDATE vps_rotations SET emergency=0,low_samples=0,drain_grace_s=? WHERE id=?',(ttl+60,rotation))
-        if emergency or reuse_draining:db.execute('UPDATE vps_rotations SET fault_recovery=1 WHERE id=?',(rotation,))
+        if emergency:db.execute('UPDATE vps_rotations SET fault_recovery=1 WHERE id=?',(rotation,))
         db.execute('UPDATE vps_rotations SET repair_check_required=?,repair_check=NULL WHERE id=?',(int(emergency and not _fixed(r)),rotation))
         db.execute('UPDATE vps_rotations SET standby_ready_at=NULL,standby_ready_server=NULL,preload_refresh_deadline=NULL,preload_base_attempt=NULL,reused_ip=NULL,reused_server_id=NULL,drain_base_attempt=action_attempts WHERE id=?',(rotation,))
         _drain_timing(db,db.execute('SELECT * FROM vps_rotations WHERE id=?',(rotation,)).fetchone(),now,start=True)
@@ -960,8 +960,8 @@ def _run_rotation(connect,cipher,rid,now):
                 _event(db,rid,r['active_server_id'],message,now)
                 r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
         if not _fixed(r) and r['phase']!='active' and (_offline(db,r['active_server_id'],now,r['offline_after_s']) or _failed_ip(db,r['active_server_id'],now)):
-            # A draining standby may reuse its current IP only after a fresh
-            # incident probe. Already issued IP actions must finish first.
+            # Only a current carrier fault permits freshly verified reuse of an
+            # unissued draining standby; a scheduled deadline alone does not.
             target=r['other_server_id'] if r['active_server_id']==r['primary_server_id'] else r['primary_server_id']
             after=r['emergency_probe_after']
             if after is None:
@@ -1034,11 +1034,6 @@ def _run_rotation(connect,cipher,rid,now):
             return
         old=r['drain_server_id']
         if not old:return
-        if r['phase']=='draining' and r['enabled'] and r['next_switch_at']<=now and _draining_fault_takeover(db,r,old,now) and not _failed_ip(db,old,now):
-            db.commit()
-            _dns_switch(connect,cipher,rid,now)
-            r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
-            old=r['drain_server_id']
         if r['phase']=='draining':
             _drain_timing(db,r,now)
             if not _fixed(r) and r['repair_check_required']:
