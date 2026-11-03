@@ -2,6 +2,7 @@
 import aliyun_probe
 import baota_probe
 import detection_recheck
+import incident_history
 import hashlib
 import ipaddress
 import json
@@ -49,7 +50,9 @@ def initialize(connect):
                 'action_after_run':'INTEGER NOT NULL DEFAULT 0',
                 'owner_id':'INTEGER',
             },
+            'detection_incidents':{'evidence':'TEXT'},
             'detection_runs':{
+                'incident_evidence':'TEXT',
                 'scheduled':'INTEGER NOT NULL DEFAULT 0',
                 'action_result':'TEXT',
                 'action_status':'TEXT',
@@ -181,10 +184,20 @@ def record_incident(db,run,plan,rows,now):
     threshold=plan['failure_threshold']
     if not active:
         source=db.execute('SELECT name FROM detection_sources WHERE id=?',(run['source_id'],)).fetchone()
-        db.execute("INSERT INTO detection_incidents(server_id,source_id,source_name,ip,port,nodes,threshold,failures,first_failed,last_failed,state,last_run,details,response_mode) VALUES(?,?,?,?,?,?,?,1,?,?,'suspected',?,?,?)",(run['server_id'],run['source_id'],source['name'],run['ip'],run['port'],run['nodes'],threshold,now,now,run['id'],json.dumps(rows),plan['response_mode']))
+        first=db.execute('SELECT incident_evidence FROM detection_runs WHERE id=?',(run['id'],)).fetchone()
+        first=json.loads(first['incident_evidence']) if first and first['incident_evidence'] else None
+        if first is None:
+            pending=db.execute('SELECT created FROM detection_rechecks WHERE parent_id=?',(run['id'],)).fetchone()
+            if pending:
+                # An upgrade may resume a recheck whose first failure predates snapshots.
+                first={'captured_at':pending['created'],'ip_observed_since':None,'ip_start_censored':True,'ip_age_s':None,'carrier_state':'unknown','bindings':[]}
+        first_at=first['captured_at'] if first else now
+        iid=db.execute("INSERT INTO detection_incidents(server_id,source_id,source_name,ip,port,nodes,threshold,failures,first_failed,last_failed,state,last_run,details,response_mode,confirmed_at) VALUES(?,?,?,?,?,?,?,1,?,?,?,?,?,?,?)",(run['server_id'],run['source_id'],source['name'],run['ip'],run['port'],run['nodes'],threshold,first_at,now,'confirmed' if threshold<=1 else 'suspected',run['id'],json.dumps(rows),plan['response_mode'],now if threshold<=1 else None)).lastrowid
+        incident_history.store(db,iid,run['server_id'],run['ip'],now,first=first)
     else:
         count=active['failures']+1
         db.execute("UPDATE detection_incidents SET failures=?,last_failed=?,last_run=?,details=?,confirmed_at=COALESCE(confirmed_at,?),state=? WHERE id=?",(count,now,run['id'],json.dumps(rows),now if count>=active['threshold'] else None,'confirmed' if active['confirmed_at'] or count>=active['threshold'] else 'suspected',active['id']))
+        if active['evidence']:incident_history.store(db,active['id'],run['server_id'],run['ip'],now)
 
 
 def finish(db,run,status,rows,recheck_confirmed=False):
@@ -201,11 +214,16 @@ def finish(db,run,status,rows,recheck_confirmed=False):
         confirm_node=dict(plan).get('confirm_node')
         scheduled=bool(run['scheduled']) if 'scheduled' in run.keys() else False
         if confirm_node and scheduled and plan['automatic']:
-            if not recheck_confirmed and detection_recheck.enqueue(db,run,plan,rows,now):return
+            if not recheck_confirmed and detection_recheck.enqueue(db,run,plan,rows,now):
+                db.execute('UPDATE detection_runs SET incident_evidence=COALESCE(incident_evidence,?) WHERE id=?',(json.dumps(incident_history.snapshot(db,run['server_id'],run['ip'],now)),run['id']))
+                return
             if recheck_confirmed:
                 plan=dict(plan);plan['failure_threshold']=1;new_evidence=True
         if new_evidence:record_incident(db,run,plan,rows,now)
         if recheck_confirmed:db.execute("UPDATE detection_incidents SET threshold=2,failures=2,first_failed=MIN(first_failed,COALESCE((SELECT created FROM detection_rechecks WHERE parent_id=?),first_failed)),confirmed_at=COALESCE(confirmed_at,?),state='confirmed' WHERE server_id=? AND last_run=? AND closed_at IS NULL",(run['id'],now,run['server_id'],run['id']))
+        if recheck_confirmed:
+            incident=db.execute('SELECT id,evidence FROM detection_incidents WHERE server_id=? AND last_run=? AND closed_at IS NULL',(run['server_id'],run['id'])).fetchone()
+            if incident and incident['evidence']:incident_history.store(db,incident['id'],run['server_id'],run['ip'],now)
         scheduled=bool(run['scheduled']) if 'scheduled' in run.keys() else False
         streak=plan['failure_streak']
         rotation_managed=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vps_rotations'").fetchone() and db.execute('SELECT 1 FROM vps_rotations WHERE (primary_server_id=? OR other_server_id=?)',(run['server_id'],run['server_id'])).fetchone()
@@ -453,12 +471,21 @@ def register(app,connect,cipher,auth,body,error,audit):
     @app.get('/api/detection/incidents')
     @auth(admin=True)
     def detection_incidents():
+        try:
+            sid=int(request.args['server_id']) if request.args.get('server_id') else None
+            before=int(request.args['before']) if request.args.get('before') else None
+            carrier_only=request.args.get('carrier_only','0')
+            if carrier_only not in ('0','1') or (sid is not None and sid<1) or (before is not None and before<1):raise ValueError()
+        except ValueError:return error('故障记录筛选参数无效')
         with connect() as db:
-            items=[dict(r) for r in db.execute("SELECT i.*,s.name AS server_name FROM detection_incidents i JOIN servers s ON s.id=i.server_id WHERE confirmed_at IS NOT NULL ORDER BY i.id DESC LIMIT 500")]
-        for item in items:
-            item['nodes']=json.loads(item['nodes']);item['details']=json.loads(item['details'])
-            item['duration_s']=(item['closed_at'] or int(time.time()))-item['first_failed']
-        return jsonify(incidents=items,notice='记录代表所选检测点连续 TCP 不通，不能单独证明被墙；IP 变化或配置变化不算原 IP 恢复。仅统计上线后的证据，不补造历史。')
+            where='i.confirmed_at IS NOT NULL';params=[]
+            if sid is not None:where+=' AND i.server_id=?';params.append(sid)
+            if carrier_only=='1':where+=" AND (json_extract(i.evidence,'$.first.carrier_state')='serving' OR json_extract(i.evidence,'$.confirmed.carrier_state')='serving')"
+            if before is not None:where+=' AND i.id<?';params.append(before)
+            rows=db.execute('SELECT i.*,s.name AS server_name FROM detection_incidents i JOIN servers s ON s.id=i.server_id WHERE '+where+' ORDER BY i.id DESC LIMIT 501',params).fetchall()
+            servers=[dict(x) for x in db.execute('SELECT s.id,s.name FROM servers s WHERE EXISTS(SELECT 1 FROM ip_monitors m WHERE m.server_id=s.id) OR EXISTS(SELECT 1 FROM detection_incidents i WHERE i.server_id=s.id) ORDER BY s.id')]
+            items=[incident_history.serialize(r,int(time.time())) for r in rows[:500]]
+        return jsonify(incidents=items,servers=servers,has_more=len(rows)>500,next_cursor=items[-1]['id'] if len(rows)>500 else None,notice='承载按当时面板确认的 DNS 判断，不代表全部客户连接；IP 周期按观察时间统计，起点未知会标注下限。连续 TCP 不通不能单独证明被墙。旧事件没有现场快照时保持未知，不事后推断。')
 
     @app.get('/api/detection/monitor-status')
     @auth(admin=True)

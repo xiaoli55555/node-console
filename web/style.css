@@ -621,3 +621,8 @@ dialog:has(.client-dns-panel){width:680px;max-height:88vh;overflow:auto;scroll-b
 .rotation-workspace .rotation-timing{padding:16px;border-radius:12px;background:color-mix(in srgb,currentColor 5%,transparent);font-variant-numeric:tabular-nums}
 .rotation-workspace>form,.rotation-workspace>h2{margin-top:22px}
 @media(max-width:900px){.rotation-detail-grid,.rotation-plan-grid{grid-template-columns:1fr}}
+
+.incident-badge{display:inline-block;padding:6px 10px;border-radius:8px;background:#edf0f6;color:#4d5d73;font-size:12px}
+.incident-badge.incident-serving{background:#ffeded;color:#a52121;border:1px solid #e7a0a0;font-weight:700}
+.incident-vps-group{margin-top:20px}.incident-event{padding:18px 0;max-width:none;border-bottom:1px solid #ccd3df}
+.incident-event p{overflow-wrap:anywhere}.incident-event h4{font-size:15px;overflow-wrap:anywhere}
