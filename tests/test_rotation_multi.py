@@ -124,6 +124,24 @@ class MultiPlan(unittest.TestCase):
             self.assertEqual(r['active_server_id'],self.sid('B'))
             self.assertEqual(r['external_dns_pending'],0)
 
+    def test_stale_split_probe_is_persisted_and_recovery_does_not_wait_five_minutes(self):
+        root,peer=self.split_legacy_group()
+        with server.connect() as db:
+            db.execute('UPDATE detection_runs SET created=?,updated=? WHERE server_id=?',(self.clock[0]-120,self.clock[0]-120,self.sid('B')))
+            db.execute('UPDATE detection_plans SET next_at=? WHERE server_id=?',(self.clock[0]+300,self.sid('B')))
+        with self.assertRaisesRegex(IntegrationError,'结果过期'):
+            rotation._sync_external_dns(server.connect,server.CIPHER,peer,self.clock[0])
+        with server.connect() as db:
+            self.assertLessEqual(db.execute('SELECT next_at FROM detection_plans WHERE server_id=?',(self.sid('B'),)).fetchone()[0],self.clock[0])
+            self.assertEqual(db.execute('SELECT external_dns_pending FROM vps_rotations WHERE id=?',(peer,)).fetchone()[0],1)
+        self.advance(15,('A','B','C'))
+        self.assertTrue(rotation._sync_external_dns(server.connect,server.CIPHER,peer,self.clock[0]))
+        self.assertEqual(self.value('telecom'),'1.1.1.1')
+        with server.connect() as db:
+            r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(peer,)).fetchone()
+            self.assertEqual(r['active_server_id'],self.sid('B'))
+            self.assertEqual(r['external_dns_pending'],0)
+
     def test_group_waits_for_later_member_deadline_then_switches_all_routes(self):
         r=self.multi()
         with server.connect() as db:
