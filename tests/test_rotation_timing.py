@@ -70,7 +70,8 @@ class CarrierTiming(unittest.TestCase):
         self.assertEqual(f.row()['interval_s'],10800);self.assertEqual(f.row()['lead_s'],660)
         f.advance(deadline-f.clock[0],online=('A','B'));f.tick()
         self.assertEqual(f.row()['active_server_id'],f.sid('B'))
-        self.assertEqual(f.row()['next_switch_at'],f.clock[0]+10800-660)
+        # Preparation lead time must not subtract from the IP's allowance.
+        self.assertEqual(f.row()['next_switch_at'],f.clock[0]+10800)
 
     def test_saving_overdue_plan_does_not_postpone_handoff(self):
         f=self.f

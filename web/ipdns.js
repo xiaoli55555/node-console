@@ -175,13 +175,14 @@ function rotationElapsed(seconds){const n=Math.max(0,Math.floor(Number(seconds)|
 function rotationTimingMarkup(r){
  const t=r.timing;if(!t)return '';const now=rotationClock(r),current=t.current;
  const load=current?`${current.censored?'至少已观察承载':'已承载'} ${rotationElapsed(now-current.started)}；${current.censored?'开始观察':'本轮开始'}：${esc(new Date(current.started*1000).toLocaleString())}`:'承载起点尚未记录，等待后台首次观察';
+ const budget=t.allowance?`<br>当前 IP 累计承载：${rotationElapsed(t.allowance.used_s+Math.max(0,now-t.server_now))} / ${rotationElapsed(t.allowance.limit_s)}（故障接替不受额度限制）`:'';
  const overdue=t.switch_deadline==null?(r.enabled?'当前承载机无固定切换截止':'定时已暂停，承载计时继续'):now>t.switch_deadline?'已超过切换时间 '+rotationElapsed(now-t.switch_deadline):'距计划切换还有 '+rotationElapsed(t.switch_deadline-now);
  const drain=t.drain_timeout_at==null?'':`<br>排空强制回收：${esc(new Date(t.drain_timeout_at*1000).toLocaleString())}；${now>=t.drain_timeout_at?'已超时 '+rotationElapsed(now-t.drain_timeout_at):'剩余 '+rotationElapsed(t.drain_timeout_at-now)}；仍须连续两次 TCP &lt; ${esc(t.force_threshold)} 并通过其他保护`;
  const action=t.action_observe_until==null?'':`<br>换 IP 观察窗口：${now>=t.action_observe_until?'已超出 '+rotationElapsed(now-t.action_observe_until)+'，等待任务及 IP 确认':'剩余 '+rotationElapsed(t.action_observe_until-now)}`;
- return `<div class="rotation-timing"><strong>承载与超时计时 · DNS #${esc(r.binding_id)}</strong><p>${r.dns_intent?'DNS 写入结果待核对；以下为上次确认的承载记录。<br>':''}${esc(current?.server_name||r.active_name||'当前承载机')}：${load}<br>${overdue}${drain}${action}</p><small>按本条 DNS 记录的确认／识别时间统计，不代表所有客户连接已迁移；强制回收默认从切离满 1 小时起算。</small></div>`;
+ return `<div class="rotation-timing"><strong>承载与超时计时 · DNS #${esc(r.binding_id)}</strong><p>${r.dns_intent?'DNS 写入结果待核对；以下为上次确认的承载记录。<br>':''}${esc(current?.server_name||r.active_name||'当前承载机')}：${load}<br>${overdue}${budget}${drain}${action}</p><small>按本条 DNS 记录的确认／识别时间统计，不代表所有客户连接已迁移；强制回收默认从切离满 1 小时起算。</small></div>`;
 }
 function rotationCarrierHistory(r){
- const rows=r.timing?.history||[],labels={plan_created:'创建计划',first_observed:'升级后首次观察（原起点未知）',scheduled_switch:'定时切换',fault_switch:'故障切换',dns_reconciled:'DNS 回读确认',manual_dns_observed:'识别手动解析',carrier_ip_observed:'确认承载机新 IP',failover_takeover:'故障转移接管',failover_restore:'故障转移切回'};
+ const rows=r.timing?.history||[],labels={plan_created:'创建计划',first_observed:'升级后首次观察（原起点未知）',scheduled_switch:'定时切换',fault_switch:'故障切换',fault_restore:'故障恢复切回',dns_reconciled:'DNS 回读确认',manual_dns_observed:'识别手动解析',carrier_ip_observed:'确认承载机新 IP',failover_takeover:'故障转移接管',failover_restore:'故障转移切回'};
  return `<h4>承载时间记录</h4>${rows.map(x=>`<div class="audit-row"><strong>${esc(x.server_name||'VPS #'+x.server_id)}</strong> · ${esc(x.ip)}<br>${esc(new Date(x.started*1000).toLocaleString())} → ${x.finished==null?'承载中':esc(new Date(x.finished*1000).toLocaleString())}<br>${x.censored?'至少观察到':'实际记录'}承载 ${rotationElapsed(x.finished==null?rotationClock(r)-x.started:x.elapsed_s)}${x.finished!=null&&x.deadline!=null?' · 切换超时 '+rotationElapsed(x.overdue_s):''}<small>${esc(labels[x.reason]||x.reason)}${x.end_reason?' · 结束：'+esc(labels[x.end_reason]||x.end_reason):''}</small></div>`).join('')||'<p>暂无记录；升级前的承载起点不会推算补齐。</p>'}`;
 }
 function drainEffectiveMarkup(r){

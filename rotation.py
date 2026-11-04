@@ -913,6 +913,12 @@ def _dns_switch_single(connect,cipher,rotation,now,emergency=False,offline=False
         else:old_ip,port,_=_fresh_ip(db,r['active_server_id'],now,cipher)
         target_ip,target_port,_=_fresh_ip(db,target,now,cipher)
         if target_port!=port or target_ip==old_ip:raise IntegrationError('备用 VPS 端口或公网 IP 无效')
+        if not emergency and not _fixed(r) and rotation_timing.ip_usage(db,rotation,target,target_ip,now)>=r['interval_s']:
+            # Credit is a scheduling gate only. Never apply this to emergency
+            # handoff; an exhausted healthy IP is preferable to an outage.
+            for member in rotation_groups.members(db,r):
+                db.execute("UPDATE vps_rotations SET phase='draining',drain_server_id=?,old_ip=?,drain_started=?,drain_grace_s=0,low_samples=0,last_sample_at=NULL,emergency=0,repair_check_required=0,fault_recovery=0,status=?,updated=? WHERE id=?",(target,target_ip,now,'备用 IP 承载额度已用完，保持当前承载并排空换 IP 后复检',now,member['id']))
+            return
         last=db.execute('SELECT updated FROM detection_runs WHERE server_id=? ORDER BY id DESC LIMIT 1',(target,)).fetchone()
         if not last or now-last['updated']>90:raise IntegrationError('备用机探测结果超过 90 秒，等待切换前的新探测')
         reason=boce_dns_gate(db,target,target_ip,port,require_plan=True)
@@ -956,7 +962,8 @@ def _finish_dns_switch(db,r,binding,rotation,target,old_ip,target_ip,ttl,submitt
     if reuse_draining:
         _drain_timing(db,r,now,'skipped')
         _event(db,rotation,target,'故障应急接替：备用机现有 IP 已通过本次复检，跳过换 IP 接替；正常定时轮换仍须排空、换 IP 和复检',now)
-    rotation_timing.change(db,rotation,target,target_ip,int(time.time()),'fault_switch' if emergency else 'scheduled_switch')
+    restoring=not emergency and not _fixed(r) and r['status'].startswith('原机复测正常，保留原 IP 并立即切回')
+    rotation_timing.change(db,rotation,target,target_ip,int(time.time()),'fault_switch' if emergency else 'fault_restore' if restoring else 'scheduled_switch')
     message=f"DNS 已从 {old_ip} 切换到 {target_ip}；等待旧 VPS #{r['active_server_id']} 连接降到阈值以下"
     if offline:message=f'承载 VPS 离线，DNS 已从 {old_ip} 切到 {target_ip}；旧机等待恢复，未执行换 IP'
     if immediate_repair:message=f'DNS 已从 {old_ip} 切换到 {target_ip}；先复测原承载机，确认故障后跳过 TTL 与连接排空换 IP；通过后立即切回'
@@ -983,6 +990,16 @@ def _finish_dns_switch(db,r,binding,rotation,target,old_ip,target_ip,ttl,submitt
     db.execute('UPDATE vps_rotations SET standby_ready_at=NULL,standby_ready_server=NULL,preload_refresh_deadline=NULL,preload_base_attempt=NULL,reused_ip=NULL,reused_server_id=NULL,drain_base_attempt=action_attempts WHERE id=?',(rotation,))
     _drain_timing(db,db.execute('SELECT * FROM vps_rotations WHERE id=?',(rotation,)).fetchone(),now,start=True)
     _event(db,rotation,r['active_server_id'],message,now)
+    _sync_ip_allowance(db,rotation,int(time.time()))
+
+
+def _sync_ip_allowance(db,rid,now,shorten_only=False):
+    r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
+    if not r or r['dns_intent']:return
+    budget=rotation_timing.allowance(db,r,now)
+    if budget:
+        deadline=min(r['next_switch_at'],budget['deadline']) if shorten_only else budget['deadline']
+        db.execute('UPDATE vps_rotations SET next_switch_at=? WHERE id=?',(deadline,rid))
 
 def _reconcile_group_switch(connect,cipher,rid,now):
     """Recover partial writes before failover, scheduling, or IP actions run."""
@@ -1029,6 +1046,7 @@ def _reconcile_group_switch(connect,cipher,rid,now):
         for item,r,binding,conn,record,actual in prepared:
             _finish_dns_switch(db,r,binding,now=now,**item)
             db.execute('UPDATE vps_rotations SET dns_intent=NULL WHERE id=?',(r['id'],))
+            _sync_ip_allowance(db,r['id'],int(time.time()))
     return True
 
 
@@ -1078,6 +1096,8 @@ def _run_rotation(connect,cipher,rid,now):
         r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
         if not r or (not r['enabled'] and not r['fault_recovery']):return
         r,drain_effective=rotation_schedule.sync(db,r,now)
+        _sync_ip_allowance(db,rid,now,shorten_only=True)
+        r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
         db.commit() # Release schedule sampling changes before a separate DNS handoff connection.
         # A recovered carrier ends this fault attempt. A later fault must request
         # another standby round, rather than reuse the previous incident's marker.
@@ -1177,12 +1197,32 @@ def _run_rotation(connect,cipher,rid,now):
                 if verdict is None:
                     db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('备用机已接替，等待原承载机本次业务复测；未确认故障，不更换 IP',now,rid));return
                 if verdict is False:
+                    used=rotation_timing.ip_usage(db,rid,old,r['old_ip'],now)
+                    if used>=r['interval_s']:
+                        # Healthy but exhausted: retain the healthy substitute
+                        # and prepare a new IP instead of bouncing back and out.
+                        binding=db.execute('SELECT * FROM dns_bindings WHERE id=?',(r['binding_id'],)).fetchone()
+                        conn=load_connection(db,cipher,binding['connection_id'])
+                        record=get_dns_record(conn,binding)
+                        validate_dns_record(record,binding,conn)
+                        try:ttl=int(record.get('ttl',record.get('TTL',300)))
+                        except (TypeError,ValueError):ttl=300
+                        ttl=300 if ttl<=1 else ttl
+                        if ttl>604800:raise IntegrationError('DNS TTL 超过 7 天，已停止轮换')
+                        db.execute('UPDATE vps_rotations SET repair_check_required=0,repair_check=NULL,fault_recovery=0,emergency=0,low_samples=0,last_sample_at=NULL,drain_grace_s=? WHERE id=?',(ttl+60,rid))
+                        _event(db,rid,old,'原机复测正常，但原 IP 累计承载额度已用完；保持接替机承载，原机继续排空换 IP',now)
+                        return
                     ready=dict(r,phase='active',drain_server_id=None)
                     try:_fixed_ready(db,cipher,ready,old,now,verified_candidate=r['old_ip'])
                     except IntegrationError as e:
                         db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('原机业务复测正常，保留原 IP；等待可安全切回：'+str(e),now,rid));return
                     _drain_timing(db,r,now,'cancelled')
-                    db.execute("UPDATE vps_rotations SET phase='active',drain_server_id=NULL,repair_check_required=0,repair_check=NULL,fault_recovery=0,emergency=0,next_switch_at=?,status=?,updated=? WHERE id=?",(now,'原机复测正常，保留原 IP 并立即切回',now,rid))
+                    # Prepare every healthy member for the same recovery handoff.
+                    # The group switch still performs all health and DNS gates.
+                    for member in rotation_groups.members(db,r):
+                        if member['drain_server_id']!=old or member['action_started'] is not None:return
+                    for member in rotation_groups.members(db,r):
+                        db.execute("UPDATE vps_rotations SET phase='active',drain_server_id=NULL,repair_check_required=0,repair_check=NULL,fault_recovery=0,emergency=0,next_switch_at=?,status=?,updated=? WHERE id=?",(now,'原机复测正常，保留原 IP 并立即切回；沿用该 IP 剩余承载额度',now,member['id']))
                     db.commit();_dns_switch(connect,cipher,rid,now);return
                 db.execute('UPDATE vps_rotations SET emergency=1,low_samples=2,drain_grace_s=0 WHERE id=?',(rid,))
                 r=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
@@ -1455,6 +1495,7 @@ def _sync_external_dns(connect,cipher,rid,now,force=False):
             _event(db,rid,target,f'历史分叉线路已核对并跟随计划 #{root["id"]} 的统一承载目标；保留计划截止时间，重新等待本线路 TTL 与连接排空',now)
         elif not lease and binding['expected_ip']!=target_ip:
             rotation_timing.change(db,rid,target,target_ip,now,'carrier_ip_observed')
+            _sync_ip_allowance(db,rid,now)
         if realign:
             db.execute('UPDATE vps_rotations SET next_switch_at=? WHERE id=?',(root['next_switch_at'],rid))
         db.execute('UPDATE vps_rotations SET external_dns_pending=0 WHERE id=?',(rid,))
