@@ -43,6 +43,7 @@ def initialize(connect):
                 'action_connection_id':'INTEGER REFERENCES ip_connections(id)',
                 'failure_threshold':'INTEGER NOT NULL DEFAULT 3',
                 'confirm_node':'TEXT',
+                'confirm_source_id':'INTEGER REFERENCES detection_sources(id)',
                 'failure_streak':'INTEGER NOT NULL DEFAULT 0',
                 'failure_ip':'TEXT',
                 'failure_port':'INTEGER',
@@ -693,7 +694,7 @@ def register(app,connect,cipher,auth,body,error,audit):
     def client_save_probe_config(sid):
         if g.user['role']!='client':return error('此功能仅供客户账号使用',403)
         d=body();ids=d.get('nodes');source_id=d.get('source_id');interval=d.get('interval_s',600);limit=d.get('daily_limit',1000);automatic=d.get('automatic')
-        if type(source_id)is not int or not isinstance(ids,list) or not 1<=len(ids)<=20 or any(not str(x).isdigit() for x in ids) or type(interval)is not int or not 120<=interval<=86400 or type(limit)is not int or not 1<=limit<=100000 or type(automatic)is not bool:return error('请检查探测来源、节点、间隔、每日额度和定时开关')
+        if type(source_id)is not int or not isinstance(ids,list) or not 1<=len(ids)<=20 or any(not str(x).isdigit() for x in ids) or type(interval)is not int or not 60<=interval<=86400 or type(limit)is not int or not 1<=limit<=100000 or type(automatic)is not bool:return error('请检查探测来源、节点、间隔、每日额度和定时开关')
         ids=sorted(set(map(str,ids)))
         if not ids:return error('请至少选择一个探测节点')
         with connect() as db:
@@ -738,7 +739,7 @@ def register(app,connect,cipher,auth,body,error,audit):
     @auth(admin=True)
     def detection_delete_source(sid):
         with connect() as db:
-            if db.execute('SELECT 1 FROM detection_plans WHERE source_id=?',(sid,)).fetchone() or db.execute("SELECT 1 FROM detection_runs WHERE source_id=? AND status IN ('pending','queued','issued','creating')",(sid,)).fetchone():return error('来源仍被使用，请先更换或移除检测计划')
+            if db.execute('SELECT 1 FROM detection_plans WHERE source_id=? OR confirm_source_id=?',(sid,sid)).fetchone() or db.execute("SELECT 1 FROM detection_runs WHERE source_id=? AND status IN ('pending','queued','issued','creating')",(sid,)).fetchone():return error('来源仍被使用，请先更换或移除检测计划')
             db.execute('DELETE FROM detection_runs WHERE source_id=?',(sid,));db.execute('DELETE FROM detection_sources WHERE id=?',(sid,));audit(db,'删除检测来源 #'+str(sid))
         return jsonify(ok=True)
 
@@ -771,7 +772,7 @@ def register(app,connect,cipher,auth,body,error,audit):
     @auth(admin=True)
     def detection_save_plan(sid):
         d=body();ids=d.get('nodes',[]);interval=d.get('interval_s',600);limit=d.get('daily_limit',1000);automatic=d.get('automatic',False);response_mode=d.get('response_mode','none');action_connection_id=d.get('action_connection_id') or None;failure_threshold=d.get('failure_threshold',3)
-        if not isinstance(ids,list) or len(ids)>20 or any(not isinstance(x,(str,int)) or not str(x) or len(str(x))>40 for x in ids) or type(interval)is not int or not 120<=interval<=86400 or type(limit)is not int or not 1<=limit<=100000 or type(automatic)is not bool or response_mode not in ('none','reboot','change_api') or type(failure_threshold)is not int or not 2<=failure_threshold<=5:return error('检测节点、频率、上限或自动处理策略无效')
+        if not isinstance(ids,list) or len(ids)>20 or any(not isinstance(x,(str,int)) or not str(x) or len(str(x))>40 for x in ids) or type(interval)is not int or not 60<=interval<=86400 or type(limit)is not int or not 1<=limit<=100000 or type(automatic)is not bool or response_mode not in ('none','reboot','change_api') or type(failure_threshold)is not int or not 2<=failure_threshold<=5:return error('检测节点、频率、上限或自动处理策略无效')
         port=d.get('port')
         if port is not None and (type(port)is not int or not 1<=port<=65535):return error('业务 TCP 端口必须为 1–65535 的整数')
         if response_mode!='none' and not automatic:return error('自动处理必须同时开启定时检测')
@@ -792,19 +793,27 @@ def register(app,connect,cipher,auth,body,error,audit):
                     for node in ids:aliyun_probe.node_parts(node)
                 except IntegrationError as e:return error(str(e))
                 if response_mode!='none':return error('阿里云来源当前仅记录检测结果；完成真实账号联调后再启用自动处理')
-            old_plan=db.execute('SELECT source_id,confirm_node FROM detection_plans WHERE server_id=?',(sid,)).fetchone()
-            confirm=d.get('confirm_node',old_plan['confirm_node'] if old_plan and old_plan['source_id']==s['id'] else None)
-            if confirm in ('',None):confirm=None
+            old_plan=db.execute('SELECT source_id,confirm_node,confirm_source_id FROM detection_plans WHERE server_id=?',(sid,)).fetchone()
+            same=old_plan and old_plan['source_id']==s['id']
+            confirm=d.get('confirm_node',old_plan['confirm_node'] if same else None)
+            confirm_source=d.get('confirm_source_id',old_plan['confirm_source_id'] if same else None)
+            if confirm_source is not None and (type(confirm_source)is not int or confirm_source<1):return error('请选择有效的复检来源')
+            if confirm in ('',None):confirm=None;confirm_source=None
             elif type(confirm) not in (str,int):return error('请选择一个独立复测点')
             else:confirm=str(confirm)
             if confirm:
                 if len(confirm)>40:return error('复测节点 ID 过长')
-                if s['kind'] not in ('boce','baota','aliyun'):return error('此来源不支持独立复测点')
-                if confirm in set(map(str,ids)):return error('复测点必须与首轮检测点不同')
-                if s['kind'] in ('boce','baota') and not confirm.isdigit():return error('复测节点 ID 必须为数字')
-                if s['kind']=='aliyun':
+                cs=db.execute('SELECT * FROM detection_sources WHERE id=?',(confirm_source or s['id'],)).fetchone()
+                if not cs or not cs['enabled'] or cs['owner_id'] is not None:return error('请选择已启用的管理员复检来源')
+                if cs['kind'] not in ('self','boce','baota','aliyun'):return error('此来源不支持独立复测点')
+                if cs['id']==s['id'] and (confirm in set(map(str,ids)) or cs['kind']=='self'):return error('复测点必须与首轮检测点不同')
+                if cs['kind'] in ('boce','baota') and not confirm.isdigit():return error('复测节点 ID 必须为数字')
+                if cs['kind']=='self' and confirm!='self':return error('自建复检节点必须为 self')
+                if cs['kind']=='aliyun':
                     try:aliyun_probe.node_parts(confirm)
                     except IntegrationError as e:return error(str(e))
+                    if response_mode!='none':return error('阿里云复检来源当前仅记录结果，不支持自动处理')
+                confirm_source=cs['id'] if cs['id']!=s['id'] else None
             ids=sorted(set(map(str,ids))) if s['kind'] in ('boce','aliyun','baota') else ['self']
             if not ids:return error('请填写至少一个节点 ID')
             db.execute('INSERT OR IGNORE INTO ip_monitors(server_id,port) VALUES(?,?)',(sid,port or 443))
@@ -812,7 +821,7 @@ def register(app,connect,cipher,auth,body,error,audit):
             existing=db.execute('SELECT next_at FROM detection_plans WHERE server_id=?',(sid,)).fetchone()
             db.execute("UPDATE detection_runs SET action_status='cancelled',action_result='检测配置已更新，未发送换 IP 请求' WHERE server_id=? AND action_status IN ('queued','issued','submitted','uncertain','verifying')",(sid,))
             db.execute('INSERT INTO detection_plans(server_id,source_id,nodes,interval_s,automatic,daily_limit,next_at,response_mode,action_connection_id,failure_threshold,failure_streak,failure_ip,failure_port,last_action,owner_id) VALUES(?,?,?,?,?,?,?,?,?,?,0,NULL,NULL,NULL,NULL) ON CONFLICT(server_id) DO UPDATE SET source_id=excluded.source_id,nodes=excluded.nodes,interval_s=excluded.interval_s,automatic=excluded.automatic,daily_limit=excluded.daily_limit,response_mode=excluded.response_mode,action_connection_id=excluded.action_connection_id,failure_threshold=excluded.failure_threshold,failure_streak=0,failure_ip=NULL,failure_port=NULL,owner_id=NULL,status=\'等待新配置检测\',checked=NULL',(sid,s['id'],json.dumps(ids),interval,int(automatic),limit,existing['next_at'] if existing else 0,response_mode,action_connection_id,failure_threshold))
-            db.execute('UPDATE detection_plans SET confirm_node=? WHERE server_id=?',(confirm,sid))
+            db.execute('UPDATE detection_plans SET confirm_node=?,confirm_source_id=? WHERE server_id=?',(confirm,confirm_source,sid))
             db.execute("UPDATE detection_rechecks SET state='cancelled',message='检测配置已更新，取消旧复测' WHERE parent_id IN (SELECT id FROM detection_runs WHERE server_id=?) AND state IN ('queued','creating','pending')",(sid,))
             # Old source jobs can finish for history, but must not change the new plan status.
             audit(db,'配置 VPS 检测点 #'+str(sid))
@@ -849,13 +858,17 @@ def register(app,connect,cipher,auth,body,error,audit):
         now=int(time.time())
         with connect() as db:
             db.execute('BEGIN IMMEDIATE')
+            cross=detection_recheck.claim_self(db,s,cipher,now)
+            if cross:
+                db.execute('UPDATE detection_sources SET last_seen=? WHERE id=?',(now,s['id']))
+                return jsonify(job=cross)
             db.execute('UPDATE detection_sources SET last_seen=? WHERE id=?',(now,s['id']))
             r=db.execute("SELECT r.* FROM detection_runs r JOIN detection_plans p ON p.server_id=r.server_id JOIN ip_monitors m ON m.server_id=r.server_id WHERE r.source_id=? AND p.source_id=r.source_id AND m.enabled=1 AND r.status='queued' AND r.created>? ORDER BY r.id LIMIT 1",(s['id'],now-120)).fetchone()
             if not r:return jsonify(job=None)
             db.execute("UPDATE detection_runs SET status='issued',updated=? WHERE id=?",(now,r['id']))
         return jsonify(job={'id':r['id'],'ip':r['ip'],'port':r['port']})
 
-    @app.post('/api/probe/results/<int:rid>')
+    @app.post('/api/probe/results/<int(signed=True):rid>')
     def detection_probe_result(rid):
         s=probe_source()
         if not s:return error('探针认证失败',401)
@@ -863,6 +876,9 @@ def register(app,connect,cipher,auth,body,error,audit):
         if type(reachable)is not bool or (latency is not None and (type(latency) not in (int,float) or not math.isfinite(latency) or not 0<=latency<=60000)):return error('结果格式无效')
         with connect() as db:
             db.execute('BEGIN IMMEDIATE')
+            if rid<0:
+                ok=detection_recheck.finish_self(db,s,cipher,-rid,d,int(time.time()))
+                return jsonify(ok=True) if ok else error('复检任务不存在、过期或目标不匹配',409)
             r=db.execute("SELECT * FROM detection_runs WHERE id=? AND source_id=? AND status='issued' AND created>?",(rid,s['id'],int(time.time())-120)).fetchone()
             if not r:return error('任务不存在、已完成或过期',409)
             # Bind result to the exact issued target.
