@@ -859,6 +859,9 @@ initialize_insights(connect)
 register_insights(app,connect,auth,body,error,audit)
 from hkt_dhcp import register as register_hkt_dhcp
 register_hkt_dhcp(app,connect,CIPHER,auth,body,error,audit)
+from monitor_api import initialize as initialize_monitor, register as register_monitor
+initialize_monitor(connect)
+register_monitor(app,connect,auth,body,error,audit)
 if __name__=='__main__':
     import argparse, getpass
     parser=argparse.ArgumentParser();parser.add_argument('command',choices=['admin','backup','entry']);parser.add_argument('target',nargs='?');args=parser.parse_args()
