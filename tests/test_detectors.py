@@ -45,6 +45,24 @@ class DetectorTest(unittest.TestCase):
   if kwargs.get('response_mode','none')!='none':
    with self.connect() as db:db.execute('UPDATE detection_sources SET verified_at=? WHERE id=?',(int(time.time()),source))
   r=self.post('/plans/1',{'source_id':source,'nodes':['1','2'],'interval_s':600,'daily_limit':1000,**kwargs});self.assertEqual(r.status_code,200,r.json)
+ def test_self_nodes_are_named_and_fresh_without_external_api(self):
+  source=self.source('self')['id']
+  with patch('detectors.boce') as external:
+   offline=self.post('/sources/'+str(source)+'/nodes')
+   self.assertEqual(offline.status_code,200)
+   self.assertEqual(offline.json['nodes'][0]['id'],'self')
+   self.assertFalse(offline.json['nodes'][0]['online'])
+   with self.connect() as db:db.execute('UPDATE detection_sources SET last_seen=? WHERE id=?',(int(time.time()),source))
+   online=self.post('/sources/'+str(source)+'/nodes')
+   self.assertTrue(online.json['nodes'][0]['online'])
+   self.assertEqual(online.json['nodes'][0]['name'],'test')
+   self.assertNotIn('secret',online.get_data(as_text=True))
+   with self.connect() as db:db.execute('UPDATE detection_sources SET last_seen=? WHERE id=?',(int(time.time())-36,source))
+   self.assertFalse(self.post('/sources/'+str(source)+'/nodes').json['nodes'][0]['online'])
+   external.assert_not_called()
+  self.plan(source,nodes=['self'])
+  with self.connect() as db:self.assertEqual(json.loads(db.execute('SELECT nodes FROM detection_plans').fetchone()[0]),['self'])
+
  def test_save_probe_without_monitor_or_dns(self):
   source=self.source()['id']
   with self.connect() as db:db.execute('DELETE FROM ip_monitors WHERE server_id=1')

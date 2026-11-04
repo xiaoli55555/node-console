@@ -75,6 +75,10 @@ _source_nodes_locks={}
 _source_nodes_guard=threading.Lock()
 
 def source_nodes(source,cipher):
+    if source['kind']=='self':
+        seen=source['last_seen']
+        online=bool(source['enabled'] and seen and int(time.time())-int(seen)<=35)
+        return [{'id':'self','name':source['name'],'isp':'自建探针','online':online,'last_seen':seen}],False
     secret=source_secret(source,cipher)
     key=(source['id'],source['kind'],hashlib.sha256(secret.encode()).hexdigest())
     with _source_nodes_guard:lock=_source_nodes_locks.setdefault(source['id'],threading.Lock())
@@ -576,7 +580,7 @@ def register(app,connect,cipher,auth,body,error,audit):
     def detection_nodes(sid):
         try:
             with connect() as db:s=db.execute('SELECT * FROM detection_sources WHERE id=?',(sid,)).fetchone()
-            if not s or not s['enabled']:raise IntegrationError('请选择已启用的 BOCE、宝塔或阿里云来源')
+            if not s or not s['enabled']:raise IntegrationError('请选择已启用的检测来源')
             rows,cached=source_nodes(s,cipher)
             return jsonify(nodes=rows,cached=cached)
         except IntegrationError as e:return error(str(e))
