@@ -26,6 +26,15 @@ class ProbeGroups(unittest.TestCase):
   return detectors.start_run(self.connect,self.cipher,1,scheduled=True)
  def configure(self,source,children,**options):
   self.plan(source['id'],nodes=children,automatic=True,response_mode='reboot',failure_threshold=2,**options)
+ def test_lost_claim_response_is_redelivered_only_to_same_node(self):
+  source=self.source('self');child=self.child(source);self.configure(source,['self',child['node_id']])
+  rid=self.start();job=self.probe(child,'jobs').json['job']
+  self.assertIsNone(self.probe(child,'jobs').json['job'])
+  with self.connect() as db:db.execute('UPDATE self_probe_tasks SET claimed_at=? WHERE parent_id=? AND node_id=?',(int(time.time())-31,rid,child['node_id']))
+  again=self.probe(child,'jobs').json['job'];self.assertEqual(job,again)
+  self.assertEqual(self.result(child,again,True).status_code,200)
+  self.assertIsNone(self.probe(child,'jobs').json['job'])
+  self.assertEqual(self.commands(),0)
  def test_group_lists_independent_nodes_and_credentials_do_not_leak(self):
   source=self.source('self');child=self.child(source)
   self.assertNotEqual(source['probe_token'],child['probe_token'])

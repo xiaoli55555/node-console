@@ -20,6 +20,7 @@ Wants=network-online.target
 Restart=always
 RestartSec=10
 DynamicUser=yes
+StateDirectory=hksdan-probe
 LoadCredential=probe-config:/etc/hksdan-probe.json
 ExecStart=/usr/bin/python3 /opt/hksdan-probe/probe.py %d/probe-config
 NoNewPrivileges=yes
@@ -74,3 +75,21 @@ HTTP 响应表明 HTTPS 通道已建立（不代表密钥正确）；连接超�
 在 VPS 检测配置选择这个来源，即可勾选广州、上海等多个节点；“获取国内节点”刷新每个节点的在线状态。所有所选节点每轮各领取同一目标 IP 和端口的独立任务，全部明确不通才按原连续失败阈值处理。某节点可达、离线、缺失、超时或上报失败都不确认故障。新 IP 自动解析等待全部所选节点通过。
 
 同组的未选节点也可作为独立复检点，不能选与首轮重复的节点。各节点可独立暂停；变更配置会取消旧在途轮次，正在被计划选择的节点不能直接删除。客户个人 BOCE 来源与管理员自建组隔离。
+
+## 网络抖动与重启恢复
+
+新版探针默认最多并发执行 4 个 TCP 任务，可用 `max_workers` 设置 1–8。结果先原子保存到 systemd 的 StateDirectory，再上报；上报失败会重试，重启后恢复尚未过期的结果。任务领取后 30 秒仍未完成允许同一节点重新领取，整体有效期仍为 120 秒，不会延长旧证据有效期。配置或目标变化仍拒绝旧结果。网络异常和过期结果不算目标不通。
+
+升级旧服务时，必须增加持久目录（只更新面板不会更新远端探针）：
+
+```bash
+mkdir -p /etc/systemd/system/hksdan-probe.service.d
+printf '[Service]\nStateDirectory=hksdan-probe\n' > /etc/systemd/system/hksdan-probe.service.d/state.conf
+systemctl daemon-reload
+# 将新版 probe.py 下载替换到 /opt/hksdan-probe/probe.py 后重启
+systemctl restart hksdan-probe
+```
+
+不要用 POST /api/probe/jobs 做连通性诊断：它会领取真实任务。只检查 HTTPS 时使用首页 GET。
+
+也可在探针服务器以 root 下载并执行仓库的 `probe/update.sh`。脚本先下载并检查语法，再备份旧程序、添加持久目录配置并重启；不会修改已有密钥。升级后可用 `journalctl -u hksdan-probe --since "5 minutes ago" --no-pager` 查看运行情况。

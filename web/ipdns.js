@@ -117,7 +117,7 @@ async function quickIPSetup(){
 function probeGroupMarkup(group){
  if(!group)return '';
  const label=group.pending&&!group.complete?'等待所选节点全部返回':group.complete?'所选节点已返回':'部分节点结果未知，不确认故障';
- return `<section class="probe-group-status"><strong>${esc(group.name)}：${esc(label)}</strong>${group.nodes.map(n=>`<p>${esc(n.name)} · ${esc(n.id)}：${n.result?esc(({reachable:'可达',unreachable:'不通',unknown:'未知'})[n.result.state]||'未知'):['queued','issued'].includes(n.state)?'检测中':'未知'}${n.result?.state==='reachable'&&Number.isFinite(n.result.latency_ms)?' · '+esc(n.result.latency_ms)+' ms':''}</p>`).join('')}<small>所选节点全部明确不通才进入故障处理；离线、缺失和超时不算不通。</small></section>`;
+ return `<section class="probe-group-status"><strong>${esc(group.name)}：${esc(label)}</strong>${group.nodes.map(n=>`<p>${esc(n.name)} · ${esc(n.id)}：${n.result?esc(({reachable:'可达',unreachable:'不通',unknown:'未知'})[n.result.state]||'未知'):n.state==='queued'?'等待领取':n.state==='issued'?'已领取，等待结果':'超时或结果未知'}${n.result?.state==='reachable'&&Number.isFinite(n.result.latency_ms)?' · '+esc(n.result.latency_ms)+' ms':''}</p>`).join('')}<small>所选节点全部明确不通才进入故障处理；离线、缺失和超时不算不通。</small></section>`;
 }
 function referenceProbeMarkup(reference){
  if(!reference)return '';

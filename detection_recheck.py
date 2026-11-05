@@ -353,7 +353,7 @@ def _poll_target(connect,cipher,parent_id,now):
 
 
 def claim_self(db,source,cipher,now):
-    rows=db.execute("SELECT c.* FROM detection_rechecks c JOIN detection_runs r ON r.id=c.parent_id WHERE COALESCE(c.confirm_source_id,r.source_id)=? AND c.node=? AND c.stage IN ('target','self_pair') AND c.state='pending' AND c.remote_id='self:queued' ORDER BY c.parent_id LIMIT 50",(source['id'],source.get('probe_node_id','self'))).fetchall()
+    rows=db.execute("SELECT c.* FROM detection_rechecks c JOIN detection_runs r ON r.id=c.parent_id WHERE COALESCE(c.confirm_source_id,r.source_id)=? AND c.node=? AND c.stage IN ('target','self_pair') AND c.state='pending' AND (c.remote_id='self:queued' OR (c.remote_id='self:issued' AND c.poll_at<=?)) ORDER BY c.parent_id LIMIT 50",(source['id'],source.get('probe_node_id','self'),now)).fetchall()
     for job in rows:
         valid=_valid(db,job,cipher,now)
         if not valid:
@@ -361,7 +361,7 @@ def claim_self(db,source,cipher,now):
         if now-(job['submitted'] or job['created'])>120:
             _stop(db,job,'unknown','自建复检超时，不能确认故障',now);continue
         r,p=valid
-        db.execute("UPDATE detection_rechecks SET remote_id='self:issued' WHERE parent_id=? AND remote_id='self:queued'",(r['id'],))
+        db.execute("UPDATE detection_rechecks SET remote_id='self:issued',poll_at=? WHERE parent_id=?",(now+30,r['id']))
         return {'id':-r['id'],'ip':r['ip'],'port':r['port']}
     return None
 
