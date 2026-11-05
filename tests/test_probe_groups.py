@@ -4,7 +4,7 @@ import unittest
 import test_detectors as fixture
 import detectors
 import detection_recheck as recheck
-import dual_detection as dual
+import probe_groups as groups
 
 class ProbeGroups(unittest.TestCase):
  setUp=fixture.DetectorTest.setUp
@@ -56,7 +56,7 @@ class ProbeGroups(unittest.TestCase):
    self.result(source,a,a_value);self.result(child,b,b_value);self.assertEqual(self.commands(),0)
    with self.connect() as db:
     self.assertEqual(db.execute('SELECT failure_streak FROM detection_plans').fetchone()[0],0)
-    self.assertFalse(dual.gate(db,db.execute('SELECT * FROM detection_runs WHERE id=?',(rid,)).fetchone(),'unreachable'))
+    self.assertFalse(groups.gate(db,db.execute('SELECT * FROM detection_runs WHERE id=?',(rid,)).fetchone(),'unreachable'))
  def test_selected_peer_only_and_other_keys_cannot_claim_or_report(self):
   source=self.source('self');child=self.child(source);other=self.source('self')
   self.configure(source,[child['node_id']]);rid=self.start()
@@ -72,7 +72,7 @@ class ProbeGroups(unittest.TestCase):
   detectors.tick(self.connect,self.cipher)
   self.assertEqual(self.commands(),0)
   with self.connect() as db:
-   run=db.execute('SELECT * FROM detection_runs WHERE id=?',(rid,)).fetchone();self.assertFalse(dual.gate(db,run,'unreachable'))
+   run=db.execute('SELECT * FROM detection_runs WHERE id=?',(rid,)).fetchone();self.assertFalse(groups.gate(db,run,'unreachable'))
    snapshot=recheck.snapshot(db,rid)['probe_group'];self.assertFalse(snapshot['complete']);self.assertFalse(snapshot['pending'])
  def test_confirmation_can_use_another_node_in_the_same_group(self):
   source=self.source('self');child=self.child(source)
@@ -82,14 +82,6 @@ class ProbeGroups(unittest.TestCase):
   self.assertIsNone(self.probe(source,'jobs').json['job'])
   confirm=self.probe(child,'jobs').json['job'];self.assertEqual(confirm['id'],-rid)
   self.assertEqual(self.result(child,confirm,False).status_code,200);self.assertEqual(self.commands(),1)
- def test_second_source_can_itself_have_multiple_nodes(self):
-  first=self.source('self');second=self.source('self');child=self.child(second)
-  self.configure(first,['self'],dual_source_id=second['id'],dual_nodes=['self',child['node_id']])
-  rid=self.start();a=self.probe(first,'jobs').json['job'];b=self.probe(second,'jobs').json['job'];c=self.probe(child,'jobs').json['job']
-  self.assertEqual(b['id'],-(dual.SELF_OFFSET+rid));self.assertEqual(b,c)
-  self.result(first,a,False);self.result(second,b,False);self.result(child,c,True)
-  with self.connect() as db:self.assertEqual(dual.snapshot(db,rid)['decision'],'unknown')
-  self.assertEqual(self.commands(),0)
  def test_node_deletion_pause_and_cross_group_edits_are_scoped(self):
   source=self.source('self');child=self.child(source);other=self.source('self')
   self.configure(source,['self',child['node_id']])
@@ -154,5 +146,18 @@ class PauseDuringConfirmation(unittest.TestCase):
   recheck.tick(self.connect,self.cipher);confirm=self.probe(source,'jobs').json['job'];self.assertEqual(confirm['id'],-rid)
   for enabled in (False,True):self.post('/sources/'+str(source['id'])+'/probe-nodes',{'id':child['id'],'name':'上海','enabled':enabled})
   self.assertEqual(self.result(source,confirm,False).status_code,409);self.assertEqual(self.commands(),0)
+
+
+class SingleSourceScope(unittest.TestCase):
+ setUp=ProbeGroups.setUp
+ source=ProbeGroups.source
+ post=ProbeGroups.post
+ def test_removed_second_source_is_rejected_and_not_in_schema(self):
+  first=self.source('self');second=self.source('self')
+  response=self.post('/plans/1',{'source_id':first['id'],'nodes':['self'],'dual_source_id':second['id'],'dual_nodes':['self']})
+  self.assertEqual(response.status_code,400)
+  with self.connect() as db:
+   self.assertNotIn('dual_source_id',{r[1] for r in db.execute('PRAGMA table_info(detection_plans)')})
+   self.assertIsNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='detection_dual_runs'").fetchone())
 
 if __name__=='__main__':unittest.main()

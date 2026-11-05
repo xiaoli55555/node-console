@@ -788,8 +788,8 @@ def _heartbeat_confirmed(db,r,now,subject=None,subject_ip=None,force=False):
             return bool(nodes) and len(details)==len(nodes) and {str(x['node_id']) for x in details}==nodes and all(x['state']=='unreachable' for x in details)
         confirmation=detection_recheck.confirmed(db,plan,runs[0])
         failed=confirmation is not False and all_failed(runs[0]) and (confirmation is True or (len(runs)>=plan['failure_threshold'] and all(valid(x) and all_failed(x) and detection_recheck.confirmed(db,plan,x) is not False for x in runs)))
-        import dual_detection
-        domestic_ok=dual_detection.gate(db,runs[0],'reachable') and bool(nodes) and len(rows)==len(nodes) and {str(x['node_id']) for x in rows}==nodes and all(x['state']=='reachable' for x in rows)
+        import probe_groups
+        domestic_ok=probe_groups.gate(db,runs[0],'reachable') and bool(nodes) and len(rows)==len(nodes) and {str(x['node_id']) for x in rows}==nodes and all(x['state']=='reachable' for x in rows)
     except (ValueError,TypeError,KeyError,AttributeError):return None
     if not failed and not domestic_ok:
         db.execute('UPDATE detection_plans SET next_at=MIN(next_at,?) WHERE server_id=?',(now,sid));return None

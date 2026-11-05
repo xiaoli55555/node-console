@@ -2,7 +2,6 @@
 import aliyun_probe
 import baota_probe
 import probe_groups
-import dual_detection
 import detection_recheck
 import incident_history
 import hashlib
@@ -46,8 +45,6 @@ def initialize(connect):
                 'failure_threshold':'INTEGER NOT NULL DEFAULT 3',
                 'confirm_node':'TEXT',
                 'confirm_source_id':'INTEGER REFERENCES detection_sources(id)',
-                'dual_source_id':'INTEGER REFERENCES detection_sources(id)',
-                'dual_nodes':"TEXT NOT NULL DEFAULT '[]'",
                 'failure_streak':'INTEGER NOT NULL DEFAULT 0',
                 'failure_ip':'TEXT',
                 'failure_port':'INTEGER',
@@ -73,7 +70,6 @@ def initialize(connect):
             for name,definition in columns.items():
                 if name not in existing:db.execute(f'ALTER TABLE {table} ADD COLUMN {name} {definition}')
         probe_groups.initialize(db)
-        dual_detection.initialize(db)
         db.execute('CREATE INDEX IF NOT EXISTS detection_recovery_status ON detection_runs(action_status,id)')
         db.execute("UPDATE detection_runs SET action_attempted=? WHERE action_attempted IS NULL AND action_status IN ('issued','submitted','uncertain')",(int(time.time()),))
 
@@ -184,8 +180,8 @@ def record_incident(db,run,plan,rows,now):
     expected=set(json.loads(run['nodes']))
     complete=bool(expected) and len(rows)==len(expected) and {str(x.get('node_id')) for x in rows}==expected
     states=[x.get('state') for x in rows]
-    failed=online and complete and all(x=='unreachable' for x in states) and dual_detection.gate(db,run,'unreachable')
-    healthy=online and complete and all(x=='reachable' for x in states) and dual_detection.gate(db,run,'reachable')
+    failed=online and complete and all(x=='unreachable' for x in states) and probe_groups.gate(db,run,'unreachable')
+    healthy=online and complete and all(x=='reachable' for x in states) and probe_groups.gate(db,run,'reachable')
     if healthy:
         if active:db.execute("UPDATE detection_incidents SET state='recovered',closed_at=?,last_run=? WHERE id=?",(now,run['id'],active['id']))
         return
@@ -214,8 +210,7 @@ def record_incident(db,run,plan,rows,now):
         if active['evidence']:incident_history.store(db,active['id'],run['server_id'],run['ip'],now)
 
 
-def finish(db,run,status,rows,recheck_confirmed=False,reference_confirmed=False,dual_ready=False):
-    if not dual_ready and not recheck_confirmed and not reference_confirmed and dual_detection.capture(db,run,status,rows):return
+def finish(db,run,status,rows,recheck_confirmed=False,reference_confirmed=False):
     now=int(time.time())
     action_result=None
     action_status=None
@@ -229,7 +224,7 @@ def finish(db,run,status,rows,recheck_confirmed=False,reference_confirmed=False,
         if new_evidence:incident_history.coverage_result(db,run,rows,now)
         confirm_node=dict(plan).get('confirm_node')
         scheduled=bool(run['scheduled']) if 'scheduled' in run.keys() else False
-        if scheduled and plan['automatic'] and dual_detection.gate(db,run,'unreachable') and (confirm_node or plan['source_kind'] in ('boce','baota','aliyun')):
+        if scheduled and plan['automatic'] and probe_groups.gate(db,run,'unreachable') and (confirm_node or plan['source_kind'] in ('boce','baota','aliyun')):
             if not reference_confirmed and not recheck_confirmed and detection_recheck.enqueue(db,run,plan,rows,now):
                 db.execute('UPDATE detection_runs SET incident_evidence=COALESCE(incident_evidence,?) WHERE id=?',(json.dumps(incident_history.snapshot(db,run['server_id'],run['ip'],now)),run['id']))
                 return
@@ -249,7 +244,7 @@ def finish(db,run,status,rows,recheck_confirmed=False,reference_confirmed=False,
         if scheduled and plan['action_enabled'] and run['id']>plan['action_after_run'] and not rotation_managed:
             recovering=db.execute("SELECT 1 FROM detection_runs WHERE server_id=? AND action_status='verifying' LIMIT 1",(run['server_id'],)).fetchone()
             complete_failure=bool(rows) and (all(r.get('state')=='unreachable' for r in rows) or (recovering and all(r.get('state') in ('reachable','unreachable') for r in rows) and any(r.get('state')=='unreachable' for r in rows)))
-            complete_failure=complete_failure and (not confirm_node or recheck_confirmed) and dual_detection.gate(db,run,'unreachable')
+            complete_failure=complete_failure and (not confirm_node or recheck_confirmed) and probe_groups.gate(db,run,'unreachable')
             if complete_failure:
                 same_target=plan['failure_ip']==run['ip'] and plan['failure_port']==run['port']
                 streak=streak+1 if same_target else 1
@@ -298,7 +293,7 @@ def start_run(connect,cipher,sid,scheduled=False):
         m=db.execute('SELECT * FROM ip_monitors WHERE server_id=?',(sid,)).fetchone()
         if not p or not m:raise IntegrationError('请先配置 VPS 的检测来源')
         if not p['enabled'] or not m['enabled']:raise IntegrationError('监控或检测来源已暂停')
-        if db.execute("SELECT 1 FROM detection_runs WHERE server_id=? AND status IN ('creating','pending','queued','issued','dual_waiting')",(sid,)).fetchone():raise IntegrationError('已有检测任务进行中，请勿重复提交')
+        if db.execute("SELECT 1 FROM detection_runs WHERE server_id=? AND status IN ('creating','pending','queued','issued')",(sid,)).fetchone():raise IntegrationError('已有检测任务进行中，请勿重复提交')
         now=int(time.time())
         if db.execute("SELECT 1 FROM detection_rechecks c JOIN detection_runs r ON r.id=c.parent_id WHERE r.server_id=? AND c.state IN ('queued','creating','pending')",(sid,)).fetchone():raise IntegrationError('独立复测进行中，等待同一 IP 的复测结果')
         if now<p['next_at']:raise IntegrationError('尚未到下一次检测时间，请避免重复扣费')
@@ -311,7 +306,7 @@ def start_run(connect,cipher,sid,scheduled=False):
             ip=heartbeat_probe_target(db,sid,m['port'],now)
         nodes=json.loads(p['nodes'])
         if not nodes:raise IntegrationError('请至少选择一个国内检测点')
-        cost=(len(nodes) if p['kind'] in ('boce','aliyun','baota') else 0)+dual_detection.extra_cost(db,p)
+        cost=len(nodes) if p['kind'] in ('boce','aliyun','baota') else 0
         from datetime import datetime
         from zoneinfo import ZoneInfo
         z=ZoneInfo('Asia/Shanghai');today=datetime.now(z).replace(hour=0,minute=0,second=0,microsecond=0).timestamp()
@@ -322,7 +317,6 @@ def start_run(connect,cipher,sid,scheduled=False):
         rid=db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,poll_at,cost,scheduled) VALUES(?,?,?,?,?,'creating',?,?,?,?,?)",(sid,p['source_id'],ip,m['port'],json.dumps(nodes),now,now,now+10,cost,int(scheduled))).lastrowid
         run=db.execute('SELECT * FROM detection_runs WHERE id=?',(rid,)).fetchone()
         if p['kind']=='self':probe_groups.create_tasks(db,run,p['source_id'],nodes)
-        dual_detection.create(db,p,run)
         if primary!=sid:db.execute('INSERT INTO vps_failover_probe_costs(run_id,primary_server_id) VALUES(?,?)',(rid,primary))
         db.execute('UPDATE detection_plans SET next_at=?,status=? WHERE server_id=?',(now+p['interval_s'],'检测中',sid))
         try:
@@ -348,7 +342,6 @@ def start_run(connect,cipher,sid,scheduled=False):
             status='提交异常（不自动重试）：'+reason
             db.execute('UPDATE detection_runs SET status=? WHERE id=?',(status,rid))
             db.execute('UPDATE detection_plans SET status=? WHERE server_id=?',(status,sid))
-            if dual_detection.enabled(p):finish(db,db.execute('SELECT * FROM detection_runs WHERE id=?',(rid,)).fetchone(),status,[])
         db.execute("DELETE FROM detection_runs WHERE created<? AND status NOT IN ('pending','queued','issued','creating') AND (action_command_id IS NOT NULL OR action_status IS NULL OR action_status NOT IN ('queued','issued','submitted','uncertain','verifying'))",(now-30*86400,))
         return rid
 
@@ -388,7 +381,6 @@ def tick(connect,cipher,server_ids=None):
             status='检测接口异常（不能判定目标不通）'
             if r['kind'] in ('aliyun','baota'):status+='：'+str(e)[:400]
             with connect() as db:finish(db,r,status,[])
-    dual_detection.tick(connect,cipher,server_ids=scope)
     if scope is None:detection_recheck.tick(connect,cipher)
     else:detection_recheck.tick(connect,cipher,server_ids=scope)
     with connect() as db:
@@ -498,9 +490,9 @@ def register(app,connect,cipher,auth,body,error,audit):
             plans=[dict(r) for r in db.execute('SELECT p.*,m.port FROM detection_plans p JOIN ip_monitors m ON m.server_id=p.server_id')]
             runs=[dict(r) for r in db.execute('SELECT id,server_id,source_id,ip,port,status,created,updated,details,action_result,action_status FROM detection_runs ORDER BY id DESC LIMIT 50')]
             for run in runs:
-                run['reference']=detection_recheck.snapshot(db,run['id']);run['dual']=run['reference'].get('dual') if run['reference'] else None
+                run['reference']=detection_recheck.snapshot(db,run['id'])
         for p in plans:
-            p['nodes']=json.loads(p['nodes']);p['dual_nodes']=json.loads(p['dual_nodes'])
+            p['nodes']=json.loads(p['nodes'])
         for r in runs:r['details']=json.loads(r['details'])
         return jsonify(sources=sources,plans=plans,runs=runs)
 
@@ -599,7 +591,7 @@ def register(app,connect,cipher,auth,body,error,audit):
         with connect() as db:
             if not db.execute('SELECT 1 FROM self_probe_nodes WHERE id=? AND source_id=?',(nid,sid)).fetchone():return error('节点不存在',404)
             for p in db.execute('SELECT * FROM detection_plans'):
-                if (p['source_id']==sid and key in json.loads(p['nodes'])) or (p['dual_source_id']==sid and key in json.loads(p['dual_nodes'])) or ((p['confirm_source_id'] or p['source_id'])==sid and p['confirm_node']==key):return error('节点仍被检测计划使用，请先取消勾选')
+                if (p['source_id']==sid and key in json.loads(p['nodes'])) or ((p['confirm_source_id'] or p['source_id'])==sid and p['confirm_node']==key):return error('节点仍被检测计划使用，请先取消勾选')
             db.execute('DELETE FROM self_probe_nodes WHERE id=? AND source_id=?',(nid,sid));audit(db,'删除自建节点 #'+str(nid))
         return jsonify(ok=True)
 
@@ -773,9 +765,6 @@ def register(app,connect,cipher,auth,body,error,audit):
             db.execute("UPDATE detection_runs SET action_status='cancelled',action_result='客户更新探测点，停止旧配置关联的自动动作' WHERE server_id=? AND action_status IN ('queued','issued','submitted','uncertain','verifying')",(sid,))
             db.execute('INSERT INTO detection_plans(server_id,source_id,nodes,interval_s,automatic,daily_limit,next_at,response_mode,action_connection_id,failure_threshold,failure_streak,failure_ip,failure_port,last_action,action_enabled,action_after_run,status,checked,owner_id) VALUES(?,?,?,?,?,?,?,\'none\',NULL,3,0,NULL,NULL,NULL,0,?,?,NULL,?) ON CONFLICT(server_id) DO UPDATE SET source_id=excluded.source_id,nodes=excluded.nodes,interval_s=excluded.interval_s,automatic=excluded.automatic,daily_limit=excluded.daily_limit,next_at=MIN(detection_plans.next_at,excluded.next_at),failure_streak=0,failure_ip=NULL,failure_port=NULL,owner_id=excluded.owner_id,status=\'客户更新探测设置\',checked=NULL',(sid,source_id,json.dumps(ids),interval,int(automatic),limit,int(time.time()),last,'客户配置探测点',g.user['id']))
             probe_groups.cancel_pending(db,server_id=sid)
-            db.execute("UPDATE detection_plans SET dual_source_id=NULL,dual_nodes='[]' WHERE server_id=?",(sid,))
-            db.execute("UPDATE detection_dual_runs SET state='cancelled',decision='unknown',message='客户改用独立个人来源，旧轮已取消' WHERE parent_id IN (SELECT id FROM detection_runs WHERE server_id=?) AND state='collecting'",(sid,))
-            db.execute("UPDATE detection_runs SET status='旧双来源检测已取消' WHERE server_id=? AND status IN ('creating','queued','pending','issued','dual_waiting') AND id IN (SELECT parent_id FROM detection_dual_runs WHERE state='cancelled')",(sid,))
             audit(db,'客户配置 VPS 探测点 #'+str(sid))
         return jsonify(ok=True,automatic=automatic,message='探测配置已保存')
 
@@ -796,7 +785,7 @@ def register(app,connect,cipher,auth,body,error,audit):
     @auth(admin=True)
     def detection_delete_source(sid):
         with connect() as db:
-            if db.execute('SELECT 1 FROM detection_plans WHERE source_id=? OR confirm_source_id=? OR dual_source_id=?',(sid,sid,sid)).fetchone() or db.execute("SELECT 1 FROM detection_runs WHERE source_id=? AND status IN ('pending','queued','issued','creating')",(sid,)).fetchone():return error('来源仍被使用，请先更换或移除检测计划')
+            if db.execute('SELECT 1 FROM detection_plans WHERE source_id=? OR confirm_source_id=?',(sid,sid)).fetchone() or db.execute("SELECT 1 FROM detection_runs WHERE source_id=? AND status IN ('pending','queued','issued','creating')",(sid,)).fetchone():return error('来源仍被使用，请先更换或移除检测计划')
             db.execute('DELETE FROM detection_runs WHERE source_id=?',(sid,));db.execute('DELETE FROM detection_sources WHERE id=?',(sid,));audit(db,'删除检测来源 #'+str(sid))
         return jsonify(ok=True)
 
@@ -850,27 +839,7 @@ def register(app,connect,cipher,auth,body,error,audit):
                     for node in ids:aliyun_probe.node_parts(node)
                 except IntegrationError as e:return error(str(e))
                 if response_mode!='none':return error('阿里云来源当前仅记录检测结果；完成真实账号联调后再启用自动处理')
-            dual_source=d.get('dual_source_id')
-            dual_nodes=d.get('dual_nodes',[])
-            if dual_source is not None:
-                if type(dual_source)is not int or dual_source==s['id']:return error('第二探测来源必须与第一来源不同')
-                ds=db.execute('SELECT * FROM detection_sources WHERE id=?',(dual_source,)).fetchone()
-                if not ds or not ds['enabled'] or ds['owner_id'] is not None:return error('请选择已启用的管理员第二来源')
-                if not isinstance(dual_nodes,list) or len(dual_nodes)>20 or any(type(x) not in (str,int) or not str(x) or len(str(x))>40 for x in dual_nodes):return error('第二来源节点格式无效')
-                dual_nodes=sorted(set(map(str,dual_nodes)))
-                if ds['kind']=='self':
-                    try:dual_nodes=probe_groups.validate(db,ds,dual_nodes)
-                    except IntegrationError as e:return error(str(e))
-                elif ds['kind'] in ('boce','baota'):
-                    if not dual_nodes or any(not x.isdigit() for x in dual_nodes):return error('请选择第二来源的有效节点')
-                elif ds['kind']=='aliyun':
-                    if not dual_nodes:return error('请选择第二来源的节点')
-                    try:
-                        for node in dual_nodes:aliyun_probe.node_parts(node)
-                    except IntegrationError as e:return error(str(e))
-                    if response_mode!='none':return error('阿里云第二来源当前仅记录结果，不支持自动处理')
-                else:return error('第二来源类型不支持')
-            else:dual_nodes=[]
+            if d.get('dual_source_id') is not None or d.get('dual_nodes'):return error('本版本仅支持一个首轮探测来源；可在自建来源内选择多个节点')
             if s['kind']=='self':
                 try:ids=probe_groups.validate(db,s,ids)
                 except IntegrationError as e:return error(str(e))
@@ -905,9 +874,7 @@ def register(app,connect,cipher,auth,body,error,audit):
             db.execute("UPDATE detection_runs SET action_status='cancelled',action_result='检测配置已更新，未发送换 IP 请求' WHERE server_id=? AND action_status IN ('queued','issued','submitted','uncertain','verifying')",(sid,))
             db.execute('INSERT INTO detection_plans(server_id,source_id,nodes,interval_s,automatic,daily_limit,next_at,response_mode,action_connection_id,failure_threshold,failure_streak,failure_ip,failure_port,last_action,owner_id) VALUES(?,?,?,?,?,?,?,?,?,?,0,NULL,NULL,NULL,NULL) ON CONFLICT(server_id) DO UPDATE SET source_id=excluded.source_id,nodes=excluded.nodes,interval_s=excluded.interval_s,automatic=excluded.automatic,daily_limit=excluded.daily_limit,response_mode=excluded.response_mode,action_connection_id=excluded.action_connection_id,failure_threshold=excluded.failure_threshold,failure_streak=0,failure_ip=NULL,failure_port=NULL,owner_id=NULL,status=\'等待新配置检测\',checked=NULL',(sid,s['id'],json.dumps(ids),interval,int(automatic),limit,existing['next_at'] if existing else 0,response_mode,action_connection_id,failure_threshold))
             probe_groups.cancel_pending(db,server_id=sid)
-            db.execute('UPDATE detection_plans SET confirm_node=?,confirm_source_id=?,dual_source_id=?,dual_nodes=? WHERE server_id=?',(confirm,confirm_source,dual_source,json.dumps(dual_nodes),sid))
-            db.execute("UPDATE detection_dual_runs SET state='cancelled',decision='unknown',message='检测配置已更新，旧轮已取消' WHERE parent_id IN (SELECT id FROM detection_runs WHERE server_id=?) AND state='collecting'",(sid,))
-            db.execute("UPDATE detection_runs SET status='旧双来源检测已取消' WHERE server_id=? AND status IN ('creating','queued','pending','issued','dual_waiting') AND id IN (SELECT parent_id FROM detection_dual_runs WHERE state='cancelled')",(sid,))
+            db.execute('UPDATE detection_plans SET confirm_node=?,confirm_source_id=? WHERE server_id=?',(confirm,confirm_source,sid))
             db.execute("UPDATE detection_rechecks SET state='cancelled',message='检测配置已更新，取消旧复测' WHERE parent_id IN (SELECT id FROM detection_runs WHERE server_id=?) AND state IN ('queued','creating','pending')",(sid,))
             # Old source jobs can finish for history, but must not change the new plan status.
             audit(db,'配置 VPS 检测点 #'+str(sid))
@@ -943,7 +910,7 @@ def register(app,connect,cipher,auth,body,error,audit):
         with connect() as db:
             db.execute('BEGIN IMMEDIATE')
             probe_groups.heartbeat(db,s,now)
-            cross=probe_groups.claim(db,s,now) or dual_detection.claim_self(db,s,now) or detection_recheck.claim_self(db,s,cipher,now)
+            cross=probe_groups.claim(db,s,now) or detection_recheck.claim_self(db,s,cipher,now)
             if cross:
                 return jsonify(job=cross)
             if s['probe_node_id']!='self':return jsonify(job=None)
@@ -960,9 +927,6 @@ def register(app,connect,cipher,auth,body,error,audit):
         if type(reachable)is not bool or (latency is not None and (type(latency) not in (int,float) or not math.isfinite(latency) or not 0<=latency<=60000)):return error('结果格式无效')
         with connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            if rid<=-dual_detection.SELF_OFFSET:
-                ok=dual_detection.finish_self(db,s,-rid-dual_detection.SELF_OFFSET,d,int(time.time()))
-                return jsonify(ok=True) if ok else error('双来源任务不存在、过期或目标不匹配',409)
             if rid<0:
                 ok=detection_recheck.finish_self(db,s,cipher,-rid,d,int(time.time()))
                 return jsonify(ok=True) if ok else error('复检任务不存在、过期或目标不匹配',409)

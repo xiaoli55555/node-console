@@ -356,8 +356,8 @@ def boce_dns_gate(db,sid,address,port=None,require_plan=False,min_created=None):
     now=int(time.time())
     recovery=db.execute("SELECT id,action_attempted FROM detection_runs WHERE server_id=? AND ip!=? AND action_attempts>0 AND action_status IN ('queued','issued','submitted','uncertain','verifying') ORDER BY id DESC LIMIT 1",(sid,address)).fetchone()
     for run in rows:
-        import dual_detection
-        if not dual_detection.gate(db,run,'reachable'):return '等待当前双来源均检测通过，不使用单来源结果更新 DNS'
+        import probe_groups
+        if not probe_groups.gate(db,run,'reachable'):return '等待所选自建节点全部检测通过，不使用不完整结果更新 DNS'
         if min_created is not None and run['created']<min_created:return '等待发现新 IP 后发起的一次全节点探测，旧结果不可复用'
         if recovery and (run['id']<=recovery['id'] or run['created']<(recovery['action_attempted'] or 0)):return '等待本次换 IP 后重新探测一次，旧结果不可复用'
         if run['source_id']!=plan['source_id'] or run['nodes']!=plan['nodes'] or run['ip']!=address or run['port']!=target_port or now-run['updated']>max(300,plan['interval_s']*3):return '等待新 IP 和当前端口的一次国内探测通过'

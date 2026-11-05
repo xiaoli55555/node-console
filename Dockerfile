@@ -5,7 +5,7 @@ ENV APP_COMMIT=$APP_COMMIT
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt && useradd --uid 10001 --create-home panel && mkdir /data && chown panel:panel /data
-COPY probe_groups.py dual_detection.py rotation_audit.py monitor_api.py incident_history.py rotation_timing.py detection_recheck.py server.py network.py credential_store.py ip_dns.py dns_worker.py baota_probe.py aliyun_probe.py detectors.py rotation.py rotation_schedule.py rotation_groups.py rotation_insights.py rotation_dns.py failover.py server_failover.py shared_failover.py hkt_dhcp.py ./
+COPY probe_groups.py rotation_audit.py monitor_api.py incident_history.py rotation_timing.py detection_recheck.py server.py network.py credential_store.py ip_dns.py dns_worker.py baota_probe.py aliyun_probe.py detectors.py rotation.py rotation_schedule.py rotation_groups.py rotation_insights.py rotation_dns.py failover.py server_failover.py shared_failover.py hkt_dhcp.py ./
 COPY web ./web
 COPY agent ./agent
 COPY probe ./probe

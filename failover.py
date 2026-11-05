@@ -172,14 +172,14 @@ def _activate_probe(db,cipher,r,now):
             if candidate['id']==a['action_connection_id']:continue
             if candidate['owner_id']==owner and (owner is None or candidate['server_id']==sid):action=candidate['id'];break
         if action is None:response='none'
-    signature=json.dumps([a['source_id'],a['nodes'],a['interval_s'],a['daily_limit'],a['failure_threshold'],dict(a).get('confirm_node'),dict(a).get('confirm_source_id'),dict(a).get('dual_source_id'),dict(a).get('dual_nodes','[]'),a['monitor_port'],response,action,a['action_enabled']])
+    signature=json.dumps([a['source_id'],a['nodes'],a['interval_s'],a['daily_limit'],a['failure_threshold'],dict(a).get('confirm_node'),dict(a).get('confirm_source_id'),a['monitor_port'],response,action,a['action_enabled']])
     current=db.execute('SELECT * FROM detection_plans WHERE server_id=?',(sid,)).fetchone()
     monitor=db.execute('SELECT port,enabled FROM ip_monitors WHERE server_id=?',(sid,)).fetchone()
     if state['active'] and state['signature']==signature and current and monitor and current['automatic'] and monitor['enabled'] and current['source_id']==a['source_id'] and current['nodes']==a['nodes'] and monitor['port']==a['monitor_port']:return state
     floor=db.execute('SELECT COALESCE(MAX(id),0) FROM detection_runs WHERE server_id=?',(sid,)).fetchone()[0]
     db.execute("INSERT INTO ip_monitors(server_id,port,enabled,source_id) VALUES(?,?,1,?) ON CONFLICT(server_id) DO UPDATE SET port=excluded.port,enabled=1",(sid,a['monitor_port'],json.loads(state['original_monitor']).get('source_id') if state['original_monitor'] else None))
     db.execute("INSERT INTO detection_plans(server_id,source_id,nodes,interval_s,automatic,daily_limit,next_at,response_mode,action_connection_id,failure_threshold,owner_id,action_enabled,status,action_after_run) VALUES(?,?,?,?,1,?,?,?,?,?,?,?,'继承 A 配置，等待首次拨测',?) ON CONFLICT(server_id) DO UPDATE SET source_id=excluded.source_id,nodes=excluded.nodes,interval_s=excluded.interval_s,automatic=1,daily_limit=excluded.daily_limit,next_at=excluded.next_at,response_mode=excluded.response_mode,action_connection_id=excluded.action_connection_id,failure_threshold=excluded.failure_threshold,owner_id=excluded.owner_id,action_enabled=excluded.action_enabled,status=excluded.status,action_after_run=excluded.action_after_run,failure_streak=0,failure_ip=NULL,failure_port=NULL",(sid,a['source_id'],a['nodes'],a['interval_s'],a['daily_limit'],now,response,action,a['failure_threshold'],r['owner_id'],int(bool(a['action_enabled']) and response!='none'),floor))
-    db.execute('UPDATE detection_plans SET confirm_node=?,confirm_source_id=?,dual_source_id=?,dual_nodes=? WHERE server_id=?',(dict(a).get('confirm_node'),dict(a).get('confirm_source_id'),dict(a).get('dual_source_id'),dict(a).get('dual_nodes','[]'),sid))
+    db.execute('UPDATE detection_plans SET confirm_node=?,confirm_source_id=? WHERE server_id=?',(dict(a).get('confirm_node'),dict(a).get('confirm_source_id'),sid))
     db.execute('UPDATE vps_failover_probe_state SET active=1,signature=?,activated_at=?,run_floor=? WHERE rotation_id=?',(signature,now,floor,r['id']))
     return db.execute('SELECT * FROM vps_failover_probe_state WHERE rotation_id=?',(r['id'],)).fetchone()
 

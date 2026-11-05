@@ -90,23 +90,20 @@ def selection_matches(db,run,wanted):
     return all(t['state']=='done' and t['details'] and json.loads(t['details']).get('state')==wanted for t in tasks)
 
 
+def gate(db,run,wanted):
+    return evidence_valid(db,run) and selection_matches(db,run,wanted)
+
+
 def claim(db,source,now,kind='primary'):
     node=source.get('probe_node_id','self')
     rows=db.execute('SELECT t.* FROM self_probe_tasks t JOIN detection_runs r ON r.id=t.parent_id WHERE t.source_id=? AND t.node_id=? AND t.kind=? AND t.state=\'queued\' AND r.created>? ORDER BY t.parent_id LIMIT 50',(source['id'],node,kind,now-120)).fetchall()
     for task in rows:
         run=db.execute('SELECT * FROM detection_runs WHERE id=?',(task['parent_id'],)).fetchone()
         if task['identity']!=identity(db,source['id'],node):continue
-        if kind=='primary':
-            p=db.execute('SELECT p.*,m.port,m.enabled FROM detection_plans p JOIN ip_monitors m ON m.server_id=p.server_id WHERE p.server_id=?',(run['server_id'],)).fetchone()
-            if not p or not p['enabled'] or run['status'] not in ('queued','issued') or p['source_id']!=run['source_id'] or p['nodes']!=run['nodes'] or p['port']!=run['port']:continue
-            db.execute("UPDATE detection_runs SET status='issued',updated=? WHERE id=?",(now,run['id']))
-            job_id=run['id']
-        else:
-            import dual_detection as dual
-            group=db.execute("SELECT * FROM detection_dual_runs WHERE parent_id=? AND state='collecting'",(run['id'],)).fetchone()
-            if not group or not dual.valid(db,group):continue
-            db.execute("UPDATE detection_dual_runs SET secondary_state='issued',submitted=COALESCE(submitted,?) WHERE parent_id=?",(now,run['id']))
-            job_id=-(dual.SELF_OFFSET+run['id'])
+        p=db.execute('SELECT p.*,m.port,m.enabled FROM detection_plans p JOIN ip_monitors m ON m.server_id=p.server_id WHERE p.server_id=?',(run['server_id'],)).fetchone()
+        if not p or not p['enabled'] or run['status'] not in ('queued','issued') or p['source_id']!=run['source_id'] or p['nodes']!=run['nodes'] or p['port']!=run['port']:continue
+        db.execute("UPDATE detection_runs SET status='issued',updated=? WHERE id=?",(now,run['id']))
+        job_id=run['id']
         db.execute("UPDATE self_probe_tasks SET state='issued' WHERE parent_id=? AND kind=? AND node_id=?",(run['id'],kind,node))
         return {'id':job_id,'ip':run['ip'],'port':run['port']}
     return None
@@ -146,7 +143,7 @@ def snapshot(db,parent_id):
     run=db.execute('SELECT * FROM detection_runs WHERE id=?',(parent_id,)).fetchone()
     source=db.execute('SELECT * FROM detection_sources WHERE id=?',(run['source_id'],)).fetchone()
     labels={n['id']:n['name'] for n in nodes(db,source)} if source else {}
-    pending=run['status'] in ('queued','issued','pending','creating','dual_waiting')
+    pending=run['status'] in ('queued','issued','pending','creating')
     result=[]
     for t in tasks:
         detail=json.loads(t['details']) if t['details'] else None
@@ -157,7 +154,7 @@ def snapshot(db,parent_id):
 
 
 def cancel_pending(db,server_id=None,source_id=None,node_id=None):
-    where="(r.status IN ('queued','issued','pending','creating','dual_waiting') OR EXISTS(SELECT 1 FROM detection_rechecks c WHERE c.parent_id=r.id AND c.state IN ('queued','pending','creating')))";args=[]
+    where="(r.status IN ('queued','issued','pending','creating') OR EXISTS(SELECT 1 FROM detection_rechecks c WHERE c.parent_id=r.id AND c.state IN ('queued','pending','creating')))";args=[]
     if server_id is not None:where+=' AND r.server_id=?';args.append(server_id)
     if source_id is not None:where+=' AND t.source_id=?';args.append(source_id)
     if node_id is not None:where+=' AND t.node_id=?';args.append(node_id)
@@ -166,7 +163,6 @@ def cancel_pending(db,server_id=None,source_id=None,node_id=None):
         db.execute("UPDATE self_probe_tasks SET state='cancelled' WHERE parent_id=? AND state IN ('queued','issued')",(rid,))
         db.execute("UPDATE detection_runs SET status='自建节点配置变化，旧轮已取消' WHERE id=?",(rid,))
         db.execute("UPDATE detection_rechecks SET state='cancelled',message='首轮节点配置变化，取消旧复检' WHERE parent_id=? AND state IN ('queued','pending','creating')",(rid,))
-        db.execute("UPDATE detection_dual_runs SET state='cancelled',decision='unknown',message='节点配置变化，旧轮已取消' WHERE parent_id=?",(rid,))
         db.execute('UPDATE detection_plans SET failure_streak=0,failure_ip=NULL,failure_port=NULL WHERE server_id=(SELECT server_id FROM detection_runs WHERE id=?)',(rid,))
     if source_id is not None:
         clause='' if node_id is None else ' AND node=?'
