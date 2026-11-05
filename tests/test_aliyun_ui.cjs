@@ -3,7 +3,7 @@ function setup(){
  const elements={},calls=[];let html='';
  const el=()=>({value:'',checked:false,disabled:false,textContent:'',innerHTML:'',setAttribute(){},after(child){if(child.id)elements[child.id]=child;this.next=child;},querySelectorAll(){return []}});
  const control=(value,checked=false)=>Object.assign(el(),{value,checked});
- const ctx=vm.createContext({console,setTimeout,clearTimeout,esc:x=>String(x??'').replaceAll('<','&lt;').replaceAll('"','&quot;'),$:id=>elements[id],dnsOptions:()=>'',notice:()=>{},document:{createElement:el},FormData:class{constructor(form){return Object.entries(form.elements).filter(([k,v])=>!['automatic','enabled'].includes(k)).map(([k,v])=>[k,v.value]);}},api:async(path,method,data)=>{calls.push({path,method,data});if(path==='ip-dns')return {connections:[]};if(path.endsWith('/nodes'))return {nodes:[{id:'546:232',name:'<北京>',isp:'联通'}]};if(path.endsWith('/test'))return {message:'来源可用'};return {ok:true};},modal:markup=>{html=markup;elements.modal={close(){}};if(markup.includes('aliyunProbeForm')){elements.aliyunProbeError=el();elements.aliyunProbeForm={elements:{name:control('阿里云'),key_id:control('test-access-key'),key_secret:control('test-secret-value'),enabled:control('',true)}};}if(markup.includes('detectorPlanForm')){elements.detectorPlanForm={elements:{server_id:control('1'),source_id:control('7'),port:control('50332'),nodes:control('546:232'),interval_s:control('120'),daily_limit:control('2160'),automatic:control('',false),response_mode:control('none'),action_connection_id:control(''),confirm_source_id:control(''),confirm_node:control(''),failure_threshold:control('3')}};for(const id of ['loadConfirmNodes','loadPlanNodes','planNodeChoices','planUsage','detectorPlanError'])elements[id]=el();}}});
+ const ctx=vm.createContext({console,setTimeout,clearTimeout,esc:x=>String(x??'').replaceAll('<','&lt;').replaceAll('"','&quot;'),$:id=>elements[id],dnsOptions:()=>'',notice:()=>{},document:{createElement:el},FormData:class{constructor(form){return Object.entries(form.elements).filter(([k,v])=>!['automatic','enabled'].includes(k)).map(([k,v])=>[k,v.value]);}},api:async(path,method,data)=>{calls.push({path,method,data});if(path==='ip-dns')return {connections:[]};if(path.endsWith('/nodes'))return {nodes:[{id:'546:232',name:'<北京>',isp:'联通'}]};if(path.endsWith('/test'))return {message:'来源可用'};return {ok:true};},modal:markup=>{html=markup;elements.modal={close(){}};if(markup.includes('aliyunProbeForm')){elements.aliyunProbeError=el();elements.aliyunProbeForm={elements:{name:control('阿里云'),key_id:control('test-access-key'),key_secret:control('test-secret-value'),enabled:control('',true)}};}if(markup.includes('detectorPlanForm')){elements.detectorPlanForm={elements:{server_id:control('1'),source_id:control('7'),port:control('50332'),nodes:control('546:232'),interval_s:control('120'),daily_limit:control('2160'),automatic:control('',false),response_mode:control('none'),action_connection_id:control(''),dual_source_id:control(''),dual_nodes:control(''),confirm_source_id:control(''),confirm_node:control(''),failure_threshold:control('3')}};for(const id of ['loadDualNodes','dualNodeChoices','loadConfirmNodes','loadPlanNodes','planNodeChoices','planUsage','detectorPlanError'])elements[id]=el();}}});
  vm.runInContext(fs.readFileSync('web/detectors.js','utf8'),ctx);
  vm.runInContext("loadDetectors=async()=>{};detectorsData={sources:[{id:7,kind:'aliyun',name:'阿里云'}],servers:[{id:1,name:'VPS'}],monitors:[{server_id:1,port:50332}]};",ctx);
  return {ctx,elements,calls,html:()=>html};
@@ -60,4 +60,18 @@ test('changing confirmation source discards delayed node results',async()=>{
  const pending=h.elements.loadConfirmNodes.onclick();f.elements.confirm_source_id.value='10';f.elements.confirm_source_id.onchange();
  resolve({nodes:[{id:'self',name:'旧来源',isp:'test'}]});await pending;
  assert.doesNotMatch(f.elements.confirm_node.innerHTML,/旧来源/);assert.equal(h.elements.loadConfirmNodes.disabled,false);
+});
+
+test('two sources submit independent node sets and rule is visible',async()=>{
+ const h=setup();await h.ctx.editDetectionPlan();assert.match(h.html(),/两个来源每轮检测同一 IP 和端口/);
+ const f=h.elements.detectorPlanForm;f.elements.dual_source_id.value='9';f.elements.dual_nodes.value='self';
+ await f.onsubmit({preventDefault(){},submitter:{}});
+ assert.equal(h.calls.at(-1).data.dual_source_id,9);assert.equal(h.calls.at(-1).data.dual_nodes[0],'self');
+});
+test('secondary source change invalidates delayed node choices',async()=>{
+ const h=setup();await h.ctx.editDetectionPlan();const f=h.elements.detectorPlanForm;
+ f.elements.dual_source_id.value='9';let resolve;h.ctx.api=()=>new Promise(r=>resolve=r);
+ const pending=h.elements.loadDualNodes.onclick();f.elements.dual_source_id.value='10';f.elements.dual_source_id.onchange();
+ resolve({nodes:[{id:'3',name:'旧第二来源',isp:'test'}]});await pending;
+ assert.doesNotMatch(h.elements.dualNodeChoices.innerHTML,/旧第二来源/);assert.equal(h.elements.loadDualNodes.disabled,false);
 });

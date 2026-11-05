@@ -107,12 +107,19 @@ async function quickIPSetup(){
   finally{button.disabled=false;}
  };
 }
+function dualProbeMarkup(dual){
+ if(!dual)return '';
+ const label=({pending:'等待两个来源返回',reachable:'两个来源均可达',unreachable:'两个来源均明确不通',mixed:'来源结果不同，不确认故障',unknown:'结果未知，不确认故障'})[dual.decision]||dual.decision;
+ return `<section class="dual-probe-status"><strong>双来源：${esc(label)}</strong>${dual.sources.map(s=>`<p>${esc(s.name)}：${['queued','creating','pending','issued'].includes(s.state)?'检测中':s.state==='done'?'已返回':'未知'}<br>${s.details.map(n=>`${esc(n.name||n.node_id)}：${esc(({reachable:'可达',unreachable:'不通',unknown:'未知'})[n.state]||'未知')}${n.state==='reachable'&&Number.isFinite(n.latency_ms)?' · '+esc(n.latency_ms)+' ms':''}`).join('；')||'尚无有效结果'}</p>`).join('')}<small>${esc(dual.message||'每轮同时检测；两个来源都明确不通才进入故障处理。')}</small></section>`;
+}
 function referenceProbeMarkup(reference){
  if(!reference)return '';
+ const dual=dualProbeMarkup(reference.dual);
+ if(!reference.stage&&reference.dual)return dual;
  const confirmation=reference.confirmation?`<p>复检来源：${esc(reference.confirmation.source_name)} · 节点 ${esc(reference.confirmation.node)} · ${esc(({queued:'等待复检',pending:'复检中',confirmed:'确认不通',reachable:'复检可达',unknown:'结果未知',cancelled:'已取消'})[reference.confirmation.state]||reference.confirmation.state)}</p>`:'';
  if(reference.reference_required===false){
   const state=({queued:'等待复检',pending:'复检中',confirmed:'两台独立探针均不通',reachable:'复检可达，本轮不确认故障',unknown:'复检未知，不触发动作',cancelled:'配置变化，旧复检已取消'})[reference.state]||reference.state;
-  return `${confirmation}<p>独立自建探针复检：${esc(state)}<br>本轮未执行参照站校验；${esc(reference.message||'等待独立探针结果')}</p>`;
+  return `${dual}${confirmation}<p>独立自建探针复检：${esc(state)}<br>本轮未执行参照站校验；${esc(reference.message||'等待独立探针结果')}</p>`;
  }
  const waiting=reference.stage==='reference'&&['queued','creating','pending'].includes(reference.state);
  const label=reference.passed?'通过':waiting?'检测中':'未通过／未知，本轮不通判定已撤销';
@@ -123,15 +130,16 @@ function referenceProbeMarkup(reference){
   const rows=details.map(x=>`<span>检测点 ${esc(x.name||x.node_id)}：${esc(({reachable:'可达',unreachable:'不通',unknown:'未知'})[x.state]||'未知')} · 延迟 ${x.state==='reachable'&&Number.isFinite(x.latency_ms)?esc(x.latency_ms)+' ms':'暂无'} </span>`).join('<br>');
   return `<div><strong>${esc(station.host)}:${esc(station.port||80)}：${esc(status)}</strong><br>${rows||'等待检测点返回状态和延迟'}${station.checked?'<br>校验时间：'+esc(new Date(station.checked*1000).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false})):''}${station.message?'<br>'+esc(station.message):''}</div>`;
  }).join('');
- return `${confirmation}<div class="reference-probe-status" role="status"><strong>参照站校验：${esc(label)}</strong>${stationMarkup}<small>同一检测点至少一站可达才通过；关联目标任务 #${esc(reference.parent_id)} · ${esc(reference.message||'')}</small></div>`;
+ return `${dual}${confirmation}<div class="reference-probe-status" role="status"><strong>参照站校验：${esc(label)}</strong>${stationMarkup}<small>同一检测点至少一站可达才通过；关联目标任务 #${esc(reference.parent_id)} · ${esc(reference.message||'')}</small></div>`;
 }
 function monitorDetectionMarkup(item,monitor){
  if(!item)return '<div class="ipdns-probe-result"><strong>多点探测：尚未配置</strong><p>配置探测来源后，此处每 5 秒刷新已有结果。</p></div>';
- const run=item.run,details=run?.details||[],pending=run&&['creating','pending','queued','issued'].includes(run.status),failed=details.some(x=>x.state==='unreachable'),unknown=details.some(x=>x.state==='unknown');
+ const run=item.run,details=run?.details||[],pending=run&&['creating','pending','queued','issued','dual_waiting'].includes(run.status),failed=details.some(x=>x.state==='unreachable'),unknown=details.some(x=>x.state==='unknown');
  const guardPending=run?.reference&&['queued','creating','pending'].includes(run.reference.state),vetoed=run?.status?.includes('判定已撤销');
- const tone=vetoed||guardPending?'unknown':pending?'pending':!details.length||unknown?'unknown':failed?'failed':'reachable';
+ const dual=run?.reference?.dual;
+ const tone=dual&&['pending','mixed','unknown'].includes(dual.decision)?'unknown':vetoed||guardPending?'unknown':pending?'pending':!details.length||unknown?'unknown':failed?'failed':'reachable';
  const label=item.source_kind==='boce'?'BOCE 国内探测':'自建探针';
- const headline=vetoed?run.status:guardPending?'首轮不通，参照站／独立复测中，尚未确认故障':pending?'检测中，等待节点结果':!details.length||unknown?(run?.status||item.status||'等待检测'):details.every(x=>x.state==='reachable')?'国内可达':details.every(x=>x.state==='unreachable')?'国内不通（疑似被墙）':'部分线路不通';
+ const headline=dual&&['pending','mixed','unknown'].includes(dual.decision)?(dual.message||'等待两个来源完成检测，尚未确认故障'):vetoed?run.status:guardPending?'首轮不通，参照站／独立复测中，尚未确认故障':pending?'检测中，等待节点结果':!details.length||unknown?(run?.status||item.status||'等待检测'):details.every(x=>x.state==='reachable')?'国内可达':details.every(x=>x.state==='unreachable')?'国内不通（疑似被墙）':'部分线路不通';
  const stamp=run?.updated||item.checked;const date=stamp?new Date(stamp*1000).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false}):'尚未检测';
  return `<div class="ipdns-probe-result probe-${tone}"><strong>${label}：${esc(headline)}</strong>${referenceProbeMarkup(run?.reference)}${['reboot','change_api'].includes(item.response_mode)?`<button type="button" role="switch" aria-checked="${item.action_enabled!==false}" data-action-toggle="${item.server_id}" data-action-enabled="${item.action_enabled!==false}" class="ipdns-action-switch">${item.response_mode==='reboot'?'自动重启换 IP':'自动换 IP API'}：${item.action_enabled===false?'已暂停 · 点击开启':'已开启 · 点击暂停'}</button>`:'<small>自动换 IP：未配置动作</small>'}<p>${esc(item.source_name)} · ${item.monitor_enabled===false?'监控已暂停':item.source_enabled?(item.automatic?'定时探测已开启':'仅手动探测'):'来源已暂停'}<br>结果更新：${date}${run?`<br>检测目标：${esc(run.ip)}:${run.port}`:''}${run&&(item.current_ip||monitor?.current_ip)&&(run.ip!==(item.current_ip||monitor?.current_ip)||run.port!==(item.current_port||monitor?.port||run.port))?'<br><b>此结果针对旧 IP 或端口，请等待新目标的探测结果。</b>':''}</p><div class="ipdns-probe-nodes">${details.map(x=>`<span class="probe-node-${['reachable','unreachable','unknown'].includes(x.state)?x.state:'unknown'}">${esc(x.name||x.node_id)}：${({reachable:'可达',unreachable:'不通',unknown:'未知'})[x.state]||'未知'}${Number.isFinite(x.latency_ms)?' '+x.latency_ms+' ms':''}</span>`).join('')}</div>${item.failure_streak?`<p>连续完整失败：${item.failure_streak} / ${item.failure_threshold}</p>`:''}${item.recovery?`<p><strong>换 IP 恢复进度</strong><br>当前恢复任务尝试次数：${item.recovery.action_attempts||0}<br>${esc(item.recovery.action_result||'等待处理')}</p>`:run?.action_result?`<p>自动处理：${esc(run.action_result)}</p>`:''}<small>结果每 5 秒刷新；实际探测按设定间隔执行，TCP 不通不等于已确认被墙。</small></div>`;
 }

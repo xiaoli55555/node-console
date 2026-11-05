@@ -23,3 +23,8 @@ test('dual failed stations show veto and never invent latency',()=>{
  const html=ctx.referenceProbeMarkup({passed:false,parent_id:88,stage:'reference',state:'unknown',stations:[{host:'www.qq.com',state:'completed',details:[{node_id:'13',state:'unreachable',latency_ms:0}]},{host:'www.baidu.com',state:'unknown',message:'接口超时',details:[]}]});
  assert.match(html,/判定已撤销/);assert.match(html,/接口超时/);assert.doesNotMatch(html,/0 ms/);
 });
+
+test('dual-source display preserves both results and escapes source labels',()=>{
+ const html=ctx.dualProbeMarkup({decision:'mixed',sources:[{name:'<广州>',state:'done',details:[{node_id:'self',state:'reachable',latency_ms:2}]},{name:'上海',state:'done',details:[{node_id:'self',state:'unreachable'}]}]});
+ assert.match(html,/来源结果不同，不确认故障/);assert.match(html,/&lt;广州&gt;/);assert.match(html,/上海/);assert.match(html,/可达/);assert.match(html,/不通/);
+});

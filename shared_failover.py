@@ -45,7 +45,7 @@ def context(db,kind,key):
 def _profile(db,r):
     from failover import probe_config
     p=probe_config(db,r['primary'],r['owner_id'])
-    sig=json.dumps([p['source_id'],p['nodes'],p['interval_s'],p['daily_limit'],p['failure_threshold'],dict(p).get('confirm_node'),dict(p).get('confirm_source_id'),p['monitor_port']])
+    sig=json.dumps([p['source_id'],p['nodes'],p['interval_s'],p['daily_limit'],p['failure_threshold'],dict(p).get('confirm_node'),dict(p).get('confirm_source_id'),dict(p).get('dual_source_id'),dict(p).get('dual_nodes','[]'),p['monitor_port']])
     return p,sig
 
 
@@ -56,7 +56,9 @@ def _run(db,r,p,address=None):
     return db.execute(sql+' ORDER BY id DESC LIMIT 1',args).fetchone()
 
 
-def _valid(run,r,p,now,address):
+def _valid(run,r,p,now,address,db):
+    import dual_detection
+    if run and not dual_detection.gate(db,run,'reachable'):return False
     if not run or run['id']<=r['run_floor'] or run['created']<r['activated_at'] or run['ip']!=address or not 0<=now-run['updated']<=90:return False
     try:rows=json.loads(run['details']);nodes=json.loads(p['nodes'])
     except (TypeError,ValueError):return False
@@ -75,7 +77,7 @@ def activate(db,kind,key,now):
     except IntegrationError:address=None
     run=_run(db,r,p,address) if address else None
     # Preserve a parent's verified result while another parent's profile runs.
-    if _valid(run,r,p,now,address) and now-run['updated']<60:return
+    if _valid(run,r,p,now,address,db) and now-run['updated']<60:return
     if run and run['id']>r['run_floor'] and 0<=now-run['updated']<15:return
     if db.execute("SELECT 1 FROM detection_runs WHERE server_id=? AND status IN ('creating','pending','queued','issued')",(sid,)).fetchone():return
     controller=db.execute('SELECT * FROM shared_failover_probe WHERE backup_id=?',(sid,)).fetchone()
@@ -90,7 +92,7 @@ def activate(db,kind,key,now):
         try:pp,_=_profile(db,peer)
         except IntegrationError:continue
         result=_run(db,peer,pp,address) if address else None
-        if _valid(result,peer,pp,now,address) and now-result['updated']<60:continue
+        if _valid(result,peer,pp,now,address,db) and now-result['updated']<60:continue
         if result and result['id']>peer['run_floor'] and 0<=now-result['updated']<15:continue
         attempted=db.execute('SELECT attempted_at FROM shared_failover_attempt WHERE kind=? AND parent_id=?',(peer['kind'],peer['key'])).fetchone()
         candidates.append((attempted[0] if attempted else -1,peer['kind'],peer['key']))
@@ -98,7 +100,7 @@ def activate(db,kind,key,now):
     db.execute('INSERT INTO shared_failover_attempt(kind,parent_id,attempted_at) VALUES(?,?,?) ON CONFLICT(kind,parent_id) DO UPDATE SET attempted_at=excluded.attempted_at',(kind,key,now))
     db.execute('INSERT INTO ip_monitors(server_id,port,enabled) VALUES(?,?,1) ON CONFLICT(server_id) DO UPDATE SET port=excluded.port,enabled=1,source_id=NULL',(sid,p['monitor_port']))
     db.execute("INSERT INTO detection_plans(server_id,source_id,nodes,interval_s,daily_limit,automatic,next_at,response_mode,action_enabled,owner_id,failure_threshold) VALUES(?,?,?,?,?,1,?,'none',0,?,?) ON CONFLICT(server_id) DO UPDATE SET source_id=excluded.source_id,nodes=excluded.nodes,interval_s=excluded.interval_s,daily_limit=excluded.daily_limit,automatic=1,next_at=excluded.next_at,response_mode='none',action_enabled=0,owner_id=excluded.owner_id,failure_threshold=excluded.failure_threshold,failure_streak=0",(sid,p['source_id'],p['nodes'],p['interval_s'],p['daily_limit'],now,r['owner_id'],p['failure_threshold']))
-    db.execute('UPDATE detection_plans SET confirm_node=?,confirm_source_id=? WHERE server_id=?',(dict(p).get('confirm_node'),dict(p).get('confirm_source_id'),sid))
+    db.execute('UPDATE detection_plans SET confirm_node=?,confirm_source_id=?,dual_source_id=?,dual_nodes=? WHERE server_id=?',(dict(p).get('confirm_node'),dict(p).get('confirm_source_id'),dict(p).get('dual_source_id'),dict(p).get('dual_nodes','[]'),sid))
     db.execute('INSERT INTO shared_failover_probe(backup_id,kind,parent_id,signature,switched_at,run_floor) VALUES(?,?,?,?,?,?) ON CONFLICT(backup_id) DO UPDATE SET kind=excluded.kind,parent_id=excluded.parent_id,signature=excluded.signature,switched_at=excluded.switched_at,run_floor=excluded.run_floor',(sid,kind,key,sig,now,floor))
 
 
@@ -109,7 +111,7 @@ def ready(db,cipher,kind,key,now,offline_s):
     if not rotation._owned_server(db,sid,r['owner_id']):raise IntegrationError('共享备用机归属已变化')
     if rotation._offline(db,sid,now,offline_s) or rotation._pending_action(db,sid):raise IntegrationError('共享备用机离线或有未完成的动作')
     address=public_v4(candidate_ip(db,{'server_id':sid,'source_id':None},cipher))
-    if not _valid(_run(db,r,p,address),r,p,now,address):raise IntegrationError('等待共享备用机通过本主机所选检测点；其他主机结果不能替代')
+    if not _valid(_run(db,r,p,address),r,p,now,address,db):raise IntegrationError('等待共享备用机通过本主机所选检测点；其他主机结果不能替代')
     try:
         with rotation.socket.create_connection((address,p['monitor_port']),timeout=4):pass
     except OSError:raise IntegrationError('共享备用机业务端口不可达') from None

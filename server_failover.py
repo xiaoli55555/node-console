@@ -90,14 +90,14 @@ def _activate(db,r,now):
     if shared_failover.shared(db,r['backup_id']):
         shared_failover.activate(db,'server',r['server_id'],now);return
     p=failover.probe_config(db,r['server_id'],r['owner_id'])
-    signature=json.dumps([p['source_id'],p['nodes'],p['interval_s'],p['daily_limit'],p['failure_threshold'],dict(p).get('confirm_node'),dict(p).get('confirm_source_id'),p['monitor_port']])
+    signature=json.dumps([p['source_id'],p['nodes'],p['interval_s'],p['daily_limit'],p['failure_threshold'],dict(p).get('confirm_node'),dict(p).get('confirm_source_id'),dict(p).get('dual_source_id'),dict(p).get('dual_nodes','[]'),p['monitor_port']])
     current=db.execute('SELECT * FROM detection_plans WHERE server_id=?',(r['backup_id'],)).fetchone()
     monitor=db.execute('SELECT * FROM ip_monitors WHERE server_id=?',(r['backup_id'],)).fetchone()
     if r['active'] and signature==r['signature'] and current and monitor and current['automatic'] and monitor['enabled'] and current['source_id']==p['source_id'] and current['nodes']==p['nodes'] and monitor['port']==p['monitor_port']:return
     floor=db.execute('SELECT COALESCE(MAX(id),0) FROM detection_runs WHERE server_id=?',(r['backup_id'],)).fetchone()[0]
     db.execute('INSERT INTO ip_monitors(server_id,port,enabled) VALUES(?,?,1) ON CONFLICT(server_id) DO UPDATE SET port=excluded.port,enabled=1',(r['backup_id'],p['monitor_port']))
     db.execute("INSERT INTO detection_plans(server_id,source_id,nodes,interval_s,daily_limit,automatic,next_at,response_mode,action_enabled,owner_id,failure_threshold) VALUES(?,?,?,?,?,1,?,'none',0,?,?) ON CONFLICT(server_id) DO UPDATE SET source_id=excluded.source_id,nodes=excluded.nodes,interval_s=excluded.interval_s,daily_limit=excluded.daily_limit,automatic=1,next_at=excluded.next_at,response_mode='none',action_enabled=0,owner_id=excluded.owner_id,failure_threshold=excluded.failure_threshold,failure_streak=0",(r['backup_id'],p['source_id'],p['nodes'],p['interval_s'],p['daily_limit'],now,r['owner_id'],p['failure_threshold']))
-    db.execute('UPDATE detection_plans SET confirm_node=?,confirm_source_id=? WHERE server_id=?',(dict(p).get('confirm_node'),dict(p).get('confirm_source_id'),r['backup_id']))
+    db.execute('UPDATE detection_plans SET confirm_node=?,confirm_source_id=?,dual_source_id=?,dual_nodes=? WHERE server_id=?',(dict(p).get('confirm_node'),dict(p).get('confirm_source_id'),dict(p).get('dual_source_id'),dict(p).get('dual_nodes','[]'),r['backup_id']))
     db.execute('UPDATE server_failovers SET active=1,signature=?,activated_at=?,run_floor=? WHERE server_id=?',(signature,now,floor,r['server_id']))
 
 

@@ -53,6 +53,8 @@ def failed(rows,nodes):
 
 
 def confirmed(db,plan,run):
+    import dual_detection
+    if not dual_detection.gate(db,run,'unreachable'):return False
     node=dict(plan).get('confirm_node')
     if not node:
         row=db.execute('SELECT * FROM detection_rechecks WHERE parent_id=?',(run['id'],)).fetchone()
@@ -404,10 +406,12 @@ def tick(connect,cipher,server_ids=None):
 
 def snapshot(db,parent_id):
     row=db.execute('SELECT * FROM detection_rechecks WHERE parent_id=?',(parent_id,)).fetchone()
-    if not row:return None
+    import dual_detection
+    dual=dual_detection.snapshot(db,parent_id)
+    if not row:return {'dual':dual} if dual else None
     source=db.execute('SELECT name FROM detection_sources WHERE id=?',(row['confirm_source_id'],)).fetchone() if row['confirm_source_id'] else None
     confirmation={'source_id':row['confirm_source_id'],'source_name':source['name'] if source else '与首轮相同来源','node':row['node'],'state':row['state'],'details':json.loads(row['details'])} if row['node'] else None
-    return {'confirmation':confirmation,'host':REFERENCE_HOST,'hosts':list(REFERENCE_HOSTS),'stations':[dict(value,host=host,port=80) for host,value in json.loads(row['reference_jobs']).items()],'port':REFERENCE_PORT,'parent_id':parent_id,
+    return {'dual':dual,'confirmation':confirmation,'host':REFERENCE_HOST,'hosts':list(REFERENCE_HOSTS),'stations':[dict(value,host=host,port=80) for host,value in json.loads(row['reference_jobs']).items()],'port':REFERENCE_PORT,'parent_id':parent_id,
             'stage':row['stage'],'state':row['state'],'passed':bool(row['reference_passed']),'confirm_source_id':row['confirm_source_id'],'reference_required':row['stage']!='self_pair',
             'checked':row['reference_checked'],'details':json.loads(row['reference_details']),
             'message':row['message'] or '使用原检测点加测参照站，等待结果'}
