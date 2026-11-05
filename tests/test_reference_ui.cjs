@@ -28,3 +28,8 @@ test('dual-source display preserves both results and escapes source labels',()=>
  const html=ctx.dualProbeMarkup({decision:'mixed',sources:[{name:'<广州>',state:'done',details:[{node_id:'self',state:'reachable',latency_ms:2}]},{name:'上海',state:'done',details:[{node_id:'self',state:'unreachable'}]}]});
  assert.match(html,/来源结果不同，不确认故障/);assert.match(html,/&lt;广州&gt;/);assert.match(html,/上海/);assert.match(html,/可达/);assert.match(html,/不通/);
 });
+
+test('group results show each peer and never label a missing peer as failed',()=>{
+ const html=ctx.probeGroupMarkup({name:'组',complete:false,pending:false,nodes:[{id:'self',name:'<广州>',state:'done',result:{state:'unreachable'}},{id:'probe-4',name:'上海',state:'unknown',result:null}]});
+ assert.match(html,/结果未知，不确认故障/);assert.match(html,/&lt;广州&gt;/);assert.match(html,/上海/);assert.match(html,/未知/);assert.doesNotMatch(html,/上海[^<]*不通/);
+});

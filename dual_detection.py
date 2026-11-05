@@ -1,4 +1,5 @@
 """Two independent sources per round. Preserve raw evidence; only both failures authorize failure."""
+import probe_groups
 import hashlib
 import json
 import time
@@ -25,7 +26,8 @@ def signature(db,p,port):
     sources=[]
     for sid in (p['source_id'],dict(p).get('dual_source_id')):
         row=db.execute('SELECT id,kind,secret,enabled FROM detection_sources WHERE id=?',(sid,)).fetchone()
-        sources.append(list(row) if row else None)
+        selected=json.loads(p['nodes'] if sid==p['source_id'] else dict(p).get('dual_nodes','[]'))
+        sources.append([list(row),[probe_groups.identity(db,sid,n) for n in selected] if row['kind']=='self' else []] if row else None)
     values=[sources,p['nodes'],dict(p).get('dual_nodes','[]'),port,dict(p).get('confirm_source_id'),dict(p).get('confirm_node')]
     return hashlib.sha256(json.dumps(values,sort_keys=True).encode()).hexdigest()
 
@@ -48,6 +50,8 @@ def create(db,p,run):
     if not enabled(p):return
     db.execute('INSERT INTO detection_dual_runs(parent_id,source_id,nodes,signature) VALUES(?,?,?,?)',
                (run['id'],p['dual_source_id'],p['dual_nodes'],signature(db,p,run['port'])))
+    source,nodes=second(db,p)
+    if source['kind']=='self':probe_groups.create_tasks(db,run,source['id'],nodes,kind='dual')
 
 
 def valid(db,group):
@@ -70,6 +74,7 @@ def valid(db,group):
 
 
 def gate(db,run,wanted):
+    if not probe_groups.evidence_valid(db,run) or not probe_groups.selection_matches(db,run,wanted):return False
     if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='detection_dual_runs'").fetchone():return True
     group=db.execute('SELECT * FROM detection_dual_runs WHERE parent_id=?',(run['id'],)).fetchone()
     if not group:
@@ -140,7 +145,10 @@ def _complete(db,group,rows):
 
 
 def claim_self(db,source,now):
-    for group in db.execute("SELECT * FROM detection_dual_runs WHERE source_id=? AND state='collecting' AND secondary_state='queued' ORDER BY parent_id LIMIT 50",(source['id'],)).fetchall():
+    task=probe_groups.claim(db,source,now,kind='dual')
+    if task:return task
+    if source.get('probe_node_id','self')!='self':return None
+    for group in db.execute("SELECT * FROM detection_dual_runs WHERE source_id=? AND state='collecting' AND secondary_state='queued' AND NOT EXISTS(SELECT 1 FROM self_probe_tasks t WHERE t.parent_id=detection_dual_runs.parent_id AND t.kind='dual') ORDER BY parent_id LIMIT 50",(source['id'],)).fetchall():
         current=valid(db,group)
         if not current:cancel(db,group);continue
         run,_=current
@@ -157,6 +165,13 @@ def finish_self(db,source,parent_id,data,now):
     if not current:cancel(db,group);return False
     run,_=current
     if now-run['created']>120 or data.get('ip')!=run['ip'] or type(data.get('port'))is not int or data['port']!=run['port']:return False
+    receipt=probe_groups.receive(db,source,run,data,kind='dual')
+    if receipt is not None:
+        if not receipt:return False
+        rows=probe_groups.completed(db,run,kind='dual')
+        if rows is not None:_complete(db,group,rows)
+        return True
+    if source.get('probe_node_id','self')!='self':return False
     _complete(db,group,[{'node_id':'self','name':source['name'],'state':'reachable' if data['reachable'] else 'unreachable','latency_ms':data.get('latency_ms')}])
     return True
 

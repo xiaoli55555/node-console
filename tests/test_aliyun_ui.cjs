@@ -75,3 +75,21 @@ test('secondary source change invalidates delayed node choices',async()=>{
  resolve({nodes:[{id:'3',name:'旧第二来源',isp:'test'}]});await pending;
  assert.doesNotMatch(h.elements.dualNodeChoices.innerHTML,/旧第二来源/);assert.equal(h.elements.loadDualNodes.disabled,false);
 });
+
+test('one self source exposes multiple selectable peers and saves both IDs',async()=>{
+ const h=setup();vm.runInContext("detectorsData.sources=[{id:7,kind:'self',name:'自建组',enabled:1,nodes:[{id:'self',name:'广州',online:true},{id:'probe-4',name:'上海',online:true}]}]",h.ctx);
+ await h.ctx.editDetectionPlan({server_id:1,source_id:7,nodes:['self','probe-4'],dual_nodes:[]});
+ assert.match(h.html(),/self,probe-4/);assert.match(h.elements.planNodeChoices.innerHTML,/广州/);assert.match(h.elements.planNodeChoices.innerHTML,/上海/);
+ h.elements.planNodeChoices.querySelectorAll=()=>[{value:'self'},{value:'probe-4'}];h.elements.planNodeChoices.onchange();
+ const f=h.elements.detectorPlanForm;assert.equal(f.elements.nodes.value,'self,probe-4');await f.onsubmit({preventDefault(){},submitter:{}});
+ assert.deepEqual(Array.from(h.calls.at(-1).data.nodes),['self','probe-4']);
+});
+test('node management creates a child with its own one-time credential',async()=>{
+ const h=setup();let token;
+ h.ctx.document.querySelectorAll=()=>[];h.ctx.probeInstructions=value=>token=value;
+ h.ctx.modal=markup=>{h.elements.modal={close(){}};h.elements.probeNodeError={textContent:''};h.elements.addProbeNodeForm={elements:{name:{value:'上海'}}};};
+ h.ctx.api=async(path,method,data)=>{h.calls.push({path,method,data});return path.endsWith('/nodes')?{nodes:[{id:'self',name:'广州',online:true,enabled:true}]}:{probe_token:'new-peer-only-key'};};
+ await h.ctx.manageProbeNodes(7);const f=h.elements.addProbeNodeForm;
+ await f.onsubmit({preventDefault(){},target:f,submitter:{}});
+ assert.equal(h.calls.at(-1).path,'detection/sources/7/probe-nodes');assert.equal(h.calls.at(-1).data.name,'上海');assert.equal(token,'new-peer-only-key');
+});

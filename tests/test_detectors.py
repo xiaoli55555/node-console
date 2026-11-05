@@ -42,6 +42,8 @@ class DetectorTest(unittest.TestCase):
  def source(self,kind='boce'):
   r=self.post('/sources',{'kind':kind,'name':'test','secret':'testsecret' if kind=='boce' else ''});self.assertEqual(r.status_code,200);return r.json
  def plan(self,source,**kwargs):
+  with self.connect() as db:kind=db.execute('SELECT kind FROM detection_sources WHERE id=?',(source,)).fetchone()[0]
+  if kind=='self' and 'nodes' not in kwargs:kwargs['nodes']=['self']
   if kwargs.get('response_mode','none')!='none':
    with self.connect() as db:db.execute('UPDATE detection_sources SET verified_at=? WHERE id=?',(int(time.time()),source))
   r=self.post('/plans/1',{'source_id':source,'nodes':['1','2'],'interval_s':600,'daily_limit':1000,**kwargs});self.assertEqual(r.status_code,200,r.json)

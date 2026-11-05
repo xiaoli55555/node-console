@@ -14,7 +14,7 @@ class DualDetection(unittest.TestCase):
  plan=fixture.DetectorTest.plan
  def configure(self,kind='self',automatic=True,response='reboot'):
   self.a=self.source('self');self.b=self.source(kind)
-  self.plan(self.a['id'],nodes=['self'],dual_source_id=self.b['id'],dual_nodes=['3'],automatic=automatic,response_mode=response,failure_threshold=2)
+  self.plan(self.a['id'],nodes=['self'],dual_source_id=self.b['id'],dual_nodes=['self'] if kind=='self' else ['3'],automatic=automatic,response_mode=response,failure_threshold=2)
  def probe(self,source,path,data=None):
   return self.client.post('/api/probe/'+path,json=data or {},headers={'Authorization':'Bearer '+source['probe_token']})
  def start(self,scheduled=True):
