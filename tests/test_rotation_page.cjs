@@ -28,3 +28,12 @@ test('live refresh updates data used by controls rather than retaining stale ena
  const {c,timers,elements}=setup();const data={rotations:[{...plan,urgent_probe_floors:'{}'}],bindings:[]};elements['rotationLive-7']={};elements['rotationSummary-7']={};
  c.api=async()=>({rotations:[{...plan,enabled:0,status:'已暂停'}],bindings:[]});c.startAdminRotationLive(data);await timers[0]();assert.equal(data.rotations[0].enabled,0);assert.match(elements['rotationLive-7'].innerHTML,/已暂停/);assert.equal(elements['rotationSummary-7'].innerHTML,'已暂停');
 });
+test('event evidence separates suspicion, unknown history and confirmed DNS with escaped content',()=>{
+ const {c}=setup();
+ assert.match(c.rotationAuditMarkup({}),/历史记录无结构化证据/);
+ const e={id:4,rotation_id:7,audit:{kind:'dns_switch_confirmed',incident_id:'7:3',evidence:{trigger:'tcp_suspected_pending_recheck',code_version:'unknown',state:{active_server_id:2,phase:'draining',next_switch_at:1793850196},servers:[{server_id:1,monitor:{current_ip:'<script>'},probe:{ip:'8.8.8.8',port:443,updated:1793850196,nodes:[{node_id:'<node>',state:'unreachable'}],recheck:{state:'pending'}}}]}}};
+ const html=c.rotationAuditMarkup(e);
+ assert.match(html,/首轮 TCP 异常，独立复检尚未完成/);assert.match(html,/北京时间/);
+ assert.match(html,/&lt;script&gt;/);assert.doesNotMatch(html,/<script>/);assert.match(html,/&lt;node&gt;/);
+ assert.match(html,/缺失、待复检和未知均不代表确认故障/);
+});

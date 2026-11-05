@@ -315,7 +315,7 @@ def _finish(db,r,b,target,restore,now,target_server=None):
     message=('A/B 恢复，解析已切回 ' if restore else 'A/B 均不可用，解析已由 C 接替：' if r['mode']=='alternating' else 'A 下线，解析已由故障转移 VPS 接替：')+target
     db.execute('UPDATE dns_bindings SET expected_ip=?,candidate=NULL,candidate_since=NULL,status=?,updated=? WHERE id=?',(target,message,now,b['id']))
     import rotation as rot
-    rot._event(db,r['id'],restored_server if restore else r['failover_server_id'],'解析 #'+str(b['id'])+'：'+message,now)
+    rot._event(db,r['id'],restored_server if restore else r['failover_server_id'],'解析 #'+str(b['id'])+'：'+message,now,kind='failover_restore' if restore else 'failover_takeover',trigger='ab_recovered' if restore else 'ab_unavailable_policy_met',transition=dict(binding_id=b['id'],from_ip=b['expected_ip'],to_ip=target,to_server_id=restored_server if restore else r['failover_server_id'],confirmed_at=now))
     if restore:
         db.execute('DELETE FROM vps_failover_leases WHERE binding_id=?',(b['id'],))
         peer=db.execute('SELECT * FROM vps_rotations WHERE binding_id=?',(b['id'],)).fetchone()

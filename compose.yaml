@@ -1,7 +1,10 @@
 name: hk-sdan
 services:
   app:
-    build: .
+    build:
+      context: .
+      args:
+        APP_COMMIT: ${APP_COMMIT:-unknown}
     restart: unless-stopped
     environment:
       DATA_DIR: /data
@@ -18,7 +21,10 @@ services:
     cap_drop:
       - ALL
   dns-worker:
-    build: .
+    build:
+      context: .
+      args:
+        APP_COMMIT: ${APP_COMMIT:-unknown}
     command: ["python", "dns_worker.py"]
     restart: unless-stopped
     environment:

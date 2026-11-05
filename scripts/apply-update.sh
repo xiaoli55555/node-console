@@ -3,6 +3,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 OLD_COMMIT=${1:?Missing previous commit}
 [[ "$OLD_COMMIT" =~ ^[0-9a-f]{40}$ ]] || exit 1
+APP_COMMIT=$(git rev-parse HEAD)
+export APP_COMMIT
 if ! docker compose build --pull; then
   echo "构建失败，运行中的旧容器未替换。旧源码版本：$OLD_COMMIT"
   echo "处理构建错误后执行：bash scripts/apply-update.sh $OLD_COMMIT"

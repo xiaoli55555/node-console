@@ -80,3 +80,61 @@ class MonitorAPI(unittest.TestCase):
         self.assertEqual(r.status_code,200)
         self.assertNotIn(key,r.get_data(as_text=True))
         self.assertNotIn('token_hash',r.json)
+
+    def test_structured_evidence_preserves_event_time_and_omits_secrets(self):
+        import rotation
+        key=self.issue();now=self.clock[0]
+        with server.connect() as db:
+            db.execute("UPDATE vps_rotations SET dns_intent='PRIVATE_MARKER',status='PRIVATE_MARKER' WHERE id=?",(self.rid,))
+            rotation._event(db,self.rid,self.sid('A'),'PRIVATE_MARKER',now,kind='handoff_source_observed',trigger='tcp_suspected_pending_recheck')
+            first=db.execute('SELECT MAX(id) FROM vps_rotation_events').fetchone()[0]
+            db.execute('UPDATE vps_rotations SET active_server_id=?,next_switch_at=? WHERE id=?',(self.sid('B'),now+100,self.rid))
+            rotation._event(db,self.rid,self.sid('B'),'PRIVATE_MARKER',now+2,kind='dns_switch_confirmed',trigger='tcp_suspected_pending_recheck')
+        with patch('rotation.get_dns_record') as dns,patch('rotation.invoke_change_ip_api') as change:
+            result=self.read(key,'/api/monitor/snapshot?after_id='+str(first-1)).json
+        dns.assert_not_called();change.assert_not_called()
+        self.assertNotIn('PRIVATE_MARKER',json.dumps(result))
+        before,after=result['events']
+        self.assertEqual(before['audit']['incident_id'],after['audit']['incident_id'])
+        evidence=after['audit']['evidence']
+        self.assertEqual(evidence['previous_state']['active_server_id'],self.sid('A'))
+        self.assertEqual(evidence['state']['active_server_id'],self.sid('B'))
+        self.assertEqual(evidence['elapsed_since_previous_event_s'],2)
+        # Later state changes cannot rewrite an earlier event's evidence.
+        self.assertEqual(before['audit']['evidence']['state']['active_server_id'],self.sid('A'))
+        self.assertTrue(before['audit']['evidence']['state']['dns_intent'])
+
+    def test_filtered_pagination_statistics_and_legacy_unknown(self):
+        import rotation
+        key=self.issue();now=self.clock[0]
+        with server.connect() as db:
+            db.execute('DELETE FROM rotation_audit');db.execute('DELETE FROM vps_rotation_events')
+            for i in range(505):
+                # Legacy records remain unknown, even when the message says failure.
+                db.execute('INSERT INTO vps_rotation_events(rotation_id,server_id,message,created) VALUES(?,?,?,?)',(self.rid,self.sid('A'),'failure',now+i))
+            rotation._event(db,self.rid,self.sid('B'),'handoff',now+505,kind='dns_switch_confirmed',trigger='scheduled_switch')
+        path=f'/api/monitor/snapshot?start_at={now}&end_at={now+505}&rotation_id={self.rid}'
+        first=self.read(key,path).json
+        self.assertEqual(len(first['events']),200);self.assertTrue(first['has_more_events'])
+        stats=first['event_statistics']
+        self.assertEqual(stats['event_count'],506);self.assertEqual(stats['missing_evidence_count'],505)
+        self.assertIsNone(first['events'][0]['audit'])
+        second=self.read(key,path+'&after_id='+str(first['next_after_id'])).json
+        self.assertEqual(len(second['events']),200);self.assertTrue(second['has_more_events'])
+        self.assertEqual(second['event_statistics'],stats)
+        self.assertGreater(second['events'][0]['id'],first['events'][-1]['id'])
+        third=self.read(key,path+'&after_id='+str(second['next_after_id'])).json
+        self.assertEqual(len(third['events']),106);self.assertFalse(third['has_more_events'])
+        self.assertEqual(third['event_statistics'],stats)
+        incident=third['events'][-1]['audit']['incident_id']
+        chain=self.read(key,'/api/monitor/snapshot?incident_id='+incident).json
+        self.assertEqual(len(chain['events']),1)
+        self.assertEqual(chain['event_statistics']['event_count'],1)
+        self.assertEqual(self.read(key,path+'&server_id='+str(self.sid('B'))).json['event_statistics']['event_count'],1)
+        for query in ('start_at=-1','start_at=2&end_at=1','server_id=１','incident_id=bogus','incident_id=1:2%27'):
+            self.assertEqual(self.read(key,'/api/monitor/snapshot?'+query).status_code,400,query)
+
+    def test_coordination_is_not_reported_as_confirmed_split(self):
+        from monitor_api import category
+        self.assertEqual(category('多记录协调中'),'group_coordination')
+        self.assertEqual(category('线路状态不一致'),'group_split')

@@ -13,6 +13,7 @@ import rotation_groups
 import detection_recheck
 import rotation_timing
 import rotation_schedule
+import rotation_audit
 from contextlib import nullcontext
 
 from detectors import boce_dns_gate, queue_reboot
@@ -78,6 +79,7 @@ def initialize(connect):
             if name not in columns:db.execute(f'ALTER TABLE vps_rotations ADD COLUMN {name} {definition}')
         failover.initialize(db)
         rotation_timing.initialize(db)
+        rotation_audit.initialize(db)
 
 
 # Existing tasks keep their alternating behavior after upgrading.
@@ -183,7 +185,8 @@ def _rotation_json(db,row):
     if len({p['active_server_id'] for p in group})>1:data['active_name']='多条记录切换中'
     data['drain_statistics']=_drain_statistics(db,row)
     data['timing']=rotation_timing.snapshot(db,row,int(time.time()))
-    data['events']=[dict(e) for e in db.execute('SELECT server_id,message,created FROM vps_rotation_events WHERE rotation_id IN ('+','.join('?' for _ in group)+') ORDER BY id DESC LIMIT 50',data['member_ids'])]
+    data['events']=[dict(e) for e in db.execute('SELECT id,rotation_id,server_id,message,created FROM vps_rotation_events WHERE rotation_id IN ('+','.join('?' for _ in group)+') ORDER BY id DESC LIMIT 50',data['member_ids'])]
+    for event in data['events']:event['audit']=rotation_audit.read(db,event['id'])
     return data
 
 def _server_snapshot(db,sid,now,cipher):
@@ -480,9 +483,11 @@ def _client_rotation(app,connect,cipher,auth,body,error,audit):
     app.add_url_rule('/api/admin/servers/<int:sid>/rotation','admin_delete_rotation',auth(admin=True)(delete_rotation.__wrapped__),methods=['DELETE'])
 
 
-def _event(db,rid,sid,message,now):
-    db.execute('INSERT INTO vps_rotation_events(rotation_id,server_id,message,created) VALUES(?,?,?,?)',(rid,sid,message,now))
-    db.execute('DELETE FROM vps_rotation_events WHERE id NOT IN (SELECT id FROM vps_rotation_events ORDER BY id DESC LIMIT 500)')
+def _event(db,rid,sid,message,now,kind='state_observed',trigger=None,transition=None):
+    cursor=db.execute('INSERT INTO vps_rotation_events(rotation_id,server_id,message,created) VALUES(?,?,?,?)',(rid,sid,message,now))
+    rotation_audit.capture(db,cursor.lastrowid,rid,sid,now,kind,trigger,transition)
+    db.execute('DELETE FROM rotation_audit WHERE event_id IN (SELECT id FROM vps_rotation_events WHERE created<?)',(now-90*86400,))
+    db.execute('DELETE FROM vps_rotation_events WHERE created<?',(now-90*86400,))
 
 def _fresh_ip(db,sid,now,cipher):
     server=db.execute('SELECT metrics,seen FROM servers WHERE id=?',(sid,)).fetchone()
@@ -637,7 +642,7 @@ def _reconcile_fixed_dns(connect,cipher,rid,now):
         db.execute('UPDATE vps_rotations SET active_server_id=?,phase=?,drain_server_id=?,drain_started=?,drain_grace_s=?,old_ip=?,new_ip=NULL,action_started=NULL,reboot_command_id=NULL,last_sample_at=NULL,low_samples=?,emergency=?,next_switch_at=?,dns_intent=NULL,status=?,updated=? WHERE id=?',(target,phase,None if normal_takeover else old,None if normal_takeover else now,0 if emergency or normal_takeover else ttl+60,None if normal_takeover else intent['from'],2 if emergency else 0,emergency,now+delay,message,now,rid))
         if emergency:db.execute('UPDATE vps_rotations SET fault_recovery=1 WHERE id=?',(rid,))
         if phase=='draining':_drain_timing(db,db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone(),now,start=True)
-        _event(db,rid,target,message,now)
+        _event(db,rid,target,message,now,kind='dns_switch_confirmed',trigger='dns_readback_reconciled',transition=dict(binding_id=binding['id'],from_server_id=old,to_server_id=target,from_ip=intent['from'],to_ip=intent['to'],submitted_at=intent['submitted'],confirmed_at=now,ttl_s=ttl))
         return True
 
 
@@ -956,14 +961,19 @@ def _dns_switch_single(connect,cipher,rotation,now,emergency=False,offline=False
 
 
 def _finish_dns_switch(db,r,binding,rotation,target,old_ip,target_ip,ttl,submitted,now,
-                       emergency,offline,reuse_draining,proxied):
+                       emergency,offline,reuse_draining,proxied,audit_trigger=None):
+    restoring=not emergency and not _fixed(r) and r['status'].startswith('原机复测正常，保留原 IP 并立即切回')
+    trigger=('heartbeat_timeout' if offline else 'tcp_failure_policy_met' if _failed_ip(db,r['active_server_id'],now) else 'tcp_suspected_pending_recheck' if _carrier_suspect(db,r['active_server_id'],now) else 'unknown') if emergency else 'fault_restore' if restoring else 'scheduled_switch'
+    trigger=audit_trigger or trigger
+    audit_now=int(time.time())
+    transition=dict(binding_id=binding['id'],from_server_id=r['active_server_id'],to_server_id=target,from_ip=old_ip,to_ip=target_ip,submitted_at=submitted,confirmed_at=audit_now,ttl_s=ttl)
+    _event(db,rotation,r['active_server_id'],'DNS 已回读确认；记录切换来源状态',audit_now,kind='handoff_source_observed',trigger=trigger,transition=transition)
     immediate_repair=not _fixed(r) and emergency
     grace=0 if immediate_repair or (emergency and not offline) else ttl+60
     record_switch(db,rotation,binding,old_ip,target_ip,submitted,int(time.time()),ttl,proxied)
     if reuse_draining:
         _drain_timing(db,r,now,'skipped')
         _event(db,rotation,target,'故障应急接替：备用机现有 IP 已通过本次复检，跳过换 IP 接替；正常定时轮换仍须排空、换 IP 和复检',now)
-    restoring=not emergency and not _fixed(r) and r['status'].startswith('原机复测正常，保留原 IP 并立即切回')
     rotation_timing.change(db,rotation,target,target_ip,int(time.time()),'fault_switch' if emergency else 'fault_restore' if restoring else 'scheduled_switch')
     message=f"DNS 已从 {old_ip} 切换到 {target_ip}；等待旧 VPS #{r['active_server_id']} 连接降到阈值以下"
     if offline:message=f'承载 VPS 离线，DNS 已从 {old_ip} 切到 {target_ip}；旧机等待恢复，未执行换 IP'
@@ -975,7 +985,7 @@ def _finish_dns_switch(db,r,binding,rotation,target,old_ip,target_ip,ttl,submitt
         message=f'所选线路解析已切入轮换 VPS #{target}；主 VPS 保持原 IP；到时切回主 VPS'
         db.execute("UPDATE vps_rotations SET active_server_id=?,phase='active',drain_server_id=NULL,emergency=0,status=?,next_switch_at=?,updated=? WHERE id=?",(target,message,now+r['interval_s'],now,rotation))
         db.execute('UPDATE dns_bindings SET status=? WHERE id=?',(message,binding['id']))
-        _event(db,rotation,target,message,now)
+        _event(db,rotation,target,message,audit_now,kind='dns_switch_confirmed',trigger=trigger,transition=transition)
         return
     db.execute("UPDATE vps_rotations SET active_server_id=?,phase='draining',emergency_probe_after=NULL,drain_server_id=?,drain_started=?,drain_grace_s=?,old_ip=?,new_ip=NULL,action_started=NULL,reboot_command_id=NULL,last_sample_at=NULL,low_samples=0,status=?,next_switch_at=?,updated=? WHERE id=?",(target,r['active_server_id'],now,grace,old_ip,message,now+r['interval_s']-r['lead_s'],now,rotation))
     db.execute('UPDATE vps_rotations SET emergency=?,low_samples=? WHERE id=?',(int(emergency and not offline),2 if emergency and not offline else 0,rotation))
@@ -990,8 +1000,8 @@ def _finish_dns_switch(db,r,binding,rotation,target,old_ip,target_ip,ttl,submitt
     db.execute('UPDATE vps_rotations SET repair_check_required=?,repair_check=NULL WHERE id=?',(int(emergency and not _fixed(r)),rotation))
     db.execute('UPDATE vps_rotations SET standby_ready_at=NULL,standby_ready_server=NULL,preload_refresh_deadline=NULL,preload_base_attempt=NULL,reused_ip=NULL,reused_server_id=NULL,drain_base_attempt=action_attempts WHERE id=?',(rotation,))
     _drain_timing(db,db.execute('SELECT * FROM vps_rotations WHERE id=?',(rotation,)).fetchone(),now,start=True)
-    _event(db,rotation,r['active_server_id'],message,now)
     _sync_ip_allowance(db,rotation,int(time.time()))
+    _event(db,rotation,target,message,audit_now,kind='dns_switch_confirmed',trigger=trigger,transition=transition)
 
 
 def _sync_ip_allowance(db,rid,now,shorten_only=False):
@@ -1179,7 +1189,7 @@ def _run_rotation(connect,cipher,rid,now):
                 address,_,_=_fresh_ip(db,standby,now,cipher)
                 message='承载前 5 分钟刷新备用 IP：重新确认连续两次 TCP 低于阈值，再换 IP 并复检；保留原定切换时间'
                 db.execute("UPDATE vps_rotations SET phase='draining',drain_server_id=?,drain_started=?,drain_grace_s=0,old_ip=?,new_ip=NULL,action_started=NULL,reboot_command_id=NULL,last_sample_at=NULL,low_samples=0,emergency=0,drain_base_attempt=action_attempts,preload_base_attempt=action_attempts,preload_refresh_deadline=?,status=?,updated=? WHERE id=?",(standby,now,address,r['next_switch_at'],message,now,rid))
-                _event(db,rid,standby,message,now)
+                _event(db,rid,standby,message,now,kind='preload_refresh',trigger='final_five_minutes')
                 return
             if r['next_switch_at']-now<=max(60,r['lead_s']):
                 for sid in (r['active_server_id'],standby):
@@ -1257,6 +1267,7 @@ def _run_rotation(connect,cipher,rid,now):
                 _drain_timing(db,r,now,'unobserved')
                 db.execute("UPDATE vps_rotations SET phase='waiting_probe',new_ip=?,action_started=COALESCE(action_started,?),status=?,updated=? WHERE id=?",(ip,now,'旧 VPS IP 已变化，等待 BOCE 复检',now,rid))
                 _request_new_ip_probe(db,old,ip,port,now,urgent=bool(r['urgent_probe_floors']))
+                _event(db,rid,old,'已观察到新 IP，等待复检',now,kind='new_ip_observed')
                 return
             stamp=metrics.get('connections_sampled');count=metrics.get('tcp')
             if not r['emergency']:
@@ -1305,11 +1316,14 @@ def _run_rotation(connect,cipher,rid,now):
                 if not message.startswith('已排队'):
                     db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',(message,now,rid));return
                 command=db.execute("SELECT id FROM commands WHERE server_id=? AND action='reboot' AND status='queued' ORDER BY id DESC LIMIT 1",(old,)).fetchone()
-                db.execute("UPDATE vps_rotations SET phase='waiting_ip',repair_check_required=0,repair_check=NULL,action_started=?,reboot_command_id=?,action_attempts=action_attempts+1,status=?,updated=? WHERE id=?",(now,command['id'] if command else None,message+'；等待重启后的新 IP，原 IP 不变将核对完成状态后继续重试',now,rid));return
+                db.execute("UPDATE vps_rotations SET phase='waiting_ip',repair_check_required=0,repair_check=NULL,action_started=?,reboot_command_id=?,action_attempts=action_attempts+1,status=?,updated=? WHERE id=?",(now,command['id'] if command else None,message+'；等待重启后的新 IP，原 IP 不变将核对完成状态后继续重试',now,rid))
+                _event(db,rid,old,'重启换 IP 动作已排队，等待新 IP',now,kind='reboot_queued')
+                return
             try:action=load_connection(db,cipher,plan['action_connection_id'])
             except IntegrationError as e:db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',(str(e),now,rid));return
             server=db.execute('SELECT name FROM servers WHERE id=?',(old,)).fetchone()
             db.execute('UPDATE vps_rotations SET phase=\'waiting_ip\',repair_check_required=0,repair_check=NULL,action_started=?,action_attempts=action_attempts+1,status=?,updated=? WHERE id=?',(now,'连接数达标，已发起旧 VPS 换 IP；等待新 IP',now,rid))
+            _event(db,rid,old,'准备提交换 IP，尚未确认供应商执行结果',now,kind='ip_change_prepared',trigger='emergency_repair' if r['emergency'] else 'forced_drain' if forced else 'drain_completed')
             item={'id':rid,'server_id':old,'ip':ip,'name':server['name'] if server else str(old)}
         elif r['phase']=='waiting_ip':
             try:ip,port,_=_fresh_ip(db,old,now,cipher)
@@ -1317,6 +1331,7 @@ def _run_rotation(connect,cipher,rid,now):
             if ip!=r['old_ip']:
                 db.execute("UPDATE vps_rotations SET phase='waiting_probe',new_ip=?,action_started=CASE WHEN mode='fixed_primary' THEN ? ELSE action_started END,status=?,updated=? WHERE id=?",(ip,now,'新 IP 已上报，等待所选检测点复检',now,rid))
                 _request_new_ip_probe(db,old,ip,port,now,urgent=bool(r['urgent_probe_floors']))
+                _event(db,rid,old,'已观察到新 IP，等待复检',now,kind='new_ip_observed')
                 return
             if r['action_started'] and now-r['action_started']<60:
                 db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('换 IP 请求已发出，观察 60 秒内的 IP 变化',now,rid));return
@@ -1362,6 +1377,7 @@ def _run_rotation(connect,cipher,rid,now):
             server=db.execute('SELECT name FROM servers WHERE id=?',(old,)).fetchone()
             if not action:db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('等待有效的旧 VPS 换 IP API',now,rid));return
             db.execute('UPDATE vps_rotations SET action_started=?,action_attempts=action_attempts+1,status=?,updated=? WHERE id=?',(now,'未观察到 IP 变化，重试换 IP API',now,rid))
+            _event(db,rid,old,'未观察到 IP 变化，准备重试换 IP',now,kind='ip_change_prepared',trigger='retry_no_ip_change')
             item={'id':rid,'server_id':old,'ip':ip,'name':server['name'] if server else str(old)}
         elif r['phase']=='waiting_probe':
             try:ip,port,_=_fresh_ip(db,old,now,cipher)
@@ -1398,7 +1414,7 @@ def _run_rotation(connect,cipher,rid,now):
             db.execute("UPDATE vps_rotations SET phase='active',emergency=0,drain_server_id=NULL,drain_started=NULL,drain_grace_s=0,old_ip=NULL,new_ip=NULL,action_started=NULL,reboot_command_id=NULL,last_sample_at=NULL,low_samples=0,next_switch_at=?,status=?,updated=? WHERE id=?",(next_at,message,now,rid))
             db.execute('UPDATE vps_rotations SET fault_recovery=0 WHERE id=?',(rid,))
             if not _fixed(r):db.execute('UPDATE vps_rotations SET standby_ready_at=?,standby_ready_server=?,reused_ip=NULL,reused_server_id=NULL,drain_base_attempt=NULL WHERE id=?',(now,old,rid))
-            _event(db,rid,old,message,now)
+            _event(db,rid,old,message,now,kind='standby_ready',trigger='new_ip_recheck_passed')
             if not _fixed(r) and r['enabled'] and (next_at<=now or r['emergency_probe_after'] is not None):
                 ready=db.execute('SELECT * FROM vps_rotations WHERE id=?',(rid,)).fetchone()
                 if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='rotation_recovery_timings'").fetchone():record_progress(db,r,ready,now)
@@ -1411,24 +1427,29 @@ def _run_rotation(connect,cipher,rid,now):
             return
         else:
             db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('轮换状态异常，请暂停后检查',now,rid));return
+    audit_kind='ip_change_returned'
     try:
         if action['kind']!='change_ip':raise IntegrationError('配置的连接不是换 IP API')
         message=invoke_change_ip_api(action,item['server_id'],item['name'],item['ip'])
         status=str(message)+'；等待 agent 上报新 IP'
     except ChangeIPUncertain as e:
+        audit_kind='ip_change_uncertain'
         status='换 IP 请求结果不确定：'+str(e)+'；先等待 IP 上报核对'
     except IntegrationError as e:
         # A definite provider rejection is retried on the next worker pass.
         detail=str(e).replace(action.get('secret',''),'[已隐藏]') if action.get('secret') else str(e)
-        with connect() as db:db.execute("UPDATE vps_rotations SET phase='draining',action_started=NULL,status=?,updated=? WHERE id=?",('换 IP 请求失败，将立即重试：'+detail[:700],int(time.time()),rid))
+        with connect() as db:
+            db.execute("UPDATE vps_rotations SET phase='draining',action_started=NULL,status=?,updated=? WHERE id=?",('换 IP 请求失败，将立即重试：'+detail[:700],int(time.time()),rid))
+            _event(db,rid,item['server_id'],'换 IP 请求失败（本地校验或供应商拒绝）',int(time.time()),kind='ip_change_rejected',trigger='local_configuration' if action['kind']!='change_ip' else 'provider_rejected')
         return
     except Exception:
+        audit_kind='ip_change_uncertain'
         status='换 IP 请求结果不确定；等待 IP 上报核对后再重试'
     if action.get('secret'):status=status.replace(action['secret'],'[已隐藏]')
     status=status[:800]
     with connect() as db:
         db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',(status,int(time.time()),rid))
-        _event(db,rid,item['server_id'],status,int(time.time()))
+        _event(db,rid,item['server_id'],status,int(time.time()),kind=audit_kind)
 
 def _sync_external_dns(connect,cipher,rid,now,force=False):
     """Every five minutes enforce the selected record's effective carrier."""
@@ -1483,7 +1504,7 @@ def _sync_external_dns(connect,cipher,rid,now,force=False):
                 raise IntegrationError('DNS 自动纠正尚未回读确认，将在下轮核对时重试')
             message=f'定期核对已纠正 DNS：{actual} → {target_ip}；保持当前承载与轮换计时'
             db.execute('UPDATE dns_bindings SET expected_ip=?,status=?,updated=? WHERE id=?',(target_ip,message,now,binding['id']))
-            _event(db,rid,r['active_server_id'],message,now)
+            _event(db,rid,r['active_server_id'],message,now,kind='external_dns_corrected',trigger='external_dns_mismatch',transition=dict(binding_id=binding['id'],from_ip=actual,to_ip=target_ip,confirmed_at=now))
         else:
             db.execute('UPDATE dns_bindings SET expected_ip=? WHERE id=?',(target_ip,binding['id']))
         if realign:
@@ -1492,7 +1513,7 @@ def _sync_external_dns(connect,cipher,rid,now,force=False):
             except (TypeError,ValueError):ttl=300
             ttl=300 if ttl<=1 else ttl
             _finish_dns_switch(db,r,binding,rid,target,binding['expected_ip'],target_ip,ttl,now,now,
-                               False,False,False,bool(record.get('proxied',False)))
+                               False,False,False,bool(record.get('proxied',False)),audit_trigger='group_realigned')
             _event(db,rid,target,f'历史分叉线路已核对并跟随计划 #{root["id"]} 的统一承载目标；保留计划截止时间，重新等待本线路 TTL 与连接排空',now)
         elif not lease and binding['expected_ip']!=target_ip:
             rotation_timing.change(db,rid,target,target_ip,now,'carrier_ip_observed')

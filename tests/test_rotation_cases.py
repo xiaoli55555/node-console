@@ -6,6 +6,8 @@ from ip_dns import IntegrationError
 
 class RotationConditions(unittest.TestCase):
     def setUp(self):
+        # This state-machine fixture omits monitoring tables; full-schema tests exercise audit evidence.
+        audit=patch('rotation.rotation_audit.capture');audit.start();self.addCleanup(audit.stop)
         # State-machine unit tests inject a confirmed heartbeat result; the
         # real probe guard is exercised in test_rotation_heartbeat_guard.
         guard=patch('rotation._heartbeat_confirmed',return_value=True);guard.start();self.addCleanup(guard.stop)
