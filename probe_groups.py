@@ -17,6 +17,8 @@ def initialize(db):
       PRIMARY KEY(parent_id,kind,node_id));
       CREATE INDEX IF NOT EXISTS self_probe_queue ON self_probe_tasks(source_id,node_id,state);''')
 
+    columns={r[1] for r in db.execute('PRAGMA table_info(self_probe_tasks)')}
+    if 'claimed_at' not in columns:db.execute('ALTER TABLE self_probe_tasks ADD COLUMN claimed_at INTEGER')
 
 def nodes(db,source):
     now=int(time.time())
@@ -96,7 +98,7 @@ def gate(db,run,wanted):
 
 def claim(db,source,now,kind='primary'):
     node=source.get('probe_node_id','self')
-    rows=db.execute('SELECT t.* FROM self_probe_tasks t JOIN detection_runs r ON r.id=t.parent_id WHERE t.source_id=? AND t.node_id=? AND t.kind=? AND t.state=\'queued\' AND r.created>? ORDER BY t.parent_id LIMIT 50',(source['id'],node,kind,now-120)).fetchall()
+    rows=db.execute('SELECT t.* FROM self_probe_tasks t JOIN detection_runs r ON r.id=t.parent_id WHERE t.source_id=? AND t.node_id=? AND t.kind=? AND (t.state=\'queued\' OR (t.state=\'issued\' AND COALESCE(t.claimed_at,0)<=?)) AND r.created>? ORDER BY t.parent_id LIMIT 50',(source['id'],node,kind,now-30,now-120)).fetchall()
     for task in rows:
         run=db.execute('SELECT * FROM detection_runs WHERE id=?',(task['parent_id'],)).fetchone()
         if task['identity']!=identity(db,source['id'],node):continue
@@ -104,7 +106,7 @@ def claim(db,source,now,kind='primary'):
         if not p or not p['enabled'] or run['status'] not in ('queued','issued') or p['source_id']!=run['source_id'] or p['nodes']!=run['nodes'] or p['port']!=run['port']:continue
         db.execute("UPDATE detection_runs SET status='issued',updated=? WHERE id=?",(now,run['id']))
         job_id=run['id']
-        db.execute("UPDATE self_probe_tasks SET state='issued' WHERE parent_id=? AND kind=? AND node_id=?",(run['id'],kind,node))
+        db.execute("UPDATE self_probe_tasks SET state='issued',claimed_at=? WHERE parent_id=? AND kind=? AND node_id=?",(now,run['id'],kind,node))
         return {'id':job_id,'ip':run['ip'],'port':run['port']}
     return None
 

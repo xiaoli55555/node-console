@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Outbound-only panel worker and standalone TCP diagnostic."""
 import argparse
+import os
+import hashlib
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 import ipaddress
 import json
 import socket
@@ -39,6 +43,24 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def load_pending(path):
+    try:
+        data = json.loads(path.read_text())
+        return {k: v for k, v in data.items() if time.time()-v['created'] <= 120}
+    except FileNotFoundError:
+        return {}
+
+
+def save_pending(path, pending):
+    temporary = path.with_suffix('.tmp')
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(pending, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temporary, path)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('config', nargs='?')
@@ -65,31 +87,58 @@ def main():
         with opener.open(req, timeout=15) as response:
             return json.load(response)
 
-    pending = None
-    while True:
-        try:
-            if pending is None:
-                job = post('/api/probe/jobs', {}).get('job')
-                if job:
-                    result = measure(job['ip'], job['port'])
-                    pending = (int(job['id']), result, time.monotonic())
-            if pending:
-                rid, result, created = pending
-                if time.monotonic()-created > 60:
-                    print('Result expired; discarded (not a target failure)', flush=True)
-                    pending = None
+    state_dir = Path(os.environ.get('STATE_DIRECTORY') or config.get('state_dir', '/var/lib/hksdan-probe'))
+    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    scope = hashlib.sha256((url+'|'+config['token']).encode()).hexdigest()
+    state_file = state_dir / ('pending-'+scope+'.json')
+    pending = load_pending(state_file)
+    active = {}
+    uploads = {}
+    workers = max(1, min(8, int(config.get('max_workers', 4))))
+    with ThreadPoolExecutor(max_workers=workers*2) as pool:
+        while True:
+            for rid, (job, future) in list(active.items()):
+                if not future.done():continue
+                try:
+                    pending[str(rid)] = {'result': future.result(), 'created': time.time()}
+                    save_pending(state_file, pending)
+                except Exception as exc:
+                    print('Measurement failed: '+type(exc).__name__, flush=True)
+                del active[rid]
+            # Uploads run independently so a slow panel request cannot block other results.
+            for rid, future in list(uploads.items()):
+                if not future.done():continue
+                discard = False
+                try:
+                    future.result()
+                    print(json.dumps({'job_id': int(rid), **pending[rid]['result']}), flush=True)
+                    discard = True
+                except urllib.error.HTTPError as exc:
+                    discard = exc.code in (400, 404, 409)
+                    print('Upload HTTP error '+str(exc.code), flush=True)
+                except Exception as exc:
+                    print('Upload failed: '+type(exc).__name__+'; saved for retry', flush=True)
+                del uploads[rid]
+                if discard:
+                    del pending[rid]
+                    save_pending(state_file, pending)
+            for rid, item in list(pending.items()):
+                if rid in uploads:continue
+                if time.time()-item['created'] > 120:
+                    del pending[rid]
+                    save_pending(state_file, pending)
                 else:
-                    post('/api/probe/results/'+str(rid), result)
-                    print(json.dumps({'job_id': rid, **result}), flush=True)
-                    pending = None
-        except urllib.error.HTTPError as exc:
-            print('Panel HTTP error '+str(exc.code)+'; check source/token/connectivity', flush=True)
-            if exc.code in (400, 404, 409):
-                pending = None
-        except Exception as exc:
-            # Never log URLs, headers, tokens or server response bodies.
-            print('Probe cycle failed: '+type(exc).__name__+'; retrying', flush=True)
-        time.sleep(poll)
+                    uploads[rid] = pool.submit(post, '/api/probe/results/'+rid, item['result'])
+            if len(active)+len(pending) < workers:
+                try:
+                    job = post('/api/probe/jobs', {}).get('job')
+                    if job and int(job['id']) not in active and str(job['id']) not in pending:
+                        active[int(job['id'])] = (job, pool.submit(measure, job['ip'], job['port']))
+                except urllib.error.HTTPError as exc:
+                    print('Poll HTTP error '+str(exc.code)+'; check source/token', flush=True)
+                except Exception as exc:
+                    print('Poll failed: '+type(exc).__name__+'; retrying', flush=True)
+            time.sleep(poll)
 
 
 if __name__ == '__main__':
