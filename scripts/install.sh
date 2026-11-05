@@ -25,6 +25,8 @@ fi
 umask 077
 printf 'PANEL_DOMAIN=%s\n' "$PANEL_DOMAIN" > .env
 echo '构建服务（首次需要下载镜像和依赖）……'
+APP_COMMIT=$(git rev-parse HEAD)
+export APP_COMMIT
 docker compose build --pull
 echo '配置管理员账号：'
 docker compose run --rm app python server.py admin

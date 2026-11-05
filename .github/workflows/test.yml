@@ -18,7 +18,7 @@ jobs:
       - run: node --test tests/*.cjs
       - run: bash -n scripts/*.sh agent/install.sh
       - run: PANEL_DOMAIN=panel.example.com docker compose config --quiet
-      - run: docker build -t hk-sdan:test .
+      - run: docker build --build-arg APP_COMMIT=${{ github.sha }} -t hk-sdan:test .
       - name: Container health smoke test
         run: |
           docker run -d --name hksdan-test -p 127.0.0.1:8080:8080 hk-sdan:test
