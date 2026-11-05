@@ -11,6 +11,8 @@ from agent.agent import tcp_port_counts
 
 class FixedPrimary(unittest.TestCase):
     def setUp(self):
+        # This state-machine fixture omits monitoring tables; full-schema tests exercise audit evidence.
+        audit=patch('rotation.rotation_audit.capture');audit.start();self.addCleanup(audit.stop)
         guard=patch('rotation._heartbeat_confirmed',return_value=True);guard.start();self.addCleanup(guard.stop)
         self.tmp=tempfile.TemporaryDirectory();self.path=Path(self.tmp.name)/'test.db'
         rotation.initialize(self.connect)

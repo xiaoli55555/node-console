@@ -26,6 +26,19 @@ class OriginalEmergencyProbe(unittest.TestCase):
         f.advance(2,online=('A','B'));f.tick()
         self.assertLess(f.clock[0],deadline)
         self.assertEqual(f.value('mobile'),'1.1.1.1');self.assertIsNone(f.row()['emergency_probe_after'])
+        with server.connect() as db:
+            records=db.execute("SELECT kind,evidence FROM rotation_audit WHERE rotation_id=? ORDER BY event_id",(f.rid,)).fetchall()
+        import json
+        completed=[json.loads(x['evidence']) for x in records if x['kind']=='dns_switch_confirmed']
+        self.assertEqual(len(completed),1)
+        event=completed[0]
+        self.assertEqual(event['state']['active_server_id'],f.sid('B'))
+        self.assertEqual(event['transition']['from_ip'],'8.8.8.8')
+        self.assertEqual(event['transition']['to_ip'],'1.1.1.1')
+        self.assertNotEqual(event['trigger'],'scheduled_switch')
+        # The snapshot must retain source evidence even though DNS now uses B.
+        self.assertIn(f.sid('A'),[x['server_id'] for x in event['servers']])
+
     def test_fresh_failed_round_does_not_publish_standby(self):
         f=self.f
         with self.assertRaises(IntegrationError):rotation._dns_switch(server.connect,server.CIPHER,f.rid,f.clock[0],emergency=True)
