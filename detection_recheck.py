@@ -1,4 +1,5 @@
 """Independent-point confirmation of the same TCP target; never invent primary evidence."""
+import probe_groups
 import hashlib
 import json
 import time
@@ -34,11 +35,14 @@ def confirmation_source(db,p):
     source=db.execute('SELECT * FROM detection_sources WHERE id=?',(sid,)).fetchone()
     if not source or not source['enabled'] or source['owner_id'] is not None:
         raise IntegrationError('复检来源已暂停或不可用')
+    if source['kind']=='self':
+        probe_groups.validate(db,source,[p['confirm_node']])
+        return dict(source,probe_identity=probe_groups.identity(db,source['id'],p['confirm_node']))
     return source
 
 
 def source_signature(source):
-    return hashlib.sha256((str(source['id'])+'|'+source['kind']+'|'+source['secret']).encode()).hexdigest()
+    return hashlib.sha256((str(source['id'])+'|'+source['kind']+'|'+source['secret']+('|' + str(dict(source)['probe_identity']) if 'probe_identity' in dict(source) else '')).encode()).hexdigest()
 
 
 def reference_profile(db,r,p):
@@ -53,6 +57,7 @@ def failed(rows,nodes):
 
 
 def confirmed(db,plan,run):
+    if not probe_groups.gate(db,run,'unreachable'):return False
     node=dict(plan).get('confirm_node')
     if not node:
         row=db.execute('SELECT * FROM detection_rechecks WHERE parent_id=?',(run['id'],)).fetchone()
@@ -146,9 +151,9 @@ def _reserve_cost(db,r,cost,now):
     db.execute('UPDATE detection_runs SET cost=cost+? WHERE id=?',(cost,r['id']))
 
 
-def reference_nodes(r,job):
+def reference_nodes(r,job,p=None):
     if dict(job).get('confirm_source_id'):
-        return [job['node']] if json.loads(r['nodes'])==['self'] else list(map(str,json.loads(r['nodes'])))
+        return [job['node']] if (p and p['kind']=='self') or json.loads(r['nodes'])==['self'] else list(map(str,json.loads(r['nodes'])))
     nodes=list(map(str,json.loads(r['nodes'])))
     if job['node'] and job['node'] not in nodes:nodes.append(job['node'])
     return nodes
@@ -184,7 +189,7 @@ def _submit_references(db,job,r,p,cipher,now):
     if profile is None:
         db.execute("UPDATE detection_rechecks SET stage='self_pair' WHERE parent_id=?",(r['id'],))
         return _submit(db,dict(job,stage='self_pair'),r,p,cipher,now)
-    nodes=reference_nodes(r,job)
+    nodes=reference_nodes(r,job,p)
     if not _budget(db,r,p,now,len(nodes)*len(REFERENCE_HOSTS)):
         _stop(db,job,'unknown','双参照站检测额度不足，本轮不通判定已撤销',now);return False
     jobs={host:{'state':'creating','submitted':now,'poll_at':now,'details':[]} for host in REFERENCE_HOSTS}
@@ -235,7 +240,7 @@ def _poll_references(connect,cipher,parent_id,now):
         db.commit()
     # HTTP waits never hold the SQLite writer lock for reference station checks.
     if profile is None:return False
-    secret=d.source_secret(profile,cipher);nodes=reference_nodes(r,job)
+    secret=d.source_secret(profile,cipher);nodes=reference_nodes(r,job,p)
     def poll(host):
         try:return host,_provider_poll(profile,secret,jobs[host],nodes),None
         except Exception:return host,[], '参照站接口异常，结果未知'
@@ -348,7 +353,7 @@ def _poll_target(connect,cipher,parent_id,now):
 
 
 def claim_self(db,source,cipher,now):
-    rows=db.execute("SELECT * FROM detection_rechecks WHERE confirm_source_id=? AND stage IN ('target','self_pair') AND state='pending' AND remote_id='self:queued' ORDER BY parent_id LIMIT 50",(source['id'],)).fetchall()
+    rows=db.execute("SELECT c.* FROM detection_rechecks c JOIN detection_runs r ON r.id=c.parent_id WHERE COALESCE(c.confirm_source_id,r.source_id)=? AND c.node=? AND c.stage IN ('target','self_pair') AND c.state='pending' AND c.remote_id='self:queued' ORDER BY c.parent_id LIMIT 50",(source['id'],source.get('probe_node_id','self'))).fetchall()
     for job in rows:
         valid=_valid(db,job,cipher,now)
         if not valid:
@@ -362,13 +367,13 @@ def claim_self(db,source,cipher,now):
 
 
 def finish_self(db,source,cipher,parent_id,data,now):
-    job=db.execute("SELECT * FROM detection_rechecks WHERE parent_id=? AND confirm_source_id=? AND state='pending' AND remote_id='self:issued'",(parent_id,source['id'])).fetchone()
+    job=db.execute("SELECT c.* FROM detection_rechecks c JOIN detection_runs r ON r.id=c.parent_id WHERE c.parent_id=? AND COALESCE(c.confirm_source_id,r.source_id)=? AND c.node=? AND c.state='pending' AND c.remote_id='self:issued'",(parent_id,source['id'],source.get('probe_node_id','self'))).fetchone()
     if not job or now-(job['submitted'] or job['created'])>120:return False
     valid=_valid(db,job,cipher,now)
     if not valid:return False
     r,p=valid
     if data.get('ip')!=r['ip'] or type(data.get('port'))is not int or data['port']!=r['port']:return False
-    rows=[{'node_id':'self','name':source['name'],'state':'reachable' if data['reachable'] else 'unreachable','latency_ms':data.get('latency_ms')}]
+    rows=[{'node_id':source.get('probe_node_id','self'),'name':source.get('probe_node_name',source['name']),'state':'reachable' if data['reachable'] else 'unreachable','latency_ms':data.get('latency_ms')}]
     _apply(db,job,r,p,now,rows)
     return True
 
@@ -404,10 +409,11 @@ def tick(connect,cipher,server_ids=None):
 
 def snapshot(db,parent_id):
     row=db.execute('SELECT * FROM detection_rechecks WHERE parent_id=?',(parent_id,)).fetchone()
-    if not row:return None
+    group=probe_groups.snapshot(db,parent_id)
+    if not row:return {'probe_group':group} if group else None
     source=db.execute('SELECT name FROM detection_sources WHERE id=?',(row['confirm_source_id'],)).fetchone() if row['confirm_source_id'] else None
     confirmation={'source_id':row['confirm_source_id'],'source_name':source['name'] if source else '与首轮相同来源','node':row['node'],'state':row['state'],'details':json.loads(row['details'])} if row['node'] else None
-    return {'confirmation':confirmation,'host':REFERENCE_HOST,'hosts':list(REFERENCE_HOSTS),'stations':[dict(value,host=host,port=80) for host,value in json.loads(row['reference_jobs']).items()],'port':REFERENCE_PORT,'parent_id':parent_id,
+    return {'probe_group':group,'confirmation':confirmation,'host':REFERENCE_HOST,'hosts':list(REFERENCE_HOSTS),'stations':[dict(value,host=host,port=80) for host,value in json.loads(row['reference_jobs']).items()],'port':REFERENCE_PORT,'parent_id':parent_id,
             'stage':row['stage'],'state':row['state'],'passed':bool(row['reference_passed']),'confirm_source_id':row['confirm_source_id'],'reference_required':row['stage']!='self_pair',
             'checked':row['reference_checked'],'details':json.loads(row['reference_details']),
             'message':row['message'] or '使用原检测点加测参照站，等待结果'}

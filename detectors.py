@@ -1,6 +1,7 @@
 """Replaceable detection sources: BOCE asynchronous tasks or authenticated self-hosted probes."""
 import aliyun_probe
 import baota_probe
+import probe_groups
 import detection_recheck
 import incident_history
 import hashlib
@@ -68,6 +69,7 @@ def initialize(connect):
             existing={r[1] for r in db.execute('PRAGMA table_info('+table+')')}
             for name,definition in columns.items():
                 if name not in existing:db.execute(f'ALTER TABLE {table} ADD COLUMN {name} {definition}')
+        probe_groups.initialize(db)
         db.execute('CREATE INDEX IF NOT EXISTS detection_recovery_status ON detection_runs(action_status,id)')
         db.execute("UPDATE detection_runs SET action_attempted=? WHERE action_attempted IS NULL AND action_status IN ('issued','submitted','uncertain')",(int(time.time()),))
 
@@ -75,8 +77,10 @@ _source_nodes_cache={}
 _source_nodes_locks={}
 _source_nodes_guard=threading.Lock()
 
-def source_nodes(source,cipher):
+def source_nodes(source,cipher,connect=None):
     if source['kind']=='self':
+        if connect:
+            with connect() as db:return probe_groups.nodes(db,source),False
         seen=source['last_seen']
         online=bool(source['enabled'] and seen and int(time.time())-int(seen)<=35)
         return [{'id':'self','name':source['name'],'isp':'自建探针','online':online,'last_seen':seen}],False
@@ -176,8 +180,8 @@ def record_incident(db,run,plan,rows,now):
     expected=set(json.loads(run['nodes']))
     complete=bool(expected) and len(rows)==len(expected) and {str(x.get('node_id')) for x in rows}==expected
     states=[x.get('state') for x in rows]
-    failed=online and complete and all(x=='unreachable' for x in states)
-    healthy=online and complete and all(x=='reachable' for x in states)
+    failed=online and complete and all(x=='unreachable' for x in states) and probe_groups.gate(db,run,'unreachable')
+    healthy=online and complete and all(x=='reachable' for x in states) and probe_groups.gate(db,run,'reachable')
     if healthy:
         if active:db.execute("UPDATE detection_incidents SET state='recovered',closed_at=?,last_run=? WHERE id=?",(now,run['id'],active['id']))
         return
@@ -220,7 +224,7 @@ def finish(db,run,status,rows,recheck_confirmed=False,reference_confirmed=False)
         if new_evidence:incident_history.coverage_result(db,run,rows,now)
         confirm_node=dict(plan).get('confirm_node')
         scheduled=bool(run['scheduled']) if 'scheduled' in run.keys() else False
-        if scheduled and plan['automatic'] and (confirm_node or plan['source_kind'] in ('boce','baota','aliyun')):
+        if scheduled and plan['automatic'] and probe_groups.gate(db,run,'unreachable') and (confirm_node or plan['source_kind'] in ('boce','baota','aliyun')):
             if not reference_confirmed and not recheck_confirmed and detection_recheck.enqueue(db,run,plan,rows,now):
                 db.execute('UPDATE detection_runs SET incident_evidence=COALESCE(incident_evidence,?) WHERE id=?',(json.dumps(incident_history.snapshot(db,run['server_id'],run['ip'],now)),run['id']))
                 return
@@ -240,7 +244,7 @@ def finish(db,run,status,rows,recheck_confirmed=False,reference_confirmed=False)
         if scheduled and plan['action_enabled'] and run['id']>plan['action_after_run'] and not rotation_managed:
             recovering=db.execute("SELECT 1 FROM detection_runs WHERE server_id=? AND action_status='verifying' LIMIT 1",(run['server_id'],)).fetchone()
             complete_failure=bool(rows) and (all(r.get('state')=='unreachable' for r in rows) or (recovering and all(r.get('state') in ('reachable','unreachable') for r in rows) and any(r.get('state')=='unreachable' for r in rows)))
-            complete_failure=complete_failure and (not confirm_node or recheck_confirmed)
+            complete_failure=complete_failure and (not confirm_node or recheck_confirmed) and probe_groups.gate(db,run,'unreachable')
             if complete_failure:
                 same_target=plan['failure_ip']==run['ip'] and plan['failure_port']==run['port']
                 streak=streak+1 if same_target else 1
@@ -300,7 +304,7 @@ def start_run(connect,cipher,sid,scheduled=False):
             if m['source_id'] or (node and node['seen'] and 0<=now-node['seen']<=90):raise
             from rotation import heartbeat_probe_target
             ip=heartbeat_probe_target(db,sid,m['port'],now)
-        nodes=json.loads(p['nodes']) if p['kind'] in ('boce','aliyun','baota') else ['self']
+        nodes=json.loads(p['nodes'])
         if not nodes:raise IntegrationError('请至少选择一个国内检测点')
         cost=len(nodes) if p['kind'] in ('boce','aliyun','baota') else 0
         from datetime import datetime
@@ -311,6 +315,8 @@ def start_run(connect,cipher,sid,scheduled=False):
         used=detection_recheck.daily_usage(db,primary,today)
         if used+cost>p['daily_limit']:raise IntegrationError('已达到此 VPS 的每日节点检测次数上限')
         rid=db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,poll_at,cost,scheduled) VALUES(?,?,?,?,?,'creating',?,?,?,?,?)",(sid,p['source_id'],ip,m['port'],json.dumps(nodes),now,now,now+10,cost,int(scheduled))).lastrowid
+        run=db.execute('SELECT * FROM detection_runs WHERE id=?',(rid,)).fetchone()
+        if p['kind']=='self':probe_groups.create_tasks(db,run,p['source_id'],nodes)
         if primary!=sid:db.execute('INSERT INTO vps_failover_probe_costs(run_id,primary_server_id) VALUES(?,?)',(rid,primary))
         db.execute('UPDATE detection_plans SET next_at=?,status=? WHERE server_id=?',(now+p['interval_s'],'检测中',sid))
         try:
@@ -477,10 +483,16 @@ def register(app,connect,cipher,auth,body,error,audit):
     def detection_overview():
         with connect() as db:
             sources=[{k:r[k] for k in ('id','name','kind','enabled','last_seen','verified_at')} for r in db.execute('SELECT * FROM detection_sources')]
+            for source in sources:
+                if source['kind']=='self':
+                    source['nodes']=probe_groups.nodes(db,db.execute('SELECT * FROM detection_sources WHERE id=?',(source['id'],)).fetchone())
+                    source['last_seen']=max((n['last_seen'] or 0 for n in source['nodes']),default=0) or None
             plans=[dict(r) for r in db.execute('SELECT p.*,m.port FROM detection_plans p JOIN ip_monitors m ON m.server_id=p.server_id')]
             runs=[dict(r) for r in db.execute('SELECT id,server_id,source_id,ip,port,status,created,updated,details,action_result,action_status FROM detection_runs ORDER BY id DESC LIMIT 50')]
-            for run in runs:run['reference']=detection_recheck.snapshot(db,run['id'])
-        for p in plans:p['nodes']=json.loads(p['nodes'])
+            for run in runs:
+                run['reference']=detection_recheck.snapshot(db,run['id'])
+        for p in plans:
+            p['nodes']=json.loads(p['nodes'])
         for r in runs:r['details']=json.loads(r['details'])
         return jsonify(sources=sources,plans=plans,runs=runs)
 
@@ -542,6 +554,7 @@ def register(app,connect,cipher,auth,body,error,audit):
                 old=db.execute('SELECT * FROM detection_sources WHERE id=?',(d['id'],)).fetchone()
                 if not old or old['kind']!=kind:return error('检测来源不存在或类型不可更改')
                 if kind=='self' and secret:return error('自建探针密钥只能由系统生成')
+                if kind=='self' and bool(old['enabled'])!=enabled:probe_groups.cancel_pending(db,source_id=old['id'])
                 encrypted=cipher.encrypt(secret.encode()).decode() if secret else old['secret']
                 db.execute('UPDATE detection_sources SET name=?,secret=?,enabled=?,verified_at=CASE WHEN ? THEN NULL ELSE verified_at END WHERE id=?',(name.strip(),encrypted,int(enabled),int(bool(secret)),old['id']));sid=old['id']
             else:
@@ -550,6 +563,37 @@ def register(app,connect,cipher,auth,body,error,audit):
                 sid=db.execute('INSERT INTO detection_sources(name,kind,secret,enabled) VALUES(?,?,?,?)',(name.strip(),kind,cipher.encrypt(secret.encode()).decode(),int(enabled))).lastrowid
             audit(db,'保存检测来源 #'+str(sid))
         return jsonify(ok=True,id=sid,probe_token=token)
+
+    @app.post('/api/detection/sources/<int:sid>/probe-nodes')
+    @auth(admin=True)
+    def save_self_probe_node(sid):
+        d=body();name=d.get('name');enabled=d.get('enabled',True);nid=d.get('id')
+        if not isinstance(name,str) or not 1<=len(name.strip())<=80 or type(enabled)is not bool or (nid is not None and type(nid)is not int):return error('节点名称或开关格式无效')
+        token=None
+        with connect() as db:
+            source=db.execute("SELECT * FROM detection_sources WHERE id=? AND kind='self' AND owner_id IS NULL",(sid,)).fetchone()
+            if not source:return error('自建来源不存在',404)
+            if nid is not None:
+                old=db.execute('SELECT enabled FROM self_probe_nodes WHERE id=? AND source_id=?',(nid,sid)).fetchone()
+                if not old:return error('节点不存在',404)
+                if bool(old['enabled'])!=enabled:probe_groups.cancel_pending(db,source_id=sid,node_id='probe-'+str(nid))
+                db.execute('UPDATE self_probe_nodes SET name=?,enabled=? WHERE id=? AND source_id=?',(name.strip(),int(enabled),nid,sid))
+            else:
+                token=secrets.token_urlsafe(36)
+                nid=db.execute('INSERT INTO self_probe_nodes(source_id,name,secret,enabled) VALUES(?,?,?,?)',(sid,name.strip(),cipher.encrypt(token.encode()).decode(),int(enabled))).lastrowid
+            audit(db,'保存自建节点 #'+str(nid)+'，来源 #'+str(sid))
+        return jsonify(ok=True,node_id='probe-'+str(nid),id=nid,probe_token=token)
+
+    @app.delete('/api/detection/sources/<int:sid>/probe-nodes/<int:nid>')
+    @auth(admin=True)
+    def delete_self_probe_node(sid,nid):
+        key='probe-'+str(nid)
+        with connect() as db:
+            if not db.execute('SELECT 1 FROM self_probe_nodes WHERE id=? AND source_id=?',(nid,sid)).fetchone():return error('节点不存在',404)
+            for p in db.execute('SELECT * FROM detection_plans'):
+                if (p['source_id']==sid and key in json.loads(p['nodes'])) or ((p['confirm_source_id'] or p['source_id'])==sid and p['confirm_node']==key):return error('节点仍被检测计划使用，请先取消勾选')
+            db.execute('DELETE FROM self_probe_nodes WHERE id=? AND source_id=?',(nid,sid));audit(db,'删除自建节点 #'+str(nid))
+        return jsonify(ok=True)
 
     @app.post('/api/detection/sources/<int:sid>/test')
     @auth(admin=True)
@@ -561,14 +605,15 @@ def register(app,connect,cipher,auth,body,error,audit):
             if not s['enabled']:raise IntegrationError('检测来源已暂停，请先启用')
             now=int(time.time())
             if s['kind'] in ('boce','aliyun','baota'):
-                rows,cached=source_nodes(s,cipher)
+                rows,cached=source_nodes(s,cipher,connect)
                 label={'boce':'BOCE','aliyun':'阿里云','baota':'宝塔拨测'}[s['kind']]
                 message=f'{label} API 可用，读取到 {len(rows)} 个检测节点；未提交拨测任务'
                 if cached:message+='（复用最近 60 秒同一凭证验证的节点列表）'
             elif s['kind']=='self':
-                seen=s['last_seen']
-                if not seen or now-int(seen)>35:raise IntegrationError('自建探针未在线：检查探针服务、面板 HTTPS 地址及密钥；在线后等待 10–35 秒再测试')
-                message='自建探针在线，最近心跳 '+str(max(0,now-int(seen)))+' 秒前；实际 VPS 端口可达性需另行发起手动检测'
+                with connect() as db:children=probe_groups.nodes(db,s)
+                online=sum(n['online'] for n in children if n['enabled'])
+                if not online:raise IntegrationError('自建探针未在线：请检查节点服务、HTTPS 地址及独立密钥')
+                message=f'自建探针组在线，{online}/{sum(n["enabled"] for n in children)} 个节点在线；请在 VPS 配置中选择实际检测节点'
             else:raise IntegrationError('未知检测来源类型')
             with connect() as db:db.execute('UPDATE detection_sources SET verified_at=? WHERE id=?',(now,sid))
             return jsonify(ok=True,usable=True,kind=s['kind'],verified_at=now,message=message)
@@ -582,7 +627,7 @@ def register(app,connect,cipher,auth,body,error,audit):
         try:
             with connect() as db:s=db.execute('SELECT * FROM detection_sources WHERE id=?',(sid,)).fetchone()
             if not s or not s['enabled']:raise IntegrationError('请选择已启用的检测来源')
-            rows,cached=source_nodes(s,cipher)
+            rows,cached=source_nodes(s,cipher,connect)
             return jsonify(nodes=rows,cached=cached)
         except IntegrationError as e:return error(str(e))
 
@@ -719,6 +764,7 @@ def register(app,connect,cipher,auth,body,error,audit):
                 if not same_probe or (automatic and not current['automatic']):return error('此 VPS 有管理员设置的自动重启/换 IP 策略；请联系管理员关闭该策略后再修改或开启探测点',409)
             db.execute("UPDATE detection_runs SET action_status='cancelled',action_result='客户更新探测点，停止旧配置关联的自动动作' WHERE server_id=? AND action_status IN ('queued','issued','submitted','uncertain','verifying')",(sid,))
             db.execute('INSERT INTO detection_plans(server_id,source_id,nodes,interval_s,automatic,daily_limit,next_at,response_mode,action_connection_id,failure_threshold,failure_streak,failure_ip,failure_port,last_action,action_enabled,action_after_run,status,checked,owner_id) VALUES(?,?,?,?,?,?,?,\'none\',NULL,3,0,NULL,NULL,NULL,0,?,?,NULL,?) ON CONFLICT(server_id) DO UPDATE SET source_id=excluded.source_id,nodes=excluded.nodes,interval_s=excluded.interval_s,automatic=excluded.automatic,daily_limit=excluded.daily_limit,next_at=MIN(detection_plans.next_at,excluded.next_at),failure_streak=0,failure_ip=NULL,failure_port=NULL,owner_id=excluded.owner_id,status=\'客户更新探测设置\',checked=NULL',(sid,source_id,json.dumps(ids),interval,int(automatic),limit,int(time.time()),last,'客户配置探测点',g.user['id']))
+            probe_groups.cancel_pending(db,server_id=sid)
             audit(db,'客户配置 VPS 探测点 #'+str(sid))
         return jsonify(ok=True,automatic=automatic,message='探测配置已保存')
 
@@ -793,6 +839,10 @@ def register(app,connect,cipher,auth,body,error,audit):
                     for node in ids:aliyun_probe.node_parts(node)
                 except IntegrationError as e:return error(str(e))
                 if response_mode!='none':return error('阿里云来源当前仅记录检测结果；完成真实账号联调后再启用自动处理')
+            if d.get('dual_source_id') is not None or d.get('dual_nodes'):return error('本版本仅支持一个首轮探测来源；可在自建来源内选择多个节点')
+            if s['kind']=='self':
+                try:ids=probe_groups.validate(db,s,ids)
+                except IntegrationError as e:return error(str(e))
             old_plan=db.execute('SELECT source_id,confirm_node,confirm_source_id FROM detection_plans WHERE server_id=?',(sid,)).fetchone()
             same=old_plan and old_plan['source_id']==s['id']
             confirm=d.get('confirm_node',old_plan['confirm_node'] if same else None)
@@ -806,21 +856,24 @@ def register(app,connect,cipher,auth,body,error,audit):
                 cs=db.execute('SELECT * FROM detection_sources WHERE id=?',(confirm_source or s['id'],)).fetchone()
                 if not cs or not cs['enabled'] or cs['owner_id'] is not None:return error('请选择已启用的管理员复检来源')
                 if cs['kind'] not in ('self','boce','baota','aliyun'):return error('此来源不支持独立复测点')
-                if cs['id']==s['id'] and (confirm in set(map(str,ids)) or cs['kind']=='self'):return error('复测点必须与首轮检测点不同')
+                if cs['id']==s['id'] and confirm in set(map(str,ids)):return error('复测点必须与首轮检测点不同')
                 if cs['kind'] in ('boce','baota') and not confirm.isdigit():return error('复测节点 ID 必须为数字')
-                if cs['kind']=='self' and confirm!='self':return error('自建复检节点必须为 self')
+                if cs['kind']=='self':
+                    try:probe_groups.validate(db,cs,[confirm])
+                    except IntegrationError as e:return error(str(e))
                 if cs['kind']=='aliyun':
                     try:aliyun_probe.node_parts(confirm)
                     except IntegrationError as e:return error(str(e))
                     if response_mode!='none':return error('阿里云复检来源当前仅记录结果，不支持自动处理')
                 confirm_source=cs['id'] if cs['id']!=s['id'] else None
-            ids=sorted(set(map(str,ids))) if s['kind'] in ('boce','aliyun','baota') else ['self']
+            ids=sorted(set(map(str,ids)))
             if not ids:return error('请填写至少一个节点 ID')
             db.execute('INSERT OR IGNORE INTO ip_monitors(server_id,port) VALUES(?,?)',(sid,port or 443))
             if port is not None:db.execute('UPDATE ip_monitors SET port=? WHERE server_id=?',(port,sid))
             existing=db.execute('SELECT next_at FROM detection_plans WHERE server_id=?',(sid,)).fetchone()
             db.execute("UPDATE detection_runs SET action_status='cancelled',action_result='检测配置已更新，未发送换 IP 请求' WHERE server_id=? AND action_status IN ('queued','issued','submitted','uncertain','verifying')",(sid,))
             db.execute('INSERT INTO detection_plans(server_id,source_id,nodes,interval_s,automatic,daily_limit,next_at,response_mode,action_connection_id,failure_threshold,failure_streak,failure_ip,failure_port,last_action,owner_id) VALUES(?,?,?,?,?,?,?,?,?,?,0,NULL,NULL,NULL,NULL) ON CONFLICT(server_id) DO UPDATE SET source_id=excluded.source_id,nodes=excluded.nodes,interval_s=excluded.interval_s,automatic=excluded.automatic,daily_limit=excluded.daily_limit,response_mode=excluded.response_mode,action_connection_id=excluded.action_connection_id,failure_threshold=excluded.failure_threshold,failure_streak=0,failure_ip=NULL,failure_port=NULL,owner_id=NULL,status=\'等待新配置检测\',checked=NULL',(sid,s['id'],json.dumps(ids),interval,int(automatic),limit,existing['next_at'] if existing else 0,response_mode,action_connection_id,failure_threshold))
+            probe_groups.cancel_pending(db,server_id=sid)
             db.execute('UPDATE detection_plans SET confirm_node=?,confirm_source_id=? WHERE server_id=?',(confirm,confirm_source,sid))
             db.execute("UPDATE detection_rechecks SET state='cancelled',message='检测配置已更新，取消旧复测' WHERE parent_id IN (SELECT id FROM detection_runs WHERE server_id=?) AND state IN ('queued','creating','pending')",(sid,))
             # Old source jobs can finish for history, but must not change the new plan status.
@@ -847,9 +900,7 @@ def register(app,connect,cipher,auth,body,error,audit):
     def probe_source():
         bearer=request.headers.get('Authorization','')
         if not bearer.startswith('Bearer ') or len(bearer)>200:return None
-        supplied=bearer[7:]
-        with connect() as db:rows=db.execute("SELECT * FROM detection_sources WHERE kind='self' AND enabled=1").fetchall()
-        return next((r for r in rows if secrets.compare_digest(source_secret(r,cipher),supplied)),None)
+        with connect() as db:return probe_groups.authenticate(db,cipher,bearer[7:])
 
     @app.post('/api/probe/jobs')
     def detection_probe_jobs():
@@ -858,12 +909,12 @@ def register(app,connect,cipher,auth,body,error,audit):
         now=int(time.time())
         with connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            cross=detection_recheck.claim_self(db,s,cipher,now)
+            probe_groups.heartbeat(db,s,now)
+            cross=probe_groups.claim(db,s,now) or detection_recheck.claim_self(db,s,cipher,now)
             if cross:
-                db.execute('UPDATE detection_sources SET last_seen=? WHERE id=?',(now,s['id']))
                 return jsonify(job=cross)
-            db.execute('UPDATE detection_sources SET last_seen=? WHERE id=?',(now,s['id']))
-            r=db.execute("SELECT r.* FROM detection_runs r JOIN detection_plans p ON p.server_id=r.server_id JOIN ip_monitors m ON m.server_id=r.server_id WHERE r.source_id=? AND p.source_id=r.source_id AND m.enabled=1 AND r.status='queued' AND r.created>? ORDER BY r.id LIMIT 1",(s['id'],now-120)).fetchone()
+            if s['probe_node_id']!='self':return jsonify(job=None)
+            r=db.execute("SELECT r.* FROM detection_runs r JOIN detection_plans p ON p.server_id=r.server_id JOIN ip_monitors m ON m.server_id=r.server_id WHERE r.source_id=? AND p.source_id=r.source_id AND m.enabled=1 AND r.status='queued' AND NOT EXISTS(SELECT 1 FROM self_probe_tasks t WHERE t.parent_id=r.id) AND r.created>? ORDER BY r.id LIMIT 1",(s['id'],now-120)).fetchone()
             if not r:return jsonify(job=None)
             db.execute("UPDATE detection_runs SET status='issued',updated=? WHERE id=?",(now,r['id']))
         return jsonify(job={'id':r['id'],'ip':r['ip'],'port':r['port']})
@@ -881,6 +932,16 @@ def register(app,connect,cipher,auth,body,error,audit):
                 return jsonify(ok=True) if ok else error('复检任务不存在、过期或目标不匹配',409)
             r=db.execute("SELECT * FROM detection_runs WHERE id=? AND source_id=? AND status='issued' AND created>?",(rid,s['id'],int(time.time())-120)).fetchone()
             if not r:return error('任务不存在、已完成或过期',409)
+            receipt=probe_groups.receive(db,s,r,d)
+            if receipt is not None:
+                if not receipt:return error('节点任务不存在、已完成或目标不匹配',409)
+                rows=probe_groups.completed(db,r)
+                if rows is not None:
+                    states=[x['state'] for x in rows]
+                    status='所选自建节点全部可达' if rows and all(x=='reachable' for x in states) else ('所选自建节点全部不通（待复核）' if rows and all(x=='unreachable' for x in states) else '自建节点部分不通或未知，不确认故障')
+                    finish(db,r,status,rows)
+                return jsonify(ok=True)
+            if s['probe_node_id']!='self':return error('此节点没有该任务',409)
             # Bind result to the exact issued target.
             if d.get('ip')!=r['ip'] or d.get('port')!=r['port']:return error('结果目标不匹配',409)
             state='reachable' if reachable else 'unreachable'

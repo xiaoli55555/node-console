@@ -61,3 +61,27 @@ test('changing confirmation source discards delayed node results',async()=>{
  resolve({nodes:[{id:'self',name:'旧来源',isp:'test'}]});await pending;
  assert.doesNotMatch(f.elements.confirm_node.innerHTML,/旧来源/);assert.equal(h.elements.loadConfirmNodes.disabled,false);
 });
+
+test('one self source exposes multiple selectable peers and saves both IDs',async()=>{
+ const h=setup();vm.runInContext("detectorsData.sources=[{id:7,kind:'self',name:'自建组',enabled:1,nodes:[{id:'self',name:'广州',online:true},{id:'probe-4',name:'上海',online:true}]}]",h.ctx);
+ await h.ctx.editDetectionPlan({server_id:1,source_id:7,nodes:['self','probe-4']});
+ assert.match(h.html(),/self,probe-4/);assert.match(h.elements.planNodeChoices.innerHTML,/广州/);assert.match(h.elements.planNodeChoices.innerHTML,/上海/);
+ h.elements.planNodeChoices.querySelectorAll=()=>[{value:'self'},{value:'probe-4'}];h.elements.planNodeChoices.onchange();
+ const f=h.elements.detectorPlanForm;assert.equal(f.elements.nodes.value,'self,probe-4');await f.onsubmit({preventDefault(){},submitter:{}});
+ assert.deepEqual(Array.from(h.calls.at(-1).data.nodes),['self','probe-4']);
+});
+test('node management creates a child with its own one-time credential',async()=>{
+ const h=setup();let token;
+ h.ctx.document.querySelectorAll=()=>[];h.ctx.probeInstructions=value=>token=value;
+ h.ctx.modal=markup=>{h.elements.modal={close(){}};h.elements.probeNodeError={textContent:''};h.elements.addProbeNodeForm={elements:{name:{value:'上海'}}};};
+ h.ctx.api=async(path,method,data)=>{h.calls.push({path,method,data});return path.endsWith('/nodes')?{nodes:[{id:'self',name:'广州',online:true,enabled:true}]}:{probe_token:'new-peer-only-key'};};
+ await h.ctx.manageProbeNodes(7);const f=h.elements.addProbeNodeForm;
+ await f.onsubmit({preventDefault(){},target:f,submitter:{}});
+ assert.equal(h.calls.at(-1).path,'detection/sources/7/probe-nodes');assert.equal(h.calls.at(-1).data.name,'上海');assert.equal(token,'new-peer-only-key');
+});
+
+test('plan offers grouped nodes but no second simultaneous source',async()=>{
+ const h=setup();await h.ctx.editDetectionPlan();assert.doesNotMatch(h.html(),/第二探测来源|dual_source_id|loadDualNodes/);
+ const f=h.elements.detectorPlanForm;await f.onsubmit({preventDefault(){},submitter:{}});
+ assert.equal('dual_source_id' in h.calls.at(-1).data,false);assert.equal('dual_nodes' in h.calls.at(-1).data,false);
+});

@@ -56,7 +56,9 @@ def _run(db,r,p,address=None):
     return db.execute(sql+' ORDER BY id DESC LIMIT 1',args).fetchone()
 
 
-def _valid(run,r,p,now,address):
+def _valid(run,r,p,now,address,db):
+    import probe_groups
+    if run and not probe_groups.gate(db,run,'reachable'):return False
     if not run or run['id']<=r['run_floor'] or run['created']<r['activated_at'] or run['ip']!=address or not 0<=now-run['updated']<=90:return False
     try:rows=json.loads(run['details']);nodes=json.loads(p['nodes'])
     except (TypeError,ValueError):return False
@@ -75,7 +77,7 @@ def activate(db,kind,key,now):
     except IntegrationError:address=None
     run=_run(db,r,p,address) if address else None
     # Preserve a parent's verified result while another parent's profile runs.
-    if _valid(run,r,p,now,address) and now-run['updated']<60:return
+    if _valid(run,r,p,now,address,db) and now-run['updated']<60:return
     if run and run['id']>r['run_floor'] and 0<=now-run['updated']<15:return
     if db.execute("SELECT 1 FROM detection_runs WHERE server_id=? AND status IN ('creating','pending','queued','issued')",(sid,)).fetchone():return
     controller=db.execute('SELECT * FROM shared_failover_probe WHERE backup_id=?',(sid,)).fetchone()
@@ -90,7 +92,7 @@ def activate(db,kind,key,now):
         try:pp,_=_profile(db,peer)
         except IntegrationError:continue
         result=_run(db,peer,pp,address) if address else None
-        if _valid(result,peer,pp,now,address) and now-result['updated']<60:continue
+        if _valid(result,peer,pp,now,address,db) and now-result['updated']<60:continue
         if result and result['id']>peer['run_floor'] and 0<=now-result['updated']<15:continue
         attempted=db.execute('SELECT attempted_at FROM shared_failover_attempt WHERE kind=? AND parent_id=?',(peer['kind'],peer['key'])).fetchone()
         candidates.append((attempted[0] if attempted else -1,peer['kind'],peer['key']))
@@ -109,7 +111,7 @@ def ready(db,cipher,kind,key,now,offline_s):
     if not rotation._owned_server(db,sid,r['owner_id']):raise IntegrationError('共享备用机归属已变化')
     if rotation._offline(db,sid,now,offline_s) or rotation._pending_action(db,sid):raise IntegrationError('共享备用机离线或有未完成的动作')
     address=public_v4(candidate_ip(db,{'server_id':sid,'source_id':None},cipher))
-    if not _valid(_run(db,r,p,address),r,p,now,address):raise IntegrationError('等待共享备用机通过本主机所选检测点；其他主机结果不能替代')
+    if not _valid(_run(db,r,p,address),r,p,now,address,db):raise IntegrationError('等待共享备用机通过本主机所选检测点；其他主机结果不能替代')
     try:
         with rotation.socket.create_connection((address,p['monitor_port']),timeout=4):pass
     except OSError:raise IntegrationError('共享备用机业务端口不可达') from None

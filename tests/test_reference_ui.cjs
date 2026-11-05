@@ -23,3 +23,8 @@ test('dual failed stations show veto and never invent latency',()=>{
  const html=ctx.referenceProbeMarkup({passed:false,parent_id:88,stage:'reference',state:'unknown',stations:[{host:'www.qq.com',state:'completed',details:[{node_id:'13',state:'unreachable',latency_ms:0}]},{host:'www.baidu.com',state:'unknown',message:'接口超时',details:[]}]});
  assert.match(html,/判定已撤销/);assert.match(html,/接口超时/);assert.doesNotMatch(html,/0 ms/);
 });
+
+test('group results show each peer and never label a missing peer as failed',()=>{
+ const html=ctx.probeGroupMarkup({name:'组',complete:false,pending:false,nodes:[{id:'self',name:'<广州>',state:'done',result:{state:'unreachable'}},{id:'probe-4',name:'上海',state:'unknown',result:null}]});
+ assert.match(html,/结果未知，不确认故障/);assert.match(html,/&lt;广州&gt;/);assert.match(html,/上海/);assert.match(html,/未知/);assert.doesNotMatch(html,/上海[^<]*不通/);
+});
