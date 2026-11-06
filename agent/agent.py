@@ -65,7 +65,7 @@ class ConnectionSampler:
             except OSError:tcp=None;err+=' TCP 采集失败'
             try:self.by_port=tcp_port_counts()
             except (OSError,ValueError):self.by_port=None
-            self.values=(tcp,udp,err.strip());self.sampled_at=int(time.time());self.next_at=now+15
+            self.values=(tcp,udp,err.strip());self.sampled_at=int(time.time());self.next_at=now+5
         return self.values
 
 class EgressSampler:

@@ -6,12 +6,20 @@ spec=importlib.util.spec_from_file_location('collector',Path(__file__).parents[1
 collector=importlib.util.module_from_spec(spec);spec.loader.exec_module(collector)
 
 class CadenceTest(unittest.TestCase):
-    def test_connections_are_cached_for_fifteen_seconds(self):
+    def test_connections_refresh_every_five_seconds_and_update_timestamp(self):
         sampler=collector.ConnectionSampler()
-        with patch.object(collector,'tcp_count',return_value=12) as tcp,patch.object(collector,'udp_count',return_value=(3,'')) as udp:
-            for stamp in (0,5,10,14):self.assertEqual(sampler.sample(lambda:stamp),(12,3,''))
+        with patch.object(collector,'tcp_count',side_effect=[12,90,7]) as tcp,patch.object(collector,'udp_count',return_value=(3,'')) as udp,patch.object(collector,'tcp_port_counts',return_value={'443':12}),patch.object(collector.time,'time',return_value=100) as wall:
+            for stamp in (0,1,4.99):self.assertEqual(sampler.sample(lambda:stamp),(12,3,''))
             self.assertEqual(tcp.call_count,1);self.assertEqual(udp.call_count,1)
-            sampler.sample(lambda:15);self.assertEqual(tcp.call_count,2)
+            self.assertEqual(sampler.sampled_at,100)
+            wall.return_value=105
+            self.assertEqual(sampler.sample(lambda:5),(90,3,''))
+            self.assertEqual(sampler.sampled_at,105)
+            self.assertEqual(sampler.sample(lambda:9.99),(90,3,''))
+            wall.return_value=110
+            self.assertEqual(sampler.sample(lambda:10),(7,3,''))
+            self.assertEqual(sampler.sampled_at,110)
+            self.assertEqual(tcp.call_count,3);self.assertEqual(udp.call_count,3)
     def test_history_is_limited_but_all_traffic_is_counted(self):
         db=sqlite3.connect(':memory:')
         db.executescript('CREATE TABLE metric_points(server_id INTEGER,stamp INTEGER,cpu REAL,memory REAL,tcp REAL,udp REAL,rx_bps REAL,tx_bps REAL,PRIMARY KEY(server_id,stamp));CREATE TABLE traffic_daily(server_id INTEGER,day TEXT,rx INTEGER,tx INTEGER,PRIMARY KEY(server_id,day));CREATE TABLE network_points(server_id INTEGER,stamp INTEGER,rx_bps REAL,tx_bps REAL,PRIMARY KEY(server_id,stamp));')
