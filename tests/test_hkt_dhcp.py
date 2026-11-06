@@ -64,6 +64,8 @@ class HKTAPI(unittest.TestCase):
         self.assertEqual(self.trigger(n,new).status_code,202)
     def test_key_cannot_target_other_VPS_or_bypass_active_rotation(self):
         n=self.node();other=self.node('B');cfg=self.generate(n);cfg2=self.generate(other)
+        self.report(n,public_ips=['42.98.100.156'])
+        self.report(other,public_ips=['42.98.100.157'])
         self.assertEqual(self.trigger(other,cfg).status_code,401)
         with server.connect() as db:
             conn=load_connection(db,server.CIPHER,cfg['connection_id'])
@@ -84,7 +86,7 @@ class HKTAPI(unittest.TestCase):
             bconn=load_connection(db,server.CIPHER,cfg2['connection_id'])
         with self.assertRaisesRegex(IntegrationError,'采样缺失或过期'):
             invoke_change_ip_api(bconn,other['id'],'B','8.8.8.8')
-        self.report(other,tcp=25,connections_sampled=int(time.time()))
+        self.report(other,public_ips=['42.98.100.157'],tcp=25,connections_sampled=int(time.time()))
         self.assertIn('已排队',invoke_change_ip_api(bconn,other['id'],'B','8.8.8.8'))
 
     def test_requires_local_capability_admin_and_no_concurrent_reboot(self):

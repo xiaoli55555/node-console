@@ -1284,7 +1284,9 @@ def _run_rotation(connect,cipher,rid,now):
             try:plan=_validated_plan(db,old,r['owner_id'])
             except IntegrationError as e:
                 db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',(str(e),now,rid));return
-            if now-(r['drain_started'] or now)<r['drain_grace_s']:
+            from hkt_dhcp import nonpreferred_ip
+            selecting=nonpreferred_ip(db,old)
+            if not selecting and now-(r['drain_started'] or now)<r['drain_grace_s']:
                 db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('等待 DNS TTL 到期后检查旧机连接',now,rid));return
             try:ip,port,metrics=_fresh_ip(db,old,now,cipher)
             except IntegrationError as e:
@@ -1307,7 +1309,7 @@ def _run_rotation(connect,cipher,rid,now):
                 except IntegrationError as e:
                     db.execute('UPDATE vps_rotations SET status=?,updated=?,low_samples=0,force_drain_samples=NULL WHERE id=?',(str(e),now,rid));return
 
-            if not r['emergency'] and r['drain_schedule_after'] is not None and stamp<=r['drain_schedule_after']:
+            if not selecting and not r['emergency'] and r['drain_schedule_after'] is not None and stamp<=r['drain_schedule_after']:
                 db.execute('UPDATE vps_rotations SET status=? WHERE id=?',('时段或排空配置已变化，等待两次新的 TCP 采样',rid));return
             if not r['emergency'] and stamp>(r['last_sample_at'] or 0):
                 threshold=drain_effective['threshold']
@@ -1315,7 +1317,7 @@ def _run_rotation(connect,cipher,rid,now):
                 db.execute('UPDATE vps_rotations SET low_samples=?,last_sample_at=?,status=?,updated=? WHERE id=?',(lows,stamp,f'旧 VPS 当前 {count} 条 TCP 连接；阈值 < {threshold}（{drain_effective["label"]}），连续低值采样 {lows}/2',now,rid))
                 r=dict(r);r['low_samples']=lows
             forced=not r['emergency'] and _force_drain_ready(db,r,count,stamp,now) and r['low_samples']<2
-            if r['low_samples']<2 and not forced:return
+            if r['low_samples']<2 and not forced and not selecting:return
             if forced:
                 try:_fixed_ready(db,cipher,r,r['active_server_id'],now)
                 except IntegrationError as e:
@@ -1333,7 +1335,7 @@ def _run_rotation(connect,cipher,rid,now):
             plan=_validated_plan(db,old,r['owner_id'])
             if not plan or (plan.get('rotation_action')!='reboot' and not plan['action_connection_id']):
                 db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('旧机连接已降至阈值，但未配置换 IP API',now,rid));return
-            try:rotation_groups.action_guard(db,r,old,now)
+            try:rotation_groups.action_guard(db,r,old,now,skip_drain_wait=selecting)
             except IntegrationError as e:
                 db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',(str(e),now,rid));return
             from server_failover import before_action
@@ -1423,6 +1425,12 @@ def _run_rotation(connect,cipher,rid,now):
                 db.execute('UPDATE vps_rotations SET new_ip=?,action_started=?,status=?,updated=? WHERE id=?',(ip,now,'备用 VPS IP 再次变化，等待新一轮 BOCE 复检',now,rid));return
             try:_preferred_rotation_ip(db,old,ip)
             except IntegrationError as e:
+                from hkt_dhcp import preferred_ip_retry_allowed
+                if preferred_ip_retry_allowed(db,old):
+                    message='当前 IP 不符合 HKT 42 优选，旧任务已结束；重新核对 DNS 排空及连接数后继续选 IP'
+                    db.execute("UPDATE vps_rotations SET phase='draining',old_ip=?,new_ip=NULL,action_started=NULL,last_sample_at=NULL,low_samples=0,status=?,updated=? WHERE id=?",(ip,message,now,rid))
+                    _event(db,rid,old,message,now)
+                    return
                 db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',(str(e),now,rid));return
             plan=db.execute('SELECT port FROM ip_monitors WHERE server_id=?',(old,)).fetchone()
             _request_probe(db,old,now)

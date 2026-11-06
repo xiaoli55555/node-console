@@ -30,7 +30,7 @@ def compatible(db,sid,other,mode,uid,rid=None):
         raise IntegrationError('仅固定主机模式可共用同一主 VPS；轮换机不能跨计划复用，也不能交叉占用 A/B')
 
 
-def action_guard(db,r,sid,now):
+def action_guard(db,r,sid,now,skip_drain_wait=False):
     peers=db.execute('SELECT * FROM vps_rotations WHERE primary_server_id=? OR other_server_id=?',(sid,sid)).fetchall()
     if len(peers)<2:return
     for p in peers:
@@ -39,7 +39,7 @@ def action_guard(db,r,sid,now):
             lease=db.execute('SELECT 1 FROM vps_failover_leases l JOIN dns_bindings b ON b.id=l.binding_id WHERE l.binding_id=? AND l.intent IS NULL AND l.current_ip=b.expected_ip',(p['binding_id'],)).fetchone()
             if not lease:raise IntegrationError('等待所有关联线路移出此 VPS 后再换 IP')
     for p in peers:
-        if p['drain_server_id']==sid and p['phase']=='draining' and not p['emergency'] and (((p['low_samples']<2 or not rotation_schedule.samples_current(p,now)) and not forced_drain_satisfied(p,now)) or now-(p['drain_started'] or now)<p['drain_grace_s']):raise IntegrationError('等待关联记录的 TTL 排空及连续 TCP 低值采样')
+        if not skip_drain_wait and p['drain_server_id']==sid and p['phase']=='draining' and not p['emergency'] and (((p['low_samples']<2 or not rotation_schedule.samples_current(p,now)) and not forced_drain_satisfied(p,now)) or now-(p['drain_started'] or now)<p['drain_grace_s']):raise IntegrationError('等待关联记录的 TTL 排空及连续 TCP 低值采样')
     inflight=[p['id'] for p in peers if p['drain_server_id']==sid and p['phase']=='waiting_ip' and p['action_started'] is not None]
     if inflight:
         if r['id']!=min(inflight):raise IntegrationError('共享 VPS 已由计划 #'+str(min(inflight))+' 发起换 IP，等待该动作完成')

@@ -9,6 +9,21 @@ from ip_dns import IntegrationError
 _connect=None
 _cipher=None
 
+def nonpreferred_ip(db,server_id):
+    from ip_dns import candidate_ip,public_v4
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hkt_dhcp_apis'").fetchone():return False
+    if not db.execute('SELECT 1 FROM hkt_dhcp_apis WHERE server_id=?',(server_id,)).fetchone():return False
+    try:return not public_v4(candidate_ip(db,{'server_id':server_id,'source_id':None},_cipher)).startswith('42.')
+    except IntegrationError:return False
+
+def preferred_ip_retry_allowed(db,server_id):
+    """Only resume selection after a terminal job; never overlap an agent task."""
+    cfg=db.execute('SELECT reset_after FROM hkt_dhcp_apis WHERE server_id=?',(server_id,)).fetchone()
+    pending=db.execute("SELECT 1 FROM commands WHERE server_id=? AND status IN ('queued','issued','accepted','unconfirmed')",(server_id,)).fetchone()
+    if not cfg or pending or not nonpreferred_ip(db,server_id):return False
+    job=db.execute("SELECT id,status FROM commands WHERE server_id=? AND action='hkt_dhcp' ORDER BY id DESC LIMIT 1",(server_id,)).fetchone()
+    return bool(job and job['status'] in ('completed','failed','expired'))
+
 def initialize(connect):
     global _connect
     _connect=connect
@@ -33,16 +48,28 @@ def queue(server_id,connection_id=None,managed=False):
         if not node or not node['seen'] or now-node['seen']>45 or 'hkt_dhcp' not in metrics.get('capabilities',[]):raise IntegrationError('HKT agent 离线或未在本机启用 DHCP 换 IP')
         # API keys must not bypass the rotation's drain/current-server guards.
         r=db.execute('SELECT * FROM vps_rotations WHERE primary_server_id=? OR other_server_id=?',(server_id,server_id)).fetchone()
-        if r and not managed:raise IntegrationError('此 VPS 由轮换管理，请通过轮换流程调用，不能绕过排空条件')
+        selecting=bool(r and nonpreferred_ip(db,server_id))
+        if r and not managed and not selecting:raise IntegrationError('此 VPS 由轮换管理，请通过轮换流程调用，不能绕过排空条件')
         if r and not r['enabled'] and not r['fault_recovery']:raise IntegrationError('轮换已暂停，未处于故障修复流程')
         if r and r['mode']=='fixed_primary' and server_id==r['primary_server_id']:
             from rotation import _fixed_failure
             if not _fixed_failure(db,server_id,now):raise IntegrationError('固定主机 A 未确认故障，禁止换 IP')
-        if r and not r['emergency'] and r['drain_started'] and now-r['drain_started']<r['drain_grace_s']:raise IntegrationError('仍在 DNS 排空等待期')
-        if r and not r['emergency'] and r['low_samples']<2:raise IntegrationError('尚未达到轮换连接阈值')
+        if r and not selecting and not r['emergency'] and r['drain_started'] and now-r['drain_started']<r['drain_grace_s']:raise IntegrationError('仍在 DNS 排空等待期')
+        if r and not selecting and not r['emergency'] and r['low_samples']<2:raise IntegrationError('尚未达到轮换连接阈值')
         if r and (r['active_server_id']==server_id or r['drain_server_id']!=server_id or r['phase'] not in ('draining','waiting_ip','waiting_probe')):
             raise IntegrationError('此机器仍承载轮换解析，或未进入换 IP 阶段')
         if db.execute('SELECT 1 FROM vps_rotations WHERE failover_server_id=?',(server_id,)).fetchone():raise IntegrationError('冷备用 C 不接受此 DHCP API 动作')
+        if selecting:
+            # The exception skips waiting, never a current DNS carrier or a
+            # partial DNS handoff. Read back every associated selected record.
+            from ip_dns import load_connection,get_dns_record,validate_dns_record,candidate_ip,public_v4
+            address=public_v4(candidate_ip(db,{'server_id':server_id,'source_id':None},_cipher))
+            for peer in db.execute('SELECT * FROM vps_rotations WHERE primary_server_id=? OR other_server_id=?',(server_id,server_id)):
+                if peer['active_server_id']==server_id or peer['dns_intent']:raise IntegrationError('此 VPS 仍承载解析或存在未完成 DNS 切换')
+                binding=db.execute('SELECT * FROM dns_bindings WHERE id=?',(peer['binding_id'],)).fetchone()
+                conn=load_connection(db,_cipher,binding['connection_id'])
+                record=get_dns_record(conn,binding);validate_dns_record(record,binding,conn)
+                if record.get('content',record.get('Value'))==address:raise IntegrationError('所选 DNS 仍指向当前 IP，不能继续选 IP')
         from server_failover import before_action
         reason=before_action(db,server_id,now,_cipher)
         if reason:
@@ -54,7 +81,7 @@ def queue(server_id,connection_id=None,managed=False):
             if pending['status']=='unconfirmed':raise IntegrationError('上次 DHCP 结果待核对，请检查 agent 后重置 API')
             return pending['id']
         last=db.execute("SELECT id,status FROM commands WHERE server_id=? AND action='hkt_dhcp' AND id>? ORDER BY id DESC LIMIT 1",(server_id,cfg['reset_after'])).fetchone()
-        if last and last['status'] in ('failed','expired'):raise IntegrationError('DHCP 上轮未成功；已停止自动重复，检查网络后重新生成 API 解除')
+        if last and last['status'] in ('failed','expired') and not selecting:raise IntegrationError('DHCP 上轮未成功；已停止自动重复，检查网络后重新生成 API 解除')
         admin=db.execute("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1").fetchone()
         if not admin:raise IntegrationError('缺少管理员')
         return db.execute("INSERT INTO commands(server_id,user_id,action,status,created,updated) VALUES(?,?,'hkt_dhcp','queued',?,?)",(server_id,admin['id'],now,now)).lastrowid
