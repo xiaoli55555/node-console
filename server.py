@@ -5,6 +5,7 @@ from datetime import date, datetime, time as datetime_time, timedelta
 from zoneinfo import ZoneInfo
 from functools import wraps
 from network import record_network, traffic_summary
+import tcp_history
 from credential_store import load_cipher, InvalidToken
 from flask import Flask, request, jsonify, g, send_from_directory, make_response
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -63,6 +64,7 @@ def init():
         PRAGMA user_version=11;
         ''')
 
+        tcp_history.initialize(db)
         if 'password_encrypted' not in [r[1] for r in db.execute('PRAGMA table_info(users)')]:
             db.execute('ALTER TABLE users ADD COLUMN password_encrypted TEXT')
         if 'entry' not in [r[1] for r in db.execute('PRAGMA table_info(sessions)')]:
@@ -639,6 +641,7 @@ def report():
             # Different units must not share one historical curve.
             db.execute('UPDATE metric_points SET udp=NULL WHERE server_id=?',(row['id'],))
         clean=record_network(db,current,clean,int(time.time()))
+        tcp_history.record(db,row['id'],clean,int(time.time()))
         previous=json.loads(current['metrics']) if current['metrics'] else {}
         reboot_detected=clean.get('uptime') is not None and previous.get('uptime') is not None and clean['uptime']<previous['uptime']
         if reboot_detected:
@@ -738,6 +741,16 @@ def network_history(sid):
         return jsonify(points=[dict(p) for p in points],traffic=traffic_summary(db,sid,now),
                        rx_bps=metrics.get('rx_bps') if online else None,tx_bps=metrics.get('tx_bps') if online else None,
                        online=online,seen=row['seen'],uptime=metrics.get('uptime') if online else None,now=now,bucket=bucket,seconds=seconds)
+
+@app.get('/api/admin/servers/<int:sid>/tcp-history')
+@auth(admin=True)
+def tcp_sample_history(sid):
+    now=int(time.time())
+    with connect() as db:
+        if not db.execute('SELECT 1 FROM servers WHERE id=?',(sid,)).fetchone():return error('服务器不存在',404)
+        try:result=tcp_history.history(db,sid,request.args,now)
+        except ValueError as e:return error(str(e))
+    return jsonify(result)
 
 @app.get('/api/servers/<int:sid>/metrics')
 @auth()

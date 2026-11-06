@@ -87,7 +87,10 @@ def capture(db,event_id,rid,sid,now,kind='state_observed',trigger=None,transitio
             probe['result_state']=p['status'] if p['status'] in ('creating','pending','queued','issued') else 'completed_with_nodes' if probe['nodes'] else 'unknown_or_error'
             probe['age_s']=now-p['updated']
             probe['matches_current_target']=bool(monitor and p['ip']==monitor['current_ip'] and p['port']==monitor['port'])
-        evidence['servers'].append({'server_id':server_id,'heartbeat_age_s':max(0,now-s['seen']) if s['seen'] else None,
+        import tcp_history
+        tcp_gate=tcp_history.gate(db,server_id,m,now,seen=s['seen'])
+        tcp_sample=db.execute('SELECT id,received_at,addresses,address_source FROM tcp_samples WHERE server_id=? ORDER BY id DESC LIMIT 1',(server_id,)).fetchone() if db.execute("SELECT 1 FROM sqlite_master WHERE name='tcp_samples'").fetchone() else None
+        evidence['servers'].append({'tcp_observed_ips':parsed(tcp_sample['addresses'],[]) if tcp_sample else [],'tcp_reported_at':tcp_sample['received_at'] if tcp_sample else None,'tcp_gate':tcp_gate,'tcp_sample_id':tcp_sample['id'] if tcp_sample else None,'server_id':server_id,'heartbeat_age_s':max(0,now-s['seen']) if s['seen'] else None,
                                    'tcp':number(m.get('tcp')),'connections_sampled':number(m.get('connections_sampled')),
                                    'monitor':dict(monitor) if monitor else None,'probe_plan':dict(plan) if plan else None,'probe':probe})
     db.execute('INSERT INTO rotation_audit VALUES(?,?,?,?,?,?)',(event_id,rid,incident,kind,now,json.dumps(evidence)))

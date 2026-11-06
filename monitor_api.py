@@ -4,6 +4,7 @@ import json
 import secrets
 import re
 import rotation_audit
+import tcp_history
 import time
 from flask import jsonify, request
 
@@ -51,7 +52,8 @@ def snapshot(db,now,after_id,dns_after_id,filters=None):
             probe['nodes']=[{k:d[k] for k in ('node_id','state','latency_ms') if k in d} for d in details if isinstance(d,dict) and d.get('state') in ('reachable','unreachable','unknown')] if isinstance(details,list) else []
         plan=db.execute('SELECT automatic,interval_s,next_at,checked FROM detection_plans WHERE server_id=?',(row['id'],)).fetchone()
         monitor=db.execute('SELECT current_ip,previous_ip,port,checked FROM ip_monitors WHERE server_id=?',(row['id'],)).fetchone()
-        servers.append(dict(pick(row,'id name seen'),heartbeat_age_s=max(0,now-row['seen']) if row['seen'] else None,
+        sample=db.execute('SELECT id,received_at,sampled_at,valid FROM tcp_samples WHERE server_id=? ORDER BY id DESC LIMIT 1',(row['id'],)).fetchone() if db.execute("SELECT 1 FROM sqlite_master WHERE name='tcp_samples'").fetchone() else None
+        servers.append(dict(pick(row,'id name seen'),tcp_gate=tcp_history.gate(db,row['id'],metrics,now,seen=row['seen']),tcp_history_latest=dict(sample) if sample else None,heartbeat_age_s=max(0,now-row['seen']) if row['seen'] else None,
                             metrics={k:metrics.get(k) if type(metrics.get(k)) in (int,float) else None for k in ('cpu_percent','memory_percent','tcp','connections_sampled','uptime')},
                             monitor=dict(monitor) if monitor else None,probe=probe,probe_plan=dict(plan) if plan else None))
     rotations=[]
