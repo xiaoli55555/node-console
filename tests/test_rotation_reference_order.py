@@ -23,6 +23,11 @@ class ReferenceOrder(unittest.TestCase):
    detectors.finish(db,row,'首轮不通',[{'node_id':'13','state':'unreachable'}])
   return row['id']
 
+ def fresh_connections(self):
+  f=self.f
+  result=f.admin.post('/api/agent/report',json={'public_ips':[f.ips[f.sid('A')]],'tcp':25,'connections_sampled':f.clock[0]},headers={'Authorization':'Bearer '+f.nodes['A']['token']})
+  self.assertEqual(result.status_code,200,result.json)
+
  def handoff(self):
   f=self.f;self.raw_failure();f.tick()
   self.assertIsNotNone(f.row()['emergency_probe_after']);f.change.assert_not_called()
@@ -57,13 +62,16 @@ class ReferenceOrder(unittest.TestCase):
   self.assertEqual(f.row()['old_ip'],'8.8.8.8');self.assertEqual(f.ips[f.sid('B')],'1.1.1.1')
   self.assertTrue(f.row()['repair_check_required']);f.change.assert_not_called()
 
- def test_stale_A_still_completes_external_confirmation_then_changes_only_A(self):
+ def test_stale_A_confirms_but_waits_for_fresh_connections_before_change(self):
   f=self.f;self.handoff();rid=self.diagnostic_failure()
   self.run_guard()
   with server.connect() as db:
    job=db.execute('SELECT * FROM detection_rechecks WHERE parent_id=?',(rid,)).fetchone()
    self.assertEqual(job['state'],'confirmed');self.assertEqual(job['applied'],1)
-  f.tick();f.change.assert_called_once();self.assertEqual(f.change.call_args.args[1],f.sid('A'))
+  f.tick();f.change.assert_not_called()
+  self.assertIn('换 IP 暂缓',f.row()['status'])
+  self.fresh_connections();f.tick()
+  f.change.assert_called_once();self.assertEqual(f.change.call_args.args[1],f.sid('A'))
   self.assertEqual(f.value('mobile'),'1.1.1.1');self.assertEqual(f.row()['phase'],'waiting_ip')
 
  def test_both_reference_sites_fail_never_change_A(self):
@@ -110,6 +118,8 @@ class ReferenceOrder(unittest.TestCase):
 
  def test_stale_confirmed_A_repairs_returns_then_B_normally_drains_and_changes(self):
   f=self.f;self.handoff();self.diagnostic_failure();self.run_guard();f.tick()
+  f.change.assert_not_called()
+  self.fresh_connections();f.tick()
   self.assertEqual(f.change.call_count,1)
   f.health[f.sid('A')]=True
   for _ in range(4):

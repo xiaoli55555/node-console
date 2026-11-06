@@ -52,7 +52,7 @@ class ConnectionGate(unittest.TestCase):
             db.execute('UPDATE vps_rotations SET force_drain_threshold=100 WHERE id=?',(self.f.rid,))
             self.assertIn('阈值 80',rotation.ip_change_connection_guard(db,self.f.sid('A'),self.f.clock[0]))
 
-    def test_emergency_repair_waits_then_executes_below_limit(self):
+    def start_repair_below_limit(self):
         f=self.f
         f.health[f.sid('A')]=False;f.refresh('A');f.tick()
         f.advance(2,online=('A','B'));f.tick()
@@ -63,3 +63,17 @@ class ConnectionGate(unittest.TestCase):
         self.assertIn('必须低于',f.row()['status'])
         self.sample(79);f.tick()
         self.assertEqual(f.change.call_count,1)
+
+    def test_emergency_repair_waits_then_executes_below_limit(self):
+        self.start_repair_below_limit()
+
+    def test_provider_no_ip_change_retry_checks_connections_again(self):
+        self.start_repair_below_limit()
+        f=self.f
+        f.advance(61,online=('B',))
+        self.sample(80);f.tick()
+        self.assertEqual(f.change.call_count,1)
+        self.assertIn('必须低于',f.row()['status'])
+        self.sample(79);f.tick()
+        self.assertEqual(f.change.call_count,2)
+        self.assertEqual(f.change.call_args.args[1],f.sid('A'))

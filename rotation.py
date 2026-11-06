@@ -800,7 +800,7 @@ def _heartbeat_confirmed(db,r,now,subject=None,subject_ip=None,force=False):
     if not runs or not valid(runs[0]):
         _request_probe(db,sid,now)
         return None
-    if state.get('run')==runs[0]['id'] and 0<=now-state.get('checked',0)<=10:
+    if state.get('tcp_policy')=='domestic_authoritative' and state.get('run')==runs[0]['id'] and 0<=now-state.get('checked',0)<=10:
         return bool(state.get('confirmed'))
     try:
         rows=json.loads(runs[0]['details']);nodes=set(map(str,json.loads(plan['nodes'])))
@@ -815,18 +815,29 @@ def _heartbeat_confirmed(db,r,now,subject=None,subject_ip=None,force=False):
     if not failed and not domestic_ok:
         db.execute('UPDATE detection_plans SET next_at=MIN(next_at,?) WHERE server_id=?',(now,sid));return None
     port_ok=False
+    port_attempts=1
     try:
         with socket.create_connection((address,port),timeout=4):port_ok=True
     except OSError:pass
-    confirmed=bool(failed or (domestic_ok and not port_ok))
-    if state.get('run')!=runs[0]['id'] or state.get('confirmed')!=confirmed:
-        state.update(run=runs[0]['id'],confirmed=confirmed,checked=now)
+    if domestic_ok and not port_ok:
+        _event(db,r['id'],sid,'国内拨测可达，但面板首次 TCP 连接失败；立即追加一次紧急 TCP 复测（同一 IP 和端口，超时 4 秒）',now,kind='tcp_retry',trigger='panel_tcp_failed')
+        port_attempts=2
+        try:
+            with socket.create_connection((address,port),timeout=4):port_ok=True
+        except OSError:pass
+    # A panel-side routing failure must never override a reachable domestic target.
+    confirmed=bool(failed)
+    panel_anomaly=domestic_ok and not port_ok
+    if (state.get('run')!=runs[0]['id'] or state.get('confirmed')!=confirmed
+            or state.get('tcp_policy')!='domestic_authoritative' or state.get('panel_tcp_ok')!=port_ok):
+        state.update(run=runs[0]['id'],confirmed=confirmed,checked=now,tcp_policy='domestic_authoritative',panel_tcp_attempts=port_attempts,panel_tcp_ok=port_ok)
         db.execute(f'UPDATE vps_rotations SET {field}=? WHERE id=?',(json.dumps(state),r['id']))
         message=(('原承载机复测确认故障：立即换 IP 并复检' if confirmed else '原承载机复测正常：保留原 IP，验证可接回后切回') if force else ('心跳超时复测确认业务不通：允许故障修复' if confirmed else '心跳超时但国内拨测及业务端口均通：不触发故障换 IP'))
+        if panel_anomaly:message='国内拨测正常，面板 TCP 复试仍失败：仅记录面板链路异常，不认定故障、不换 IP，等待连接重试'
         if r['phase']=='active':db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',(message,now,r['id']))
         _event(db,r['id'],sid,message,now)
     else:
-        state['checked']=now
+        state.update(checked=now,tcp_policy='domestic_authoritative',panel_tcp_attempts=port_attempts,panel_tcp_ok=port_ok)
         db.execute(f'UPDATE vps_rotations SET {field}=? WHERE id=?',(json.dumps(state),r['id']))
     if not confirmed and not force:
         db.execute('UPDATE vps_rotations SET emergency_probe_after=NULL WHERE id=?',(r['id'],))

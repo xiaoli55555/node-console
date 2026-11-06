@@ -64,8 +64,8 @@ class RotationFaultMatrix(unittest.TestCase):
                             f.tick()
                         self.assertEqual(f.row()['active_server_id'],f.sid('B'))
                         self.assertEqual(f.value('mobile'),'8.8.4.4' if inflight else '1.1.1.1')
-                        # Every alternating emergency handoff repairs A without
-                        # waiting for TTL, a new sample, or a low connection count.
+                        # Emergency DNS takeover skips TTL; IP repair still
+                        # requires a fresh sample below the configured limit.
                         self.assertEqual(f.row()['drain_grace_s'],0)
                         self.assertEqual(f.row()['emergency'],1)
                         f.change.assert_not_called()
@@ -102,7 +102,7 @@ class RotationFaultMatrix(unittest.TestCase):
                 self.assertEqual(f.row()['standby_ready_server'],f.sid(old))
         finally:case.doCleanups()
 
-    def test_heartbeat_handoff_repairs_old_carrier_despite_high_connections(self):
+    def test_heartbeat_handoff_waits_for_low_connections_before_repair(self):
         case,f=self.case()
         try:
             with server.connect() as db:
@@ -112,17 +112,25 @@ class RotationFaultMatrix(unittest.TestCase):
             self.assertEqual(f.value('mobile'),'1.1.1.1')
             f.change.assert_not_called();self.confirm_retired_A(f)
             self.assertEqual(f.row()['drain_grace_s'],0);self.assertEqual(f.row()['emergency'],1)
+            f.change.assert_not_called()
+            self.assertIn('必须低于',f.row()['status'])
+            f.admin.post('/api/agent/report',json={'public_ips':['8.8.8.8'],'tcp':79,'connections_sampled':f.clock[0]},headers={'Authorization':'Bearer '+f.nodes['A']['token']})
+            f.tick()
             self.assertEqual(f.change.call_count,1);self.assertEqual(f.change.call_args.args[1],f.sid('A'))
             self.assertEqual(f.row()['phase'],'waiting_ip')
         finally:case.doCleanups()
 
-    def test_confirmed_failure_uses_provider_despite_missing_agent_report(self):
+    def test_confirmed_failure_waits_for_agent_connections_before_provider(self):
         case,f=self.case()
         try:
             self.fault(f,'heartbeat');f.tick();f.advance(100,online=('B',));f.offline_probe();f.tick();f.advance(2,online=('B',));f.tick()
             self.assertEqual(f.value('mobile'),'1.1.1.1');f.change.assert_not_called()
             self.assertEqual(f.row()['drain_grace_s'],0);self.assertEqual(f.row()['emergency'],1)
             self.confirm_retired_A(f)
+            f.change.assert_not_called()
+            self.assertIn('换 IP 暂缓',f.row()['status'])
+            f.admin.post('/api/agent/report',json={'public_ips':['8.8.8.8'],'tcp':25,'connections_sampled':f.clock[0]},headers={'Authorization':'Bearer '+f.nodes['A']['token']})
+            f.tick()
             self.assertEqual(f.change.call_count,1);self.assertEqual(f.row()['phase'],'waiting_ip')
         finally:case.doCleanups()
 

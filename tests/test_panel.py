@@ -654,7 +654,8 @@ class PanelTest(unittest.TestCase):
                 row=db.execute('SELECT * FROM vps_rotations').fetchone()
                 self.assertEqual(row['phase'],'active');self.assertEqual(row['active_server_id'],nodes[1][0]);self.assertIsNone(row['drain_server_id'])
             self.assertEqual(change.call_count,1)
-            # Active B fails before its timer: return DNS to healthy A, bypass B's 200 connections.
+            # Active B fails before its timer: DNS returns to healthy A;
+            # changing B's IP must still wait for its 200 connections to fall.
             self.assertEqual(report(1,tcp=200).status_code,200)
             with server.connect() as db:
                 source=db.execute('SELECT source_id FROM detection_plans WHERE server_id=?',(nodes[1][0],)).fetchone()[0]
@@ -680,6 +681,9 @@ class PanelTest(unittest.TestCase):
                 source=db.execute('SELECT source_id FROM detection_plans WHERE server_id=?',(nodes[1][0],)).fetchone()[0]
                 for _ in range(db.execute('SELECT failure_threshold FROM detection_plans WHERE server_id=?',(nodes[1][0],)).fetchone()[0]):
                     db.execute("INSERT INTO detection_runs(server_id,source_id,ip,port,nodes,status,created,updated,details) VALUES(?,?,?,?,'[\"13\"]','TCP 不通',?,?,?)",(nodes[1][0],source,ips[1],port,clock[0],clock[0],json.dumps([{'node_id':'13','state':'unreachable'}])))
+            rotation.tick(server.connect,server.CIPHER)
+            self.assertEqual(change.call_count,1)
+            self.assertEqual(report(1,tcp=79).status_code,200)
             rotation.tick(server.connect,server.CIPHER)
             with server.connect() as db:
                 row=db.execute('SELECT * FROM vps_rotations').fetchone()
@@ -718,7 +722,10 @@ class PanelTest(unittest.TestCase):
                 row=db.execute('SELECT * FROM vps_rotations').fetchone()
                 self.assertEqual(row['active_server_id'],nodes[1][0]);self.assertEqual(row['emergency'],1)
                 self.assertEqual(row['drain_grace_s'],0)
-            self.assertEqual(record['Value'],ips[1]);self.assertEqual(change.call_count,3)
+            self.assertEqual(record['Value'],ips[1]);self.assertEqual(change.call_count,2)
+            self.assertEqual(report(0,tcp=25).status_code,200)
+            rotation.tick(server.connect,server.CIPHER)
+            self.assertEqual(change.call_count,3)
             # Telemetry tokens are scoped: observer can report only DNS; analyst can only read statistics.
             self.assertEqual(self.bob.get(f'/api/client/servers/{nodes[0][0]}/rotation/insights').status_code,404)
             created=self.alice.post(f'/api/client/servers/{nodes[0][0]}/rotation/observers',json={'label':'test observer','region':'Shanghai','isp':'Telecom'},headers=headers)

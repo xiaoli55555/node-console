@@ -75,13 +75,50 @@ class HeartbeatGuard(unittest.TestCase):
         self.assertEqual(f.change.call_count,1);self.assertEqual(f.change.call_args.args[1],f.sid('A'))
         self.assertEqual(f.row()['phase'],'waiting_ip')
 
-    def test_domestic_success_but_business_port_failure_confirms_A_fault(self):
+    def test_domestic_success_never_confirms_fault_from_panel_tcp_failures(self):
         f=self.f;self.takeover();f.advance(2,online=('B',));f.offline_probe(reachable=True)
+        attempts=[]
         def port(address,**kwargs):
-            if address[0]=='8.8.8.8':raise OSError('original business port failed')
+            if address[0]=='8.8.8.8':
+                attempts.append((address,kwargs['timeout']))
+                raise OSError('original business port failed')
+            return MagicMock()
+        deadline=f.row()['next_switch_at']
+        with patch('rotation.socket.create_connection',side_effect=port):
+            for _ in range(3):
+                f.tick();f.advance(2,online=('B',))
+        self.assertEqual(f.value('mobile'),'1.1.1.1');f.change.assert_not_called()
+        self.assertEqual(attempts[:2],[(('8.8.8.8',443),4)]*2)
+        self.assertFalse(json.loads(f.row()['repair_check'])['confirmed'])
+        self.assertEqual(f.row()['next_switch_at'],deadline)
+        f.refresh('A');f.tick()
+        self.assertEqual(f.value('mobile'),'8.8.8.8');f.change.assert_not_called()
+
+    def test_urgent_tcp_retry_success_preserves_ip_and_deadline(self):
+        f=self.f;self.takeover(age=100);f.advance(2,online=('B',));f.offline_probe(reachable=True)
+        deadline=f.row()['next_switch_at'];attempts=[]
+        def port(address,**kwargs):
+            if address[0]=='8.8.8.8':
+                attempts.append(address)
+                if len(attempts)==1:raise OSError('transient panel network failure')
             return MagicMock()
         with patch('rotation.socket.create_connection',side_effect=port):f.tick()
-        self.assertEqual(f.value('mobile'),'1.1.1.1');self.assertEqual(f.change.call_count,1)
+        f.change.assert_not_called()
+        self.assertEqual(len(attempts),2)
+        self.assertEqual(f.row()['next_switch_at'],deadline)
+        proof=json.loads(f.row()['repair_check'])
+        self.assertFalse(proof['confirmed']);self.assertTrue(proof['panel_tcp_ok'])
+        self.assertEqual(proof['panel_tcp_attempts'],2)
+
+    def test_legacy_single_failure_cache_must_get_fresh_tcp_check(self):
+        f=self.f;self.takeover(age=100);f.advance(2,online=('B',));f.offline_probe(reachable=True)
+        with server.connect() as db:
+            state=json.loads(f.row()['repair_check'])
+            state.update(run=db.execute('SELECT MAX(id) FROM detection_runs WHERE server_id=?',(f.sid('A'),)).fetchone()[0],confirmed=True,checked=f.clock[0])
+            state['tcp_policy']='retry_once'
+            db.execute('UPDATE vps_rotations SET repair_check=? WHERE id=?',(json.dumps(state),f.rid))
+        f.tick();f.change.assert_not_called()
+        self.assertFalse(json.loads(f.row()['repair_check'])['confirmed'])
 
     def test_scheduled_probe_uses_frozen_A_ip_after_agent_is_stale(self):
         f=self.f;self.takeover(age=100);f.advance(2,online=('B',))
