@@ -52,10 +52,11 @@ class ScheduleDraining(fixture.ForcedDrain):
         self.step(at(20)+15);self.change.assert_not_called()
         self.step(at(20)+30);self.change.assert_called_once()
 
-    def test_emergency_ignores_schedule_and_large_tcp(self):
+    def test_emergency_still_requires_current_connection_limit(self):
         self.prepare_schedule();self.count=5000
         with self.connect() as db:db.execute('UPDATE vps_rotations SET emergency=1,low_samples=2')
-        self.step(at(20));self.change.assert_called_once()
+        self.step(at(20));self.change.assert_not_called()
+        self.count=79;self.step(at(20)+1);self.change.assert_called_once()
 
     def test_peer_cannot_authorize_action_using_previous_period_samples(self):
         self.prepare_schedule();self.step(at(19,59));self.step(at(19,59)+15)

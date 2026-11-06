@@ -152,6 +152,9 @@ def _ready(db,cipher,r,sid,now,backup=False):
 
 def before_action(db,sid,now,cipher=None):
     """Called inside the action's write transaction; worker must take over first."""
+    import rotation
+    reason=rotation.ip_change_connection_guard(db,sid,now,cipher)
+    if reason:return reason
     if not exists(db):return None
     if reserved(db,sid):return '冷备用不执行自动换 IP，请先解除故障转移配置'
     using=db.execute('SELECT 1 FROM server_failovers f JOIN server_failover_leases l ON l.server_id=f.server_id WHERE f.backup_id=?',(sid,)).fetchone()

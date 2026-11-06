@@ -82,6 +82,9 @@ class HKTAPI(unittest.TestCase):
         with server.connect() as db:
             db.execute("UPDATE vps_rotations SET active_server_id=?,drain_server_id=?,phase='waiting_ip',low_samples=2 WHERE primary_server_id=?",(n['id'],other['id'],n['id']))
             bconn=load_connection(db,server.CIPHER,cfg2['connection_id'])
+        with self.assertRaisesRegex(IntegrationError,'采样缺失或过期'):
+            invoke_change_ip_api(bconn,other['id'],'B','8.8.8.8')
+        self.report(other,tcp=25,connections_sampled=int(time.time()))
         self.assertIn('已排队',invoke_change_ip_api(bconn,other['id'],'B','8.8.8.8'))
 
     def test_requires_local_capability_admin_and_no_concurrent_reboot(self):

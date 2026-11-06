@@ -17,8 +17,8 @@ class FixedPrimary(unittest.TestCase):
         self.tmp=tempfile.TemporaryDirectory();self.path=Path(self.tmp.name)/'test.db'
         rotation.initialize(self.connect)
         with self.connect() as db:
-            db.executescript('''CREATE TABLE servers(id INTEGER,seen INTEGER,name TEXT);
-            INSERT INTO servers VALUES(1,1000,'A');INSERT INTO servers VALUES(2,1000,'B');
+            db.executescript('''CREATE TABLE servers(id INTEGER,seen INTEGER,name TEXT,metrics TEXT);
+            INSERT INTO servers(id,seen,name) VALUES(1,1000,'A');INSERT INTO servers(id,seen,name) VALUES(2,1000,'B');
             CREATE TABLE dns_bindings(id INTEGER,connection_id INTEGER,expected_ip TEXT,port INTEGER,status TEXT,updated INTEGER);
             INSERT INTO dns_bindings VALUES(1,1,'8.8.8.8',443,'',0);
             INSERT INTO dns_bindings VALUES(2,1,'8.8.8.8',443,'untouched telecom',0);
@@ -30,9 +30,21 @@ class FixedPrimary(unittest.TestCase):
             db.execute("INSERT INTO vps_rotations(owner_id,primary_server_id,other_server_id,binding_id,active_server_id,enabled,phase,next_switch_at,updated,interval_s,mode,takeover_s,mobile_only_ack) VALUES(1,1,2,1,1,1,'active',1000,900,7200,'fixed_primary',600,1)")
         self.ips={1:'8.8.8.8',2:'1.1.1.1'};self.count=80;self.now=1000;self.failed=set()
         self.record={'content':self.ips[1],'ttl':60}
-        def fresh(db,sid,now,cipher):return self.ips[sid],443,{'connections_sampled':now,'tcp':self.count,'tcp_by_port':{'443':999}}
+        def fresh(db,sid,now,cipher):
+            metrics={'connections_sampled':now,'tcp':self.count,'tcp_by_port':{'443':999}}
+            return self.ips[sid],443,metrics
         self.patches=[patch('rotation._validated_plan',return_value={'action_connection_id':1}),patch('rotation._fresh_ip',side_effect=fresh),patch('rotation._failed_ip',side_effect=lambda db,sid,now:sid in self.failed),patch('rotation._fixed_failure',side_effect=lambda db,sid,now:sid in self.failed),patch('rotation._offline',return_value=False),patch('rotation.load_connection',return_value={'kind':'change_ip'}),patch('rotation.get_dns_record',side_effect=lambda *_:dict(self.record)),patch('rotation.validate_dns_record'),patch('rotation.update_dns_record',side_effect=lambda c,b,r,ip:self.record.update(content=ip)),patch('rotation.boce_dns_gate',side_effect=lambda db,sid,*args,**kwargs:'所选检测点不通' if sid in self.failed else None),patch('rotation.socket.create_connection',return_value=MagicMock()),patch('rotation.record_switch'),patch('rotation.invoke_change_ip_api',return_value='accepted')]
         self.mocks=[p.start() for p in self.patches];self.change=self.mocks[-1]
+        # Publish the simulated agent samples before each worker transaction.
+        run=rotation._run_rotation
+        def sampled_run(connect,cipher,rid,now):
+            with self.connect() as db:
+                for sid in (1,2):
+                    _,_,metrics=rotation._fresh_ip(db,sid,now,cipher)
+                    db.execute('UPDATE servers SET metrics=?,seen=? WHERE id=?',(json.dumps(metrics),now,sid))
+            return run(connect,cipher,rid,now)
+        worker=patch('rotation._run_rotation',side_effect=sampled_run)
+        worker.start();self.patches.append(worker)
     def tearDown(self):
         for p in reversed(self.patches):p.stop()
         self.tmp.cleanup()
@@ -70,8 +82,11 @@ class FixedPrimary(unittest.TestCase):
         with patch('rotation.boce_dns_gate',return_value='unreachable'):
             with self.assertRaises(IntegrationError):self.switch(1600)
         self.assertEqual(self.row()['active_server_id'],2);self.assertEqual(self.record['content'],'1.1.1.1');self.change.assert_not_called()
-    def test_failed_rotation_vps_skips_normal_TCP_threshold(self):
+    def test_failed_rotation_vps_requires_normal_TCP_threshold(self):
         self.switch(1000);self.switch(1600);self.failed={2};self.count=100;self.refresh(1751)
+        rotation._run_rotation(self.connect,None,1,1751)
+        self.change.assert_not_called()
+        self.count=79
         rotation._run_rotation(self.connect,None,1,1751)
         self.change.assert_called_once();self.assertEqual(self.change.call_args.args[1],2)
     def test_missing_or_stale_TCP_sample_never_treated_as_zero(self):
@@ -128,6 +143,9 @@ class FixedPrimary(unittest.TestCase):
         self.failed={1}
         rotation._run_rotation(self.connect,None,1,1000)
         self.assertEqual(self.row()['active_server_id'],2)
+        self.change.assert_not_called()
+        self.count=79
+        rotation._run_rotation(self.connect,None,1,1000)
         self.change.assert_called_once();self.assertEqual(self.change.call_args.args[1],1)
     def test_offline_primary_does_not_refresh_ip(self):
         with patch('rotation._offline',side_effect=lambda db,sid,now,*args:sid==1):
@@ -146,9 +164,12 @@ class FixedPrimary(unittest.TestCase):
                 rotation._run_rotation(self.connect,None,1,1766);self.change.assert_not_called()
     def refresh(self,now):
         with self.connect() as db:db.execute('UPDATE detection_runs SET updated=?,created=?',(now,now))
-    def test_failed_B_API_retry_does_not_wait_for_normal_TCP_threshold(self):
+    def test_failed_B_API_retry_requires_normal_TCP_threshold(self):
         self.switch(1000);self.switch(1600);self.failed={2};self.count=50000
         self.refresh(1751)
+        rotation._run_rotation(self.connect,None,1,1751)
+        self.change.assert_not_called()
+        self.count=79
         rotation._run_rotation(self.connect,None,1,1751)
         self.change.assert_called_once()
         self.refresh(1812)
@@ -161,11 +182,17 @@ class FixedPrimary(unittest.TestCase):
         rotation._run_rotation(self.connect,None,1,1650)
         self.assertEqual(self.row()['active_server_id'],2)
         self.assertEqual(self.row()['drain_server_id'],1)
+        self.change.assert_not_called()
+        self.count=79
+        rotation._run_rotation(self.connect,None,1,1650)
         self.change.assert_called_once();self.assertEqual(self.change.call_args.args[1],1)
     def test_B_failure_cuts_back_without_waiting_for_takeover_deadline(self):
         self.switch(1000);self.failed={2};self.refresh(1100)
         rotation._run_rotation(self.connect,None,1,1100)
         self.assertEqual(self.row()['active_server_id'],1)
+        self.change.assert_not_called()
+        self.count=79
+        rotation._run_rotation(self.connect,None,1,1100)
         self.assertEqual(self.row()['drain_server_id'],2);self.change.assert_called_once();self.assertEqual(self.change.call_args.args[1],2)
     def test_A_failure_during_B_action_finishes_B_before_repairing_A(self):
         self.switch(1000);self.switch(1600)
@@ -177,15 +204,21 @@ class FixedPrimary(unittest.TestCase):
         self.assertEqual(self.row()['phase'],'draining');self.change.assert_not_called()
         self.refresh(1711);rotation._run_rotation(self.connect,None,1,1711)
         self.assertEqual(self.record['content'],'9.9.9.9')
+        self.change.assert_not_called()
+        self.count=79
+        rotation._run_rotation(self.connect,None,1,1711)
         self.change.assert_called_once();self.assertEqual(self.change.call_args.args[1],1)
     def test_no_B_repair_if_A_becomes_unknown_or_stale(self):
         self.switch(1000);self.switch(1600);self.count=0
         rotation._run_rotation(self.connect,None,1,1730)
         rotation._run_rotation(self.connect,None,1,1745)
         self.change.assert_not_called();self.assertIn('暂缓',self.row()['status'])
-    def test_both_failed_repairs_one_machine_without_waiting_for_TCP_threshold(self):
+    def test_both_failed_repairs_one_machine_after_TCP_drops(self):
         self.failed={1,2};self.count=200
         rotation._run_rotation(self.connect,None,1,1000)
+        rotation._run_rotation(self.connect,None,1,1010)
+        self.change.assert_not_called()
+        self.count=79
         rotation._run_rotation(self.connect,None,1,1010)
         self.change.assert_called_once();self.assertEqual(self.change.call_args.args[1],2)
     def test_pending_reboot_on_target_blocks_switch_even_if_TCP_works(self):
@@ -230,6 +263,9 @@ class FixedPrimary(unittest.TestCase):
         self.failed={1}
         rotation._run_rotation(self.connect,None,1,1000)
         self.assertEqual(self.record['content'],'1.1.1.1')
+        self.change.assert_not_called()
+        self.count=79
+        rotation._run_rotation(self.connect,None,1,1000)
         self.assertEqual(self.row()['enabled'],0);self.change.assert_called_once()
         self.assertEqual(self.change.call_args.args[1],1)
     def test_paused_fault_DNS_timeout_reconciles_then_finishes_repair(self):
@@ -243,6 +279,9 @@ class FixedPrimary(unittest.TestCase):
         rotation._run_rotation(self.connect,None,1,1001)
         self.assertIsNone(self.row()['dns_intent'])
         self.assertEqual(self.row()['active_server_id'],2)
+        rotation._run_rotation(self.connect,None,1,1002)
+        self.change.assert_not_called()
+        self.count=79
         rotation._run_rotation(self.connect,None,1,1002)
         self.change.assert_called_once()
         self.assertEqual(self.change.call_args.args[1],1)
@@ -259,6 +298,9 @@ class FixedPrimary(unittest.TestCase):
         rotation._run_rotation(self.connect,None,1,1101)
         self.assertIsNone(self.row()['dns_intent'])
         self.assertEqual(self.row()['active_server_id'],1)
+        rotation._run_rotation(self.connect,None,1,1102)
+        self.change.assert_not_called()
+        self.count=79
         rotation._run_rotation(self.connect,None,1,1102)
         self.change.assert_called_once();self.assertEqual(self.change.call_args.args[1],2)
         self.assertEqual(self.row()['enabled'],0)

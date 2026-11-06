@@ -40,9 +40,8 @@ class ForcedDrain(unittest.TestCase):
                 self.step(5199);self.step(5200);self.step(5200)
                 self.change.assert_not_called()
                 self.step(5215)
-                self.change.assert_called_once()
-                self.assertEqual(self.row()['phase'],'waiting_ip')
-                self.assertEqual(self.change.call_args.args[1],2)
+                self.change.assert_not_called()
+                self.assertEqual(self.row()['phase'],'draining')
 
     def test_disabled_threshold_does_not_relax_normal_gate(self):
         self.prepare(threshold=0)
@@ -53,14 +52,14 @@ class ForcedDrain(unittest.TestCase):
         self.prepare()
         self.step(5200);self.count=200;self.step(5215)
         self.count=150;self.step(5230);self.change.assert_not_called()
-        self.step(5245);self.change.assert_called_once()
+        self.step(5245);self.change.assert_not_called()
 
     def test_missing_and_stale_samples_break_forced_confirmation(self):
         self.prepare();self.step(5200)
         with patch('rotation._fresh_ip',return_value=('1.1.1.1',443,{'tcp':0,'connections_sampled':5000})):
             self.step(5215)
         self.step(5230);self.change.assert_not_called()
-        self.step(5245);self.change.assert_called_once()
+        self.step(5245);self.change.assert_not_called()
 
     def test_new_drain_and_changed_threshold_cannot_reuse_confirmation(self):
         self.prepare();self.step(5200)
@@ -68,7 +67,7 @@ class ForcedDrain(unittest.TestCase):
         self.step(5215);self.change.assert_not_called()
         with self.connect() as db:db.execute('UPDATE vps_rotations SET drain_started=1620')
         self.step(5230);self.change.assert_not_called()
-        self.step(5245);self.change.assert_called_once()
+        self.step(5245);self.change.assert_not_called()
 
     def test_unhealthy_carrier_and_pending_action_still_block_force(self):
         self.prepare();self.step(5200)
@@ -77,13 +76,13 @@ class ForcedDrain(unittest.TestCase):
         self.change.assert_not_called()
         with patch('rotation._pending_action',return_value=True):self.step(5230)
         self.change.assert_not_called()
-        self.step(5245);self.change.assert_called_once()
+        self.step(5245);self.change.assert_not_called()
 
     def test_long_ttl_cannot_be_bypassed_after_one_hour(self):
         self.prepare()
         with self.connect() as db:db.execute('UPDATE vps_rotations SET drain_grace_s=4000')
         self.step(5200);self.step(5215);self.change.assert_not_called()
-        self.step(5600);self.step(5615);self.change.assert_called_once()
+        self.step(5600);self.step(5615);self.change.assert_not_called()
 
     def test_shared_record_with_unfinished_drain_blocks_forced_action(self):
         self.prepare();self.step(5200)
@@ -92,7 +91,7 @@ class ForcedDrain(unittest.TestCase):
         self.step(5215);self.change.assert_not_called()
         self.assertIn('关联记录',self.row()['status'])
         with self.connect() as db:db.execute('UPDATE vps_rotations SET low_samples=2 WHERE id<>1')
-        self.step(5230);self.change.assert_called_once()
+        self.step(5230);self.change.assert_not_called()
 
 
 class FastRecovery(unittest.TestCase):
@@ -115,25 +114,18 @@ class FastRecovery(unittest.TestCase):
         self.assertEqual(f.save(enabled=False,force_drain_threshold=0).status_code,200)
         self.assertEqual(f.row()['force_drain_threshold'],0)
 
-    def test_forced_drain_has_separate_statistics_and_event(self):
+    def test_forced_drain_cannot_override_current_connection_threshold(self):
         f=self.f
-        f.mocks[0].side_effect=lambda db,cipher,cid:{'kind':db.execute('SELECT kind FROM ip_connections WHERE id=?',(cid,)).fetchone()[0]}
         with server.connect() as db:
             db.execute("UPDATE vps_rotations SET phase='draining',drain_server_id=?,old_ip='1.1.1.1',drain_started=?,drain_grace_s=0,force_drain_threshold=200 WHERE id=?",(f.sid('B'),f.clock[0]-3601,f.rid))
-            rotation._drain_timing(db,db.execute('SELECT * FROM vps_rotations WHERE id=?',(f.rid,)).fetchone(),f.clock[0],start=True)
         for step in range(2):
             if step:f.advance(15,online=('A','B'))
             with server.connect() as db:
                 m=json.loads(db.execute('SELECT metrics FROM servers WHERE id=?',(f.sid('B'),)).fetchone()[0]);m['tcp']=150
                 db.execute('UPDATE servers SET metrics=? WHERE id=?',(json.dumps(m),f.sid('B')))
             f.tick()
-        f.change.assert_called_once()
-        with server.connect() as db:
-            stats=rotation._drain_statistics(db,f.row());record=stats['records'][0]
-            self.assertEqual(record['outcome'],'forced');self.assertEqual(record['threshold'],200)
-            self.assertEqual(record['tcp'],150);self.assertEqual(stats['summaries'],[])
-            self.assertEqual(db.execute('SELECT reason FROM rotation_recovery_timings WHERE rotation_id=?',(f.rid,)).fetchone()[0],'forced_drain')
-            self.assertTrue(db.execute("SELECT 1 FROM vps_rotation_events WHERE message LIKE '%强制换 IP%' LIMIT 1").fetchone())
+        f.change.assert_not_called()
+        self.assertIn('必须低于',f.row()['status'])
 
     def test_incident_forces_new_round_but_not_repeated_paid_rounds(self):
         f=self.prepare()

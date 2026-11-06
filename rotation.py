@@ -96,6 +96,27 @@ def _rotation_tcp_count(metrics,now):
     return count,stamp
 
 
+def ip_change_connection_guard(db,sid,now,cipher=None):
+    """Every action, including emergency retries, must meet each configured limit."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vps_rotations'").fetchone():return None
+    plans=db.execute('SELECT * FROM vps_rotations WHERE primary_server_id=? OR other_server_id=?',(sid,sid)).fetchall()
+    if not plans:return None
+    try:
+        node=db.execute('SELECT metrics,seen FROM servers WHERE id=?',(sid,)).fetchone()
+        if not node or type(node['seen'])is not int or not 0<=now-node['seen']<=45:
+            raise IntegrationError('VPS 心跳过期，无法核实当前连接数')
+        metrics=json.loads(node['metrics'] or '{}')
+        if not isinstance(metrics,dict):raise ValueError()
+        count,_=_rotation_tcp_count(metrics,now)
+    except (ValueError,TypeError,IntegrationError) as e:
+        return '换 IP 暂缓：'+(str(e) or '连接数采样无效')
+    for plan in plans:
+        limit=rotation_schedule.effective(plan,now)['threshold']
+        if count>=limit:
+            return f'换 IP 暂缓：VPS 当前 {count} 条 TCP 连接，必须低于设定阈值 {limit}（计划 #{plan["id"]}）'
+    return None
+
+
 def _force_drain_ready(db,r,count,stamp,now):
     """Opt-in one-hour escape hatch; never reinterpret normal low samples."""
     threshold=r['force_drain_threshold']

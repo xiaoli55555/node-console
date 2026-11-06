@@ -674,7 +674,12 @@ def report():
         if clean['capabilities']:
             job=db.execute("SELECT commands.*,users.role FROM commands JOIN users ON users.id=commands.user_id WHERE server_id=? AND status='queued' AND action IN ("+','.join('?' for _ in clean['capabilities'])+") ORDER BY commands.id LIMIT 1",(row['id'],*clean['capabilities'])).fetchone()
             if job:
-                if job['role']=='admin' or current['owner_id']==job['user_id']:
+                # Recheck the just-reported count at delivery, not only at queue time.
+                import rotation
+                blocked=rotation.ip_change_connection_guard(db,row['id'],now,CIPHER)
+                if blocked:
+                    db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE primary_server_id=? OR other_server_id=?',(blocked,now,row['id'],row['id']))
+                elif job['role']=='admin' or current['owner_id']==job['user_id']:
                     db.execute("UPDATE commands SET status='issued',updated=? WHERE id=?",(now,job['id']))
                     command={'id':job['id'],'action':job['action']}
                 else:db.execute("UPDATE commands SET status='cancelled',updated=? WHERE id=?",(now,job['id']))
