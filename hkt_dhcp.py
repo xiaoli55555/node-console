@@ -4,7 +4,7 @@ import json
 import secrets
 import time
 from flask import jsonify, request, g
-from ip_dns import IntegrationError
+from ip_dns import IntegrationError, ChangeIPBlocked
 
 _connect=None
 _cipher=None
@@ -23,6 +23,24 @@ def preferred_ip_retry_allowed(db,server_id):
     if not cfg or pending or not nonpreferred_ip(db,server_id):return False
     job=db.execute("SELECT id,status FROM commands WHERE server_id=? AND action='hkt_dhcp' ORDER BY id DESC LIMIT 1",(server_id,)).fetchone()
     return bool(job and job['status'] in ('completed','failed','expired'))
+
+def action_block(db,server_id,connection_id=None,selecting=None):
+    """Read the same interlock used inside queue's atomic transaction."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hkt_dhcp_apis'").fetchone():return None
+    cfg=db.execute('SELECT * FROM hkt_dhcp_apis WHERE server_id=?',(server_id,)).fetchone()
+    if not cfg or (connection_id is not None and connection_id!=cfg['connection_id']):return None
+    pending=db.execute("SELECT id,action,status FROM commands WHERE server_id=? AND status IN ('queued','issued','accepted','unconfirmed') ORDER BY id DESC LIMIT 1",(server_id,)).fetchone()
+    if pending:
+        if pending['action']=='hkt_dhcp' and pending['status']=='unconfirmed':
+            return ChangeIPBlocked('上次 DHCP 结果待核对，请检查 agent 后重置 API',pending['id'],'dhcp_unconfirmed')
+        return None
+    if selecting is None:
+        managed=db.execute('SELECT 1 FROM vps_rotations WHERE primary_server_id=? OR other_server_id=?',(server_id,server_id)).fetchone()
+        selecting=bool(managed and nonpreferred_ip(db,server_id))
+    last=db.execute("SELECT id,status FROM commands WHERE server_id=? AND action='hkt_dhcp' AND id>? ORDER BY id DESC LIMIT 1",(server_id,cfg['reset_after'])).fetchone()
+    if last and last['status'] in ('failed','expired') and not selecting:
+        return ChangeIPBlocked('DHCP 上轮未成功；已停止自动重复，检查网络后重新生成 API 解除',last['id'],'dhcp_'+last['status'])
+    return None
 
 def initialize(connect):
     global _connect
@@ -78,10 +96,10 @@ def queue(server_id,connection_id=None,managed=False):
         pending=db.execute("SELECT id,action,status FROM commands WHERE server_id=? AND status IN ('queued','issued','accepted','unconfirmed') ORDER BY id DESC LIMIT 1",(server_id,)).fetchone()
         if pending:
             if pending['action']!='hkt_dhcp':raise IntegrationError('服务器另有未完成动作')
-            if pending['status']=='unconfirmed':raise IntegrationError('上次 DHCP 结果待核对，请检查 agent 后重置 API')
+            if pending['status']=='unconfirmed':raise action_block(db,server_id,connection_id,selecting)
             return pending['id']
-        last=db.execute("SELECT id,status FROM commands WHERE server_id=? AND action='hkt_dhcp' AND id>? ORDER BY id DESC LIMIT 1",(server_id,cfg['reset_after'])).fetchone()
-        if last and last['status'] in ('failed','expired') and not selecting:raise IntegrationError('DHCP 上轮未成功；已停止自动重复，检查网络后重新生成 API 解除')
+        blocked=action_block(db,server_id,connection_id,selecting)
+        if blocked:raise blocked
         admin=db.execute("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1").fetchone()
         if not admin:raise IntegrationError('缺少管理员')
         return db.execute("INSERT INTO commands(server_id,user_id,action,status,created,updated) VALUES(?,?,'hkt_dhcp','queued',?,?)",(server_id,admin['id'],now,now)).lastrowid

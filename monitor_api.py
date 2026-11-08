@@ -29,7 +29,7 @@ def parsed(value,default):
 def category(value):
     # Never expose free-form provider errors or logs: they can contain secrets.
     text=value or ''
-    for key,words in [('probe_stale',('结果过期','探测过期')),('heartbeat_stale',('心跳超时','心跳已超时')),
+    for key,words in [('action_blocked',('本地 DHCP 保护锁',)),('probe_stale',('结果过期','探测过期')),('heartbeat_stale',('心跳超时','心跳已超时')),
                       ('dns_pending',('DNS 写入','DNS 切换','DNS 自动纠正','解析待核对')),
                       ('group_split',('线路状态不一致',)),('group_coordination',('多记录协调',)),('probe_disabled',('请开启定时探测',)),
                       ('failed',('失败','错误')),('waiting',('等待','暂缓')),('recovered',('恢复正常','恢复完成')),

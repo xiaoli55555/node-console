@@ -102,6 +102,8 @@ class ScheduledFaultMatrix(unittest.TestCase):
             with test_failover.server.connect() as db:
                 db.execute('UPDATE vps_rotations SET drain_schedule=? WHERE id=?',(json.dumps(dict(schedule.DEFAULT,enabled=True)),f.rid))
             return case,f
-        with patch.object(RotationFaultMatrix,'case',scheduled_case):
+        # The matrix uses TCP=25 as a low sample. Pin the clock to the
+        # 80-connection period; running at 03:00-10:00 (limit 20) must block.
+        with patch('time.time',return_value=at(21)),patch.object(RotationFaultMatrix,'case',scheduled_case):
             matrix=RotationFaultMatrix(methodName='test_both_fault_types_at_eight_stages_then_repair_return_and_resume')
             matrix.test_both_fault_types_at_eight_stages_then_repair_return_and_resume()

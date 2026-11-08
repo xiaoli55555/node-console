@@ -18,7 +18,7 @@ from contextlib import nullcontext
 
 from detectors import boce_dns_gate, queue_reboot
 from ip_dns import (
-    ChangeIPUncertain, IntegrationError, candidate_ip, get_dns_record,
+    ChangeIPBlocked, ChangeIPUncertain, IntegrationError, candidate_ip, get_dns_record,
     invoke_change_ip_api, load_connection, public_v4, update_dns_record,
     validate_dns_record,
 )
@@ -509,6 +509,22 @@ def _event(db,rid,sid,message,now,kind='state_observed',trigger=None,transition=
     rotation_audit.capture(db,cursor.lastrowid,rid,sid,now,kind,trigger,transition)
     db.execute('DELETE FROM rotation_audit WHERE event_id IN (SELECT id FROM vps_rotation_events WHERE created<?)',(now-90*86400,))
     db.execute('DELETE FROM vps_rotation_events WHERE created<?',(now-90*86400,))
+
+def _record_dhcp_block(db,rid,sid,blocked,now):
+    message=f'本地 DHCP 保护锁：任务 #{blocked.command_id}（{blocked.code}）；'+str(blocked)
+    db.execute("UPDATE vps_rotations SET phase='draining',action_started=NULL,status=?,updated=? WHERE id=?",(message,now,rid))
+    # Key by plan/server/job/reason, independent of transient status messages.
+    prior=db.execute("SELECT 1 FROM vps_rotation_events e JOIN rotation_audit a ON a.event_id=e.id WHERE e.rotation_id=? AND e.server_id=? AND e.message=? AND a.kind='ip_change_blocked' LIMIT 1",(rid,sid,message)).fetchone()
+    if not prior:_event(db,rid,sid,message,now,kind='ip_change_blocked',trigger='local_dhcp_guard')
+
+
+def _dhcp_action_blocked(db,rid,sid,action,now):
+    if action.get('config',{}).get('provider')!='agent_dhcp':return False
+    from hkt_dhcp import action_block
+    blocked=action_block(db,sid,action.get('id'))
+    if not blocked:return False
+    _record_dhcp_block(db,rid,sid,blocked,now)
+    return True
 
 def _fresh_ip(db,sid,now,cipher):
     server=db.execute('SELECT metrics,seen FROM servers WHERE id=?',(sid,)).fetchone()
@@ -1355,6 +1371,7 @@ def _run_rotation(connect,cipher,rid,now):
                 return
             try:action=load_connection(db,cipher,plan['action_connection_id'])
             except IntegrationError as e:db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',(str(e),now,rid));return
+            if action and _dhcp_action_blocked(db,rid,old,action,now):return
             server=db.execute('SELECT name FROM servers WHERE id=?',(old,)).fetchone()
             db.execute('UPDATE vps_rotations SET phase=\'waiting_ip\',repair_check_required=0,repair_check=NULL,action_started=?,action_attempts=action_attempts+1,status=?,updated=? WHERE id=?',(now,'连接数达标，已发起旧 VPS 换 IP；等待新 IP',now,rid))
             _event(db,rid,old,'准备提交换 IP，尚未确认供应商执行结果',now,kind='ip_change_prepared',trigger='emergency_repair' if r['emergency'] else 'forced_drain' if forced else 'drain_completed')
@@ -1408,6 +1425,7 @@ def _run_rotation(connect,cipher,rid,now):
             if reason:
                 db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',(reason,now,rid));return
             action=load_connection(db,cipher,plan['action_connection_id']) if plan and plan['action_connection_id'] else None
+            if action and _dhcp_action_blocked(db,rid,old,action,now):return
             server=db.execute('SELECT name FROM servers WHERE id=?',(old,)).fetchone()
             if not action:db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE id=?',('等待有效的旧 VPS 换 IP API',now,rid));return
             db.execute('UPDATE vps_rotations SET action_started=?,action_attempts=action_attempts+1,status=?,updated=? WHERE id=?',(now,'未观察到 IP 变化，重试换 IP API',now,rid))
@@ -1472,6 +1490,10 @@ def _run_rotation(connect,cipher,rid,now):
         if action['kind']!='change_ip':raise IntegrationError('配置的连接不是换 IP API')
         message=invoke_change_ip_api(action,item['server_id'],item['name'],item['ip'])
         status=str(message)+'；等待 agent 上报新 IP'
+    except ChangeIPBlocked as e:
+        # Queue rechecks under BEGIN IMMEDIATE, closing the preflight race.
+        with connect() as db:_record_dhcp_block(db,rid,item['server_id'],e,int(time.time()))
+        return
     except ChangeIPUncertain as e:
         audit_kind='ip_change_uncertain'
         status='换 IP 请求结果不确定：'+str(e)+'；先等待 IP 上报核对'

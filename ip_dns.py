@@ -43,6 +43,13 @@ CREATE TABLE IF NOT EXISTS dns_events(
 class IntegrationError(ValueError):
     pass
 
+class ChangeIPBlocked(IntegrationError):
+    """A local agent safety interlock; retrying the provider cannot resolve it."""
+    def __init__(self, message, command_id, code):
+        super().__init__(message)
+        self.command_id=command_id
+        self.code=code
+
 class ChangeIPUncertain(IntegrationError):
     """Provider may have accepted a request whose response was lost."""
     pass
