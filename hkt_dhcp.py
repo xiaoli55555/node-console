@@ -34,12 +34,8 @@ def action_block(db,server_id,connection_id=None,selecting=None):
         if pending['action']=='hkt_dhcp' and pending['status']=='unconfirmed':
             return ChangeIPBlocked('上次 DHCP 结果待核对，请检查 agent 后重置 API',pending['id'],'dhcp_unconfirmed')
         return None
-    if selecting is None:
-        managed=db.execute('SELECT 1 FROM vps_rotations WHERE primary_server_id=? OR other_server_id=?',(server_id,server_id)).fetchone()
-        selecting=bool(managed and nonpreferred_ip(db,server_id))
-    last=db.execute("SELECT id,status FROM commands WHERE server_id=? AND action='hkt_dhcp' AND id>? ORDER BY id DESC LIMIT 1",(server_id,cfg['reset_after'])).fetchone()
-    if last and last['status'] in ('failed','expired') and not selecting:
-        return ChangeIPBlocked('DHCP 上轮未成功；已停止自动重复，检查网络后重新生成 API 解除',last['id'],'dhcp_'+last['status'])
+    # Terminal failures/expiry do not lock out later rotation attempts.
+    # queue() still checks drain/carrier guards and serializes pending jobs.
     return None
 
 def initialize(connect):
@@ -103,6 +99,24 @@ def queue(server_id,connection_id=None,managed=False):
         admin=db.execute("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1").fetchone()
         if not admin:raise IntegrationError('缺少管理员')
         return db.execute("INSERT INTO commands(server_id,user_id,action,status,created,updated) VALUES(?,?,'hkt_dhcp','queued',?,?)",(server_id,admin['id'],now,now)).lastrowid
+
+def reconcile_task(db,sid,status,now):
+    """Authenticated agent answers a query about the SAME pending task."""
+    if not isinstance(status,dict) or type(status.get('id')) is not int:return
+    job=db.execute("SELECT * FROM commands WHERE id=? AND server_id=? AND action='hkt_dhcp'",(status['id'],sid)).fetchone()
+    if not job or job['status'] not in ('issued','accepted','unconfirmed'):return
+    state=status.get('state')
+    if state in ('not_started','unknown'):
+        db.execute('INSERT OR REPLACE INTO hkt_dhcp_results(command_id,result,updated) VALUES(?,?,?)',(job['id'],json.dumps({'state':state,'id':job['id']}),now))
+    if state=='not_started':
+        # An idle execution lock, no live systemd unit, and no persistent result
+        # must ALL be checked by the agent. Redispatch the same id, not a new job.
+        if status.get('idle_verified') is not True:return
+        db.execute("UPDATE commands SET status='queued',updated=? WHERE id=?",(now,job['id']))
+    elif state in ('running','changed','unchanged','failed'):
+        db.execute("UPDATE commands SET status='accepted',updated=? WHERE id=?",(now,job['id']))
+        apply_result(db,sid,status,now)
+
 
 def apply_result(db,sid,result,now):
     if not isinstance(result,dict) or type(result.get('id')) is not int or result.get('state') not in ('running','changed','unchanged','failed'):return

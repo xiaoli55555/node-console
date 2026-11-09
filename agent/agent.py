@@ -295,6 +295,29 @@ def dispatch_dhcp(cid):
     subprocess.run(['systemd-run','--unit=hksdan-dhcp-recover-'+str(cid),'--on-active=300s','--collect','/usr/bin/python3',str(Path(__file__).resolve()),'--dhcp-recover'],check=True,timeout=10,capture_output=True)
     subprocess.run(['systemd-run','--unit=hksdan-dhcp-'+str(cid),'--collect','/usr/bin/python3',str(Path(__file__).resolve()),'--dhcp-task',str(cid)],check=True,timeout=10,capture_output=True)
 
+def dhcp_task_status(cid):
+    """Never declare idle just because a heartbeat/result is missing."""
+    DHCP_STATE.mkdir(mode=0o700,parents=True,exist_ok=True)
+    with (DHCP_STATE/'dhcp.lock').open('a') as lock:
+        try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:return {'id':cid,'state':'running'}
+        path=DHCP_STATE/'dhcp-result.json'
+        previous=json.loads(path.read_text()) if path.exists() else {}
+        if previous.get('id')==cid and previous.get('state') in ('changed','unchanged','failed'):
+            return previous
+        unit=subprocess.run(['systemctl','show','hksdan-dhcp-'+str(cid)+'.service','--property=LoadState','--property=ActiveState'],capture_output=True,text=True,timeout=5,check=False)
+        properties=dict(line.split('=',1) for line in unit.stdout.splitlines() if '=' in line)
+        active=properties.get('ActiveState',unit.stdout.strip())
+        missing=properties.get('LoadState')=='not-found' and active=='inactive'
+        if (unit.returncode and not missing) or active not in ('active','activating','deactivating','inactive','failed'):
+            return {'id':cid,'state':'unknown'}
+        if active in ('active','activating','deactivating'):return {'id':cid,'state':'running'}
+        if previous.get('id',0)>cid:return {'id':cid,'state':'unknown'}
+        if previous.get('id')==cid:
+            return {'id':cid,'state':'failed','error':'DHCP task stopped without a terminal result'}
+        return {'id':cid,'state':'not_started','idle_verified':True}
+
+
 def main():
     p=argparse.ArgumentParser();p.add_argument('--once',action='store_true');p.add_argument('--config',default='/etc/hk-sdan-agent/config.json');p.add_argument('--dhcp-task',type=int);p.add_argument('--dhcp-recover',action='store_true');p.add_argument('--dhcp-detect');a=p.parse_args()
     if a.dhcp_detect:
@@ -305,6 +328,7 @@ def main():
         dhcp_task(a.dhcp_task);return
     config=json.loads(Path(a.config).read_text());url=config['url'].rstrip('/')
     if not url.startswith('https://'):raise SystemExit('只支持 HTTPS 面板地址')
+    task_query=None
     previous=None;connections=ConnectionSampler();egress=EgressSampler()
     threading.Thread(target=egress.run,daemon=True).start()
     while True:
@@ -313,7 +337,10 @@ def main():
             metrics,previous=collect(previous,connections)
             metrics.update(egress.snapshot())
             try:
-                dhcp_config();metrics['capabilities'].append('hkt_dhcp')
+                dhcp_config();metrics['capabilities'].extend(['hkt_dhcp','hkt_task_status'])
+                if task_query is not None:
+                    try:metrics['dhcp_task_status']=dhcp_task_status(task_query)
+                    except Exception:metrics['dhcp_task_status']={'id':task_query,'state':'unknown'}
                 state=DHCP_STATE/'dhcp-result.json'
                 if state.exists():
                     result_state=json.loads(state.read_text())
@@ -326,6 +353,8 @@ def main():
             # Never follow redirects with the agent credential.
             opener=urllib.request.build_opener(NoRedirect)
             with opener.open(req,timeout=15) as response:result=json.loads(response.read(32768))
+            query=result.get('dhcp_task_query')
+            task_query=query['id'] if isinstance(query,dict) and type(query.get('id')) is int else None
             command=result.get('command')
             if isinstance(command,dict) and command.get('action') in ('reboot','hkt_dhcp') and type(command.get('id')) is int:
                 command_url=url+'/api/agent/commands/'+str(command['id'])+'/ack'
@@ -338,9 +367,15 @@ def main():
                     else:subprocess.run(['/usr/bin/systemctl','reboot','--no-block'],check=True,timeout=15,capture_output=True)
                     print('动作请求已交给系统管理器',flush=True)
                 except (OSError,subprocess.SubprocessError):
-                    print('系统重启请求失败',flush=True)
-                    failure=urllib.request.Request(command_url,data=b'{"status":"failed"}',headers=headers,method='POST')
-                    with opener.open(failure,timeout=15) as response:response.read(1024)
+                    if command['action']=='hkt_dhcp':
+                        # systemd-run may have succeeded even when its reply timed out.
+                        # Query local execution before calling this a failure.
+                        task_query=command['id']
+                        print('DHCP 提交结果待核对',flush=True)
+                    else:
+                        print('系统重启请求失败',flush=True)
+                        failure=urllib.request.Request(command_url,data=b'{"status":"failed"}',headers=headers,method='POST')
+                        with opener.open(failure,timeout=15) as response:response.read(1024)
             # Routine five-second reports stay out of journald to reduce disk writes.
         except Exception as e:
             # Avoid including URL, request headers or token in logs.

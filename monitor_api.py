@@ -96,12 +96,20 @@ def snapshot(db,now,after_id,dns_after_id,filters=None):
     events,next_id,latest,more=events_since('vps_rotation_events','id rotation_id server_id created',after_id)
     dns_events,dns_next,dns_latest,dns_more=events_since('dns_events','id binding_id created',dns_after_id)
     commands=[]
-    for row in db.execute("SELECT id,server_id,action,status,created,updated FROM commands WHERE status IN ('queued','issued','running') ORDER BY id"):
+    for row in db.execute("SELECT id,server_id,action,status,created,updated FROM commands WHERE status IN ('queued','issued','accepted','unconfirmed','running') ORDER BY id"):
         commands.append(dict(pick(row,'id server_id status created updated'),action='reboot' if row['action']=='reboot' else 'other'))
+    dhcp_tasks=[]
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hkt_dhcp_results'").fetchone():
+        for task in db.execute("SELECT c.id,c.server_id,c.status,c.created,c.updated,r.result,r.updated AS result_updated FROM commands c LEFT JOIN hkt_dhcp_results r ON r.command_id=c.id WHERE c.action='hkt_dhcp' ORDER BY c.id DESC LIMIT 100"):
+            item=pick(task,'id server_id status created updated result_updated')
+            try:result=json.loads(task['result'] or '{}')
+            except (ValueError,TypeError):result={}
+            item['execution']=pick(result,'state old_ip new_ip attempts')
+            dhcp_tasks.append(item)
     changes=[dict(row) for row in db.execute('SELECT id,server_id,observed FROM ip_events ORDER BY id DESC LIMIT 100')]
     return dict(schema_version=2,code_version=rotation_audit.code_version(),event_statistics=statistics,events_retained_since=db.execute('SELECT MIN(created) FROM vps_rotation_events').fetchone()[0],observed_at=now,dns_values_source='panel_last_confirmed_not_live_provider',
                 servers=servers,rotations=rotations,dns_bindings=bindings,failover_leases=leases,
-                pending_commands=commands,recent_ip_changes=changes,
+                pending_commands=commands,dhcp_tasks=dhcp_tasks,recent_ip_changes=changes,
                 events=events,next_after_id=next_id,latest_event_id=latest,has_more_events=more,
                 dns_events=dns_events,dns_next_after_id=dns_next,dns_latest_event_id=dns_latest,dns_has_more_events=dns_more)
 

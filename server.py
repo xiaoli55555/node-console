@@ -630,7 +630,7 @@ def report():
             if stamp is not None:
                 if type(stamp) is not int or not 0<=stamp<=int(time.time())+60:return error('采集时间格式无效')
                 clean[stamp_key]=stamp
-        clean['capabilities']=[x for x in ('reboot','hkt_dhcp') if isinstance(d.get('capabilities'),list) and x in d['capabilities']]
+        clean['capabilities']=[x for x in ('reboot','hkt_dhcp','hkt_task_status') if isinstance(d.get('capabilities'),list) and x in d['capabilities']]
         clean['udp_method']='socket' if d.get('udp_method')=='socket' else 'conntrack'
         clean['network_method']='TCP ESTABLISHED sockets; UDP '+clean['udp_method']
         db.execute('BEGIN IMMEDIATE')
@@ -650,7 +650,8 @@ def report():
             # do not wait out the plan's normal 2+ minute interval.
             db.execute("UPDATE detection_plans SET next_at=MIN(next_at,?) WHERE server_id=? AND automatic=1 AND response_mode='reboot'",(int(time.time()),row['id']))
         db.execute("UPDATE commands SET status='unconfirmed',updated=? WHERE server_id=? AND status='accepted' AND created<?",(int(time.time()),row['id'],int(time.time())-600))
-        from hkt_dhcp import apply_result
+        from hkt_dhcp import apply_result,reconcile_task
+        if 'hkt_task_status' in clean['capabilities']:reconcile_task(db,row['id'],d.get('dhcp_task_status'),int(time.time()))
         apply_result(db,row['id'],d.get('dhcp_result'),int(time.time()))
         # Match the public-IP display: fresh external observations first, then
         # interface addresses. Missing/failed samples never erase IP history.
@@ -673,9 +674,9 @@ def report():
         db.execute('UPDATE servers SET metrics=?,seen=? WHERE id=?',(json.dumps(clean),int(time.time()),row['id']))
         # Fetch at most one command, and mark it issued before replying (no redelivery).
         command=None;now=int(time.time())
-        db.execute("UPDATE commands SET status='expired',updated=? WHERE server_id=? AND status IN ('queued','issued') AND created<?",(now,row['id'],now-120))
+        db.execute("UPDATE commands SET status='expired',updated=? WHERE server_id=? AND status IN ('queued','issued') AND created<? AND NOT (action='hkt_dhcp' AND ?)",(now,row['id'],now-120,'hkt_task_status' in clean['capabilities']))
         if clean['capabilities']:
-            job=db.execute("SELECT commands.*,users.role FROM commands JOIN users ON users.id=commands.user_id WHERE server_id=? AND status='queued' AND action IN ("+','.join('?' for _ in clean['capabilities'])+") ORDER BY commands.id LIMIT 1",(row['id'],*clean['capabilities'])).fetchone()
+            job=db.execute("SELECT commands.*,users.role FROM commands JOIN users ON users.id=commands.user_id WHERE server_id=? AND status='queued' AND action IN ("+','.join('?' for _ in clean['capabilities'])+") ORDER BY CASE WHEN action='hkt_dhcp' THEN 0 ELSE 1 END,commands.id LIMIT 1",(row['id'],*clean['capabilities'])).fetchone()
             if job:
                 # Recheck the just-reported count at delivery, not only at queue time.
                 import rotation
@@ -686,7 +687,11 @@ def report():
                     db.execute("UPDATE commands SET status='issued',updated=? WHERE id=?",(now,job['id']))
                     command={'id':job['id'],'action':job['action']}
                 else:db.execute("UPDATE commands SET status='cancelled',updated=? WHERE id=?",(now,job['id']))
-    return jsonify(ok=True,command=command)
+        task_query=None
+        if 'hkt_task_status' in clean['capabilities']:
+            q=db.execute("SELECT id,status FROM commands WHERE server_id=? AND action='hkt_dhcp' AND status IN ('issued','accepted','unconfirmed') ORDER BY id DESC LIMIT 1",(row['id'],)).fetchone()
+            if q:task_query=dict(q)
+    return jsonify(ok=True,command=command,dhcp_task_query=task_query)
 
 @app.post('/api/servers/<int:sid>/reboot')
 @auth()
@@ -723,7 +728,8 @@ def ack_command(cid):
         if body().get('status')=='failed':
             if job['status']!='accepted':return error('任务状态不匹配',409)
             db.execute("UPDATE commands SET status='failed',updated=? WHERE id=?",(now,cid));return jsonify(ok=True)
-        if job['status']!='issued' or now-job['created']>120:return error('任务已过期或已确认',409)
+        if job['action']=='hkt_dhcp' and job['status']=='accepted':return jsonify(ok=True)
+        if job['status']!='issued' or (job['action']!='hkt_dhcp' and now-job['created']>120):return error('任务已过期或已确认',409)
         db.execute("UPDATE commands SET status='accepted',updated=? WHERE id=?",(now,cid))
     return jsonify(ok=True)
 

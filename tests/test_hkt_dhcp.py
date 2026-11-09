@@ -55,11 +55,13 @@ class HKTAPI(unittest.TestCase):
         ack=self.admin.post(f'/api/agent/commands/{command["id"]}/ack',json={},headers={'Authorization':'Bearer '+n['token']})
         self.assertEqual(ack.status_code,200,ack.json)
 
-    def test_unchanged_result_stops_further_automatic_jobs_until_reset(self):
+    def test_unchanged_result_allows_retry_without_reset(self):
         n=self.node();cfg=self.generate(n);cid=self.trigger(n,cfg).json['command_id'];self.report(n)
         self.admin.post(f'/api/agent/commands/{cid}/ack',json={},headers={'Authorization':'Bearer '+n['token']})
         self.report(n,dhcp_result={'id':cid,'state':'unchanged','attempts':3})
-        self.assertEqual(self.trigger(n,cfg).status_code,409)
+        retry=self.trigger(n,cfg);self.assertEqual(retry.status_code,202)
+        self.assertNotEqual(retry.json["command_id"],cid)
+        self.assertEqual(self.trigger(n,cfg).json["command_id"],retry.json["command_id"])
         new=self.generate(n);self.assertEqual(self.trigger(n,cfg).status_code,401)
         self.assertEqual(self.trigger(n,new).status_code,202)
     def test_key_cannot_target_other_VPS_or_bypass_active_rotation(self):
