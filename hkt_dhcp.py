@@ -46,6 +46,17 @@ def initialize(connect):
         server_id INTEGER PRIMARY KEY REFERENCES servers(id) ON DELETE CASCADE,
         connection_id INTEGER NOT NULL REFERENCES ip_connections(id) ON DELETE CASCADE,
         token_hash TEXT NOT NULL, reset_after INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS dhcp_task_events(
+        id INTEGER PRIMARY KEY, command_id INTEGER NOT NULL REFERENCES commands(id) ON DELETE CASCADE,
+        server_id INTEGER NOT NULL, stage TEXT NOT NULL, detail TEXT NOT NULL, created INTEGER NOT NULL);
+        CREATE INDEX IF NOT EXISTS dhcp_task_events_job ON dhcp_task_events(command_id,id);
+        CREATE TRIGGER IF NOT EXISTS dhcp_task_created AFTER INSERT ON commands WHEN NEW.action='hkt_dhcp'
+        BEGIN INSERT INTO dhcp_task_events(command_id,server_id,stage,detail,created)
+        VALUES(NEW.id,NEW.server_id,NEW.status,'{}',NEW.created); END;
+        CREATE TRIGGER IF NOT EXISTS dhcp_task_transition AFTER UPDATE OF status ON commands
+        WHEN NEW.action='hkt_dhcp' AND OLD.status<>NEW.status
+        BEGIN INSERT INTO dhcp_task_events(command_id,server_id,stage,detail,created)
+        VALUES(NEW.id,NEW.server_id,NEW.status,json_object('previous_status',OLD.status),NEW.updated); END;
         CREATE TABLE IF NOT EXISTS hkt_dhcp_results(
         command_id INTEGER PRIMARY KEY REFERENCES commands(id) ON DELETE CASCADE,
         result TEXT NOT NULL, updated INTEGER NOT NULL);''')
@@ -100,12 +111,23 @@ def queue(server_id,connection_id=None,managed=False):
         if not admin:raise IntegrationError('缺少管理员')
         return db.execute("INSERT INTO commands(server_id,user_id,action,status,created,updated) VALUES(?,?,'hkt_dhcp','queued',?,?)",(server_id,admin['id'],now,now)).lastrowid
 
+def task_event(db,sid,cid,stage,detail,now):
+    safe={k:v for k,v in detail.items() if k in ('state','attempts','old_ip','new_ip','previous_status','error_code') and isinstance(v,(str,int,float,bool,type(None)))}
+    payload=json.dumps(safe,sort_keys=True,ensure_ascii=False)
+    if len(payload)>1024:return
+    last=db.execute('SELECT stage,detail FROM dhcp_task_events WHERE command_id=? AND stage=? ORDER BY id DESC LIMIT 1',(cid,stage)).fetchone()
+    if last and last['stage']==stage and last['detail']==payload:return
+    db.execute('INSERT INTO dhcp_task_events(command_id,server_id,stage,detail,created) VALUES(?,?,?,?,?)',(cid,sid,stage,payload,now))
+
+
 def reconcile_task(db,sid,status,now):
     """Authenticated agent answers a query about the SAME pending task."""
     if not isinstance(status,dict) or type(status.get('id')) is not int:return
     job=db.execute("SELECT * FROM commands WHERE id=? AND server_id=? AND action='hkt_dhcp'",(status['id'],sid)).fetchone()
     if not job or job['status'] not in ('issued','accepted','unconfirmed'):return
     state=status.get('state')
+    if state not in ('not_started','unknown','running','changed','unchanged','failed'):return
+    task_event(db,sid,job['id'],'reconciled',{'state':state},now)
     if state in ('not_started','unknown'):
         db.execute('INSERT OR REPLACE INTO hkt_dhcp_results(command_id,result,updated) VALUES(?,?,?)',(job['id'],json.dumps({'state':state,'id':job['id']}),now))
     if state=='not_started':
@@ -125,6 +147,11 @@ def apply_result(db,sid,result,now):
     # A reported success is still subject to fresh agent IP + selected probe gates.
     safe={k:result[k] for k in ('id','state','old_ip','new_ip','attempts','error') if k in result}
     if len(json.dumps(safe))>1024:return
+    evidence=dict(safe)
+    if result.get('error'):
+        kind=str(result['error']).split(':',1)[0]
+        evidence['error_code']=kind if kind in ('ValueError','OSError','TimeoutExpired','CalledProcessError','RuntimeError','SubprocessError') else 'execution_failed'
+    task_event(db,sid,result['id'],'execution',evidence,now)
     if result['state']=='running':
         db.execute("UPDATE commands SET status='accepted',updated=? WHERE id=?",(now,result['id']))
         db.execute('INSERT OR REPLACE INTO hkt_dhcp_results(command_id,result,updated) VALUES(?,?,?)',(result['id'],json.dumps(safe),now))
@@ -168,6 +195,31 @@ def register(app,connect,cipher,auth,body,error,audit):
         except IntegrationError as e:return error(str(e),409)
         with connect() as db:audit(db,'单次 HKT DHCP 换 IP 测试 VPS #'+str(sid)+'，命令 #'+str(cid))
         return jsonify(ok=True,command_id=cid,status='queued',message='单次测试已排队；等待 agent 执行及新 IP 上报，不代表换 IP 已成功'),202
+
+    @app.get('/api/admin/servers/<int:sid>/hkt-dhcp/tasks')
+    @auth(admin=True)
+    def task_history(sid):
+        try:
+            before=int(request.args.get('before',2**63-1))
+            if before<1:raise ValueError()
+        except ValueError:return error('无效任务游标',400)
+        with connect() as db:
+            jobs=db.execute("SELECT id,server_id,status,created,updated FROM commands WHERE server_id=? AND action='hkt_dhcp' AND id<? ORDER BY id DESC LIMIT 21",(sid,before)).fetchall()
+        return jsonify(tasks=[dict(j) for j in jobs[:20]],has_more=len(jobs)>20,next_before=jobs[19]['id'] if len(jobs)>20 else None)
+
+    @app.get('/api/admin/servers/<int:sid>/hkt-dhcp/tasks/<int:cid>')
+    @auth(admin=True)
+    def task_timeline(sid,cid):
+        try:
+            after=int(request.args.get('after',0))
+            if after<0:raise ValueError()
+        except ValueError:return error('无效事件游标',400)
+        with connect() as db:
+            job=db.execute("SELECT id,server_id,status,created,updated FROM commands WHERE id=? AND server_id=? AND action='hkt_dhcp'",(cid,sid)).fetchone()
+            if not job:return error('任务不存在',404)
+            rows=db.execute('SELECT id,stage,detail,created FROM dhcp_task_events WHERE command_id=? AND id>? ORDER BY id LIMIT 201',(cid,after)).fetchall()
+            events=[dict(id=r['id'],stage=r['stage'],detail=json.loads(r['detail']),created=r['created']) for r in rows[:200]]
+        return jsonify(job=dict(job),events=events,has_more=len(rows)>200,next_after=events[-1]['id'] if events else after,history_complete=any(e['stage']=='queued' for e in events) if after==0 else None)
 
     @app.get('/api/admin/servers/<int:sid>/hkt-dhcp/status')
     @auth(admin=True)

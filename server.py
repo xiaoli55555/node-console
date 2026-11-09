@@ -682,6 +682,9 @@ def report():
                 import rotation
                 blocked=rotation.ip_change_connection_guard(db,row['id'],now,CIPHER)
                 if blocked:
+                    if job['action']=='hkt_dhcp':
+                        from hkt_dhcp import task_event
+                        task_event(db,row['id'],job['id'],'delivery_guard_wait',{},now)
                     db.execute('UPDATE vps_rotations SET status=?,updated=? WHERE primary_server_id=? OR other_server_id=?',(blocked,now,row['id'],row['id']))
                 elif job['role']=='admin' or current['owner_id']==job['user_id']:
                     db.execute("UPDATE commands SET status='issued',updated=? WHERE id=?",(now,job['id']))
@@ -690,7 +693,10 @@ def report():
         task_query=None
         if 'hkt_task_status' in clean['capabilities']:
             q=db.execute("SELECT id,status FROM commands WHERE server_id=? AND action='hkt_dhcp' AND status IN ('issued','accepted','unconfirmed') ORDER BY id DESC LIMIT 1",(row['id'],)).fetchone()
-            if q:task_query=dict(q)
+            if q:
+                task_query=dict(q)
+                from hkt_dhcp import task_event
+                task_event(db,row['id'],q['id'],'status_query',{'state':q['status']},now)
     return jsonify(ok=True,command=command,dhcp_task_query=task_query)
 
 @app.post('/api/servers/<int:sid>/reboot')
