@@ -68,6 +68,23 @@ class MonitorAPI(unittest.TestCase):
         self.assertEqual(r.json['rotations'][0]['dns_write_pending'],True)
         with server.connect() as db:
             self.assertEqual(db.execute('SELECT dns_intent FROM vps_rotations WHERE id=?',(self.rid,)).fetchone()[0],'PRIVATE_MARKER')
+    def test_legacy_dhcp_results_never_break_snapshot(self):
+        key=self.issue()
+        import hkt_dhcp
+        hkt_dhcp.initialize(server.connect)
+        with server.connect() as db:
+            uid=db.execute("SELECT id FROM users WHERE role='admin' LIMIT 1").fetchone()[0]
+            for value in (None,'{}','null','[]','1','"legacy"','broken','{"old_ip":"8.8.8.8"}', '{"state":"failed","error":"PRIVATE_MARKER"}'):
+                cid=db.execute("INSERT INTO commands(server_id,user_id,action,status,created,updated) VALUES(?,?,'hkt_dhcp','failed',1,1)",(self.sid('A'),uid)).lastrowid
+                if value is not None:db.execute('INSERT INTO hkt_dhcp_results VALUES(?,?,1)',(cid,value))
+        response=self.read(key)
+        self.assertEqual(response.status_code,200,response.text)
+        self.assertNotIn('PRIVATE_MARKER',response.text)
+        self.assertEqual(len(response.json['dhcp_tasks']),9)
+        for task in response.json['dhcp_tasks']:
+            self.assertEqual(set(task['execution']),{'state','old_ip','new_ip','attempts'})
+        self.assertEqual(response.json['dhcp_tasks'][-1]['execution']['state'],None)
+
     def test_event_cursor_validation(self):
         key=self.issue()
         r=self.read(key)

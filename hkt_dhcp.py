@@ -61,8 +61,26 @@ def initialize(connect):
         command_id INTEGER PRIMARY KEY REFERENCES commands(id) ON DELETE CASCADE,
         result TEXT NOT NULL, updated INTEGER NOT NULL);''')
 
+def _selection_dns_preflight(server_id):
+    # Provider I/O must never own SQLite's single writer slot.
+    from ip_dns import load_connection,get_dns_record,validate_dns_record,candidate_ip,public_v4
+    checked=[]
+    with _connect() as db:
+        if not nonpreferred_ip(db,server_id):return checked
+        address=public_v4(candidate_ip(db,{'server_id':server_id,'source_id':None},_cipher))
+        for peer in db.execute('SELECT * FROM vps_rotations WHERE primary_server_id=? OR other_server_id=?',(server_id,server_id)).fetchall():
+            if peer['active_server_id']==server_id or peer['dns_intent']:raise IntegrationError('此 VPS 仍承载解析或存在未完成 DNS 切换')
+            binding=db.execute('SELECT * FROM dns_bindings WHERE id=?',(peer['binding_id'],)).fetchone()
+            credential=db.execute('SELECT * FROM ip_connections WHERE id=?',(binding['connection_id'],)).fetchone()
+            conn=load_connection(db,_cipher,binding['connection_id'])
+            record=get_dns_record(conn,binding);validate_dns_record(record,binding,conn)
+            if record.get('content',record.get('Value'))==address:raise IntegrationError('所选 DNS 仍指向当前 IP，不能继续选 IP')
+            checked.append((dict(peer),dict(binding),dict(credential),address))
+    return checked
+
 def queue(server_id,connection_id=None,managed=False):
     if _connect is None:raise IntegrationError('DHCP 动作通道未初始化')
+    selection_checks=_selection_dns_preflight(server_id)
     now=int(time.time())
     with _connect() as db:
         db.execute('BEGIN IMMEDIATE')
@@ -85,16 +103,18 @@ def queue(server_id,connection_id=None,managed=False):
             raise IntegrationError('此机器仍承载轮换解析，或未进入换 IP 阶段')
         if db.execute('SELECT 1 FROM vps_rotations WHERE failover_server_id=?',(server_id,)).fetchone():raise IntegrationError('冷备用 C 不接受此 DHCP API 动作')
         if selecting:
-            # The exception skips waiting, never a current DNS carrier or a
-            # partial DNS handoff. Read back every associated selected record.
-            from ip_dns import load_connection,get_dns_record,validate_dns_record,candidate_ip,public_v4
+            # Reject any changed topology/credentials/IP after the unlocked check.
+            peers=db.execute('SELECT * FROM vps_rotations WHERE primary_server_id=? OR other_server_id=?',(server_id,server_id)).fetchall()
+            if len(peers)!=len(selection_checks):raise IntegrationError('DNS 核对期间轮换配置变化，等待重新核对')
+            from ip_dns import candidate_ip,public_v4
             address=public_v4(candidate_ip(db,{'server_id':server_id,'source_id':None},_cipher))
-            for peer in db.execute('SELECT * FROM vps_rotations WHERE primary_server_id=? OR other_server_id=?',(server_id,server_id)):
-                if peer['active_server_id']==server_id or peer['dns_intent']:raise IntegrationError('此 VPS 仍承载解析或存在未完成 DNS 切换')
-                binding=db.execute('SELECT * FROM dns_bindings WHERE id=?',(peer['binding_id'],)).fetchone()
-                conn=load_connection(db,_cipher,binding['connection_id'])
-                record=get_dns_record(conn,binding);validate_dns_record(record,binding,conn)
-                if record.get('content',record.get('Value'))==address:raise IntegrationError('所选 DNS 仍指向当前 IP，不能继续选 IP')
+            for peer,binding,credential,checked_ip in selection_checks:
+                current_peer=db.execute('SELECT * FROM vps_rotations WHERE id=?',(peer['id'],)).fetchone()
+                current_binding=db.execute('SELECT * FROM dns_bindings WHERE id=?',(binding['id'],)).fetchone()
+                current_credential=db.execute('SELECT * FROM ip_connections WHERE id=?',(credential['id'],)).fetchone()
+                if (not current_peer or dict(current_peer)!=peer or not current_binding or dict(current_binding)!=binding
+                    or not current_credential or dict(current_credential)!=credential or address!=checked_ip):
+                    raise IntegrationError('DNS 核对期间状态变化，等待重新核对')
         from server_failover import before_action
         reason=before_action(db,server_id,now,_cipher)
         if reason:

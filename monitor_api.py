@@ -104,11 +104,12 @@ def snapshot(db,now,after_id,dns_after_id,filters=None):
             item=pick(task,'id server_id status created updated result_updated')
             try:result=json.loads(task['result'] or '{}')
             except (ValueError,TypeError):result={}
-            item['execution']=pick(result,'state old_ip new_ip attempts')
+            if not isinstance(result,dict):result={}
+            item['execution']={key:result.get(key) if isinstance(result.get(key),(str,int,float,bool,type(None))) else None for key in ('state','old_ip','new_ip','attempts')}
             dhcp_tasks.append(item)
     task_trace=[]
     if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='dhcp_task_events'").fetchone():
-        task_trace=[dict(id=r['id'],command_id=r['command_id'],server_id=r['server_id'],stage=r['stage'],created=r['created'],detail=json.loads(r['detail'])) for r in db.execute('SELECT * FROM dhcp_task_events ORDER BY id DESC LIMIT 200')]
+        task_trace=[dict(id=r['id'],command_id=r['command_id'],server_id=r['server_id'],stage=r['stage'],created=r['created'],detail=parsed(r['detail'],{})) for r in db.execute('SELECT * FROM dhcp_task_events ORDER BY id DESC LIMIT 200')]
     changes=[dict(row) for row in db.execute('SELECT id,server_id,observed FROM ip_events ORDER BY id DESC LIMIT 100')]
     return dict(schema_version=2,code_version=rotation_audit.code_version(),event_statistics=statistics,events_retained_since=db.execute('SELECT MIN(created) FROM vps_rotation_events').fetchone()[0],observed_at=now,dns_values_source='panel_last_confirmed_not_live_provider',
                 servers=servers,rotations=rotations,dns_bindings=bindings,failover_leases=leases,
