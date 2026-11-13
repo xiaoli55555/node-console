@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS rotation_report_samples(
  id INTEGER PRIMARY KEY,rotation_id INTEGER NOT NULL REFERENCES vps_rotations(id) ON DELETE CASCADE,
  created INTEGER NOT NULL,payload TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS rotation_report_time ON rotation_report_samples(rotation_id,created);
+CREATE INDEX IF NOT EXISTS rotation_report_expiry ON rotation_report_samples(created);
 CREATE TABLE IF NOT EXISTS rotation_dns_trials(
  id INTEGER PRIMARY KEY,rotation_id INTEGER NOT NULL REFERENCES vps_rotations(id) ON DELETE CASCADE,
  hostname TEXT NOT NULL,line TEXT NOT NULL,old_ip TEXT NOT NULL,new_ip TEXT NOT NULL,

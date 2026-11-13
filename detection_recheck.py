@@ -20,6 +20,7 @@ REFERENCE_PORT=80
 def initialize(db):
     db.executescript(SCHEMA)
     db.executescript('''CREATE TABLE IF NOT EXISTS detection_guard_costs(id INTEGER PRIMARY KEY,parent_id INTEGER NOT NULL REFERENCES detection_runs(id) ON DELETE CASCADE,primary_server_id INTEGER NOT NULL,reserved_at INTEGER NOT NULL,cost INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS guard_cost_day ON detection_guard_costs(primary_server_id,reserved_at);''')
+    db.execute('CREATE INDEX IF NOT EXISTS guard_cost_parent ON detection_guard_costs(parent_id,cost)')
     columns={x[1] for x in db.execute('PRAGMA table_info(detection_rechecks)')}
     for name,definition in [('stage',"TEXT NOT NULL DEFAULT 'reference'"),('reference_passed','INTEGER NOT NULL DEFAULT 0'),('reference_details',"TEXT NOT NULL DEFAULT '[]'"),('reference_checked','INTEGER'),('reference_jobs',"TEXT NOT NULL DEFAULT '{}'"),('confirm_source_id','INTEGER'),('confirm_signature','TEXT')]:
         if name not in columns:

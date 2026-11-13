@@ -23,6 +23,9 @@ CREATE TABLE IF NOT EXISTS detection_incidents(id INTEGER PRIMARY KEY,server_id 
 CREATE INDEX IF NOT EXISTS detection_incident_server ON detection_incidents(server_id,id);
 CREATE INDEX IF NOT EXISTS detection_pending ON detection_runs(status,poll_at);
 CREATE INDEX IF NOT EXISTS detection_server_latest ON detection_runs(server_id,source_id,id);
+CREATE INDEX IF NOT EXISTS detection_server_order ON detection_runs(server_id,id);
+CREATE INDEX IF NOT EXISTS detection_created ON detection_runs(created);
+CREATE INDEX IF NOT EXISTS detection_server_created ON detection_runs(server_id,created);
 '''
 
 def initialize(connect):
@@ -647,11 +650,12 @@ def register(app,connect,cipher,auth,body,error,audit):
             safe_plan={'source_id':plan['source_id'] if personal else None,'nodes':json.loads(plan['nodes']) if personal else [],'interval_s':plan['interval_s'] if personal else 600,'daily_limit':plan['daily_limit'] if personal else 1000,'automatic':bool(plan['automatic']) if personal else False,'actions_locked':bool(not personal and plan['action_enabled'] and plan['response_mode'] in ('reboot','change_api'))}
             if personal:safe_plan.update(response_mode=plan['response_mode'],action_enabled=bool(plan['action_enabled']),failure_threshold=plan['failure_threshold'],action_connection_id=plan['action_connection_id'] if plan['action_owner']==g.user['id'] and plan['action_server']==sid else None)
         if safe_plan:
-            with connect() as db:inherited=db.execute('SELECT r.primary_server_id FROM vps_failover_probe_state f JOIN vps_rotations r ON r.id=f.rotation_id WHERE f.server_id=? AND f.active=1 AND r.owner_id=?',(sid,g.user['id'])).fetchone()
-            if not inherited:
-                import server_failover
-                generic=server_failover.parent(db,sid,active=True)
-                if generic and generic['owner_id']==g.user['id']:inherited={'primary_server_id':generic['server_id']}
+            with connect() as db:
+                inherited=db.execute('SELECT r.primary_server_id FROM vps_failover_probe_state f JOIN vps_rotations r ON r.id=f.rotation_id WHERE f.server_id=? AND f.active=1 AND r.owner_id=?',(sid,g.user['id'])).fetchone()
+                if not inherited:
+                    import server_failover
+                    generic=server_failover.parent(db,sid,active=True)
+                    if generic and generic['owner_id']==g.user['id']:inherited={'primary_server_id':generic['server_id']}
             if inherited:safe_plan.update(inherited_from=inherited['primary_server_id'],nodes=json.loads(plan['nodes']),interval_s=plan['interval_s'],daily_limit=plan['daily_limit'],automatic=bool(plan['automatic']),actions_locked=True)
         run=dict(latest) if latest else None
         if run:
