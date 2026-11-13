@@ -11,6 +11,7 @@ def initialize(db):
       reason TEXT NOT NULL,addresses TEXT NOT NULL,address_source TEXT NOT NULL,
       ports TEXT NOT NULL,context TEXT NOT NULL,UNIQUE(server_id,received_at));
       CREATE INDEX IF NOT EXISTS tcp_samples_server_time ON tcp_samples(server_id,received_at,id);
+      CREATE INDEX IF NOT EXISTS tcp_samples_server_latest ON tcp_samples(server_id,id);
       CREATE INDEX IF NOT EXISTS tcp_samples_expiry ON tcp_samples(received_at);''')
 
 def gate(db,sid,metrics,now,seen=None):

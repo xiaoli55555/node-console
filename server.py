@@ -19,11 +19,23 @@ SECURE = os.environ.get('COOKIE_SECURE', '1') == '1'
 app = Flask(__name__, static_folder=None)
 app.config['MAX_CONTENT_LENGTH'] = 32768
 
+class ClosingConnection(sqlite3.Connection):
+    """Keep SQLite transaction semantics, then release the connection on exit."""
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
 def connect():
-    db = sqlite3.connect(DB, timeout=20)
-    db.row_factory = sqlite3.Row
-    db.execute('PRAGMA foreign_keys=ON')
-    return db
+    db = sqlite3.connect(DB, timeout=20, factory=ClosingConnection)
+    try:
+        db.row_factory = sqlite3.Row
+        db.execute('PRAGMA foreign_keys=ON')
+        return db
+    except BaseException:
+        db.close()
+        raise
 
 def init():
     with connect() as db:
